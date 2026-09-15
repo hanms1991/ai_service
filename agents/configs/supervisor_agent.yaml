@@ -1,29 +1,20 @@
-# agents/configs/supervisor.yaml
+# agents/configs/supervisor_agent.yaml
 name: platform_supervisor
 type: supervisor
 
 model: core.llm:model
 
+# system_prompt 作为 planner 的额外补充指令（planner 基础提示由代码动态生成）
 system_prompt: |
-  你是汽车电子智能平台的总调度。
-
-  职责：理解用户意图，选择合适的工具完成任务。
-  你本人不产出业务内容，只负责分派。
-
   分派规则：
-  1. 单点需求 → 直接调对应工具，不要串联多个。
-  2. 复合需求（如"给我完整 PRD"）→ 按 功能定义 → 干系人 → PRD 的顺序依次调用，
-    把上一步输出作为下一步输入。
-  3. 一次只调一个工具，拿到结果后再决定下一步。
-  4. 若用户意图不清，先追问，不要猜。
-
-  禁止：
-  - 不要自己编造功能定义 / PRD 内容，必须通过工具产出。
-  - 不要在最终回复里暴露工具调用过程。
+  1. 单点需求 → single 模式，一步完成。
+  2. 复合需求 → chain 模式，按功能定义 → 干系人 → PRD 的顺序依次调用，
+     把上一步输出作为下一步输入。
+  3. 若用户意图不清 → ask 模式，先追问。
+  4. 涉及高风险操作 → confirm 模式，等待人工确认。
 
 tools:
-  # 原子工具（普通 tool）
-  - tools.load_skill:load_skill
-  # 子 agent 成员：loader 自动包成 tool
+  # 子 agent 成员：planner 可调度，executor 通过 registry 调用
   - agent: product_agent
     description: 把功能诉求转化为结构化功能定义。输入原始诉求，输出功能定义。
+    risk_level: low          # low=直接执行 / high=需 confirm 人工确认

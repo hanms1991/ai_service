@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import importlib
 from pathlib import Path
-from typing import Any, Callable
+from typing import Annotated, Any, Callable
 
 import yaml
 from langchain.agents import create_agent
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import InjectedToolArg
 
 DEFAULT_MODEL_PATH = "core.llm:model"
 
@@ -72,9 +74,16 @@ def _agent_as_tool(name, description, registry_getter):
     from langchain_core.tools import tool
 
     @tool(name, description=description)
-    def _call(task: str) -> str:
+    def _call(
+        task: str,
+        config: Annotated[RunnableConfig, InjectedToolArg],
+    ) -> str:
         sub = registry_getter(name)               # 从注册表惰性拿 agent
-        result = sub.invoke({"messages": [{"role": "user", "content": task}]})
+        # 传递 config 使 callbacks 穿透到子 agent 的 LLM 调用
+        result = sub.invoke(
+            {"messages": [{"role": "user", "content": task}]},
+            config=config,
+        )
         return result["messages"][-1].content
 
     return _call
@@ -96,11 +105,18 @@ def _resolve_system_prompt(spec: Any, base_dir: Path | None) -> str:
 
 # ---------- 组装 ----------
 def build_agent(config: dict[str, Any], base_dir: Path | None = None) -> Any:
-    """根据已解析的配置字典构建 Agent。"""
-    from agents.registry import get_worker  # 惰性导入，避免与 registry.py 的循环依赖
+    """根据已解析的配置字典构建 Agent。
+
+    - type=worker：走 LangChain create_agent（工具型叶子 Agent）
+    - type=supervisor：走 LangGraph 规划-执行分离图（planner → executor → route）
+    """
+    from agents.registry import get_worker  # 惰性导入，避免循环依赖
 
     kind = config.get("type", "worker")
-    # worker 和 supervisor 现在走的是同一条路
+
+    if kind == "supervisor":
+        from agents.supervisor_graph import build_supervisor_graph
+        return build_supervisor_graph(config, base_dir)
 
     return create_agent(
         model=_resolve_model(config.get("model")),
