@@ -109,6 +109,9 @@ def build_agent(config: dict[str, Any], base_dir: Path | None = None) -> Any:
 
     - type=worker：走 LangChain create_agent（工具型叶子 Agent）
     - type=supervisor：走 LangGraph 规划-执行分离图（planner → executor → route）
+
+    skills 字段（可选）：声明该 Agent 可用的技能名列表。配置后自动注入受限版
+    load_skill 工具（只能加载此处列出的技能），YAML 的 tools 字段无需再显式声明 load_skill。
     """
     from agents.registry import get_worker  # 惰性导入，避免循环依赖
 
@@ -118,10 +121,23 @@ def build_agent(config: dict[str, Any], base_dir: Path | None = None) -> Any:
         from agents.supervisor_graph import build_supervisor_graph
         return build_supervisor_graph(config, base_dir)
 
+    # 解析 tools 字段声明的其它工具（load_skill 无需在此声明）
+    tools = _resolve_tools(config.get("tools"), registry_getter=get_worker)
+
+    # 若声明了 skills 字段，自动注入受限版 load_skill 工具
+    skills = config.get("skills")
+    if skills:
+        from tools.load_skill import make_load_skill_tool
+        tools.insert(0, make_load_skill_tool(list(skills)))
+
     return create_agent(
         model=_resolve_model(config.get("model")),
-        tools=_resolve_tools(config.get("tools"), registry_getter=get_worker),
-        system_prompt=_resolve_system_prompt(config["system_prompt"], base_dir),
+        tools=tools,
+        # worker 独立运行时的身份/安全边界提示；经 Planner 调度执行技能时，
+        # 由 capability_registry.execute_skill 用 skill.system_prompt 覆盖此值。
+        system_prompt=_resolve_system_prompt(
+            config.get("default_system_prompt", ""), base_dir
+        ),
     )
 
 

@@ -1,20 +1,22 @@
 # agents/configs/supervisor_agent.yaml
-name: platform_supervisor
+name: supervisor_agent
 type: supervisor
+domain:
+  - 平台
+  - 中枢
+tags:
+  - 分派
+  - 分配任务
+  - 分配干系人
 
 model: core.llm:model
 
 # system_prompt 作为 planner 的额外补充指令（planner 基础提示由代码动态生成）
-system_prompt: |
-  分派规则：
-  1. 单点需求 → single 模式，一步完成。
-  2. 复合需求 → chain 模式，按功能定义 → 干系人 → PRD 的顺序依次调用，
-     把上一步输出作为下一步输入。
-  3. 若用户意图不清 → ask 模式，先追问。
-  4. 涉及高风险操作 → confirm 模式，等待人工确认。
+system_prompt:  |
+  
 
 tools:
-  # 子 agent 成员：planner 可调度，executor 通过 registry 调用
+  # 本中枢的成员清单：只声明 agent 名，能力描述与风险等级一律以能力注册表为准
+  # （agents/configs/<agent>.yaml + skills/<skill>.yaml 为唯一事实来源）
   - agent: product_agent
-    description: 把功能诉求转化为结构化功能定义。输入原始诉求，输出功能定义。
-    risk_level: low          # low=直接执行 / high=需 confirm 人工确认
+  - agent: fallback_agent

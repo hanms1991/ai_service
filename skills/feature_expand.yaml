@@ -1,0 +1,48 @@
+name: feature_expand
+display_name: 功能说明扩写
+description: 将零散的功能名称与功能点扩写为一段50～100字的专业功能说明（纯正文，无标题分点）。
+version: 1.0.0
+risk_level: low
+domain:
+  - 产品定义
+tags:
+  - 扩写
+  - 功能说明
+  - 文本生成
+
+system_prompt: |
+  你是一名资深产品经理，擅长将零散功能点整理为清晰、专业的功能说明。
+  你只输出一段功能说明正文，不要标题、编号、分点或解释。
+  不要输出 PRD、竞品分析、表格或列表。
+
+model_hint:
+  reasoning: disabled
+  
+# 输入参数
+inputs:
+  feature_name:
+    type: string
+    required: true
+    desc: 功能名称，例如 AEB自动紧急制动
+  feature_points:
+    type: string
+    required: false
+    desc: 功能点/关键诉求，多个点可用顿号或分号分隔；未提供则仅依据功能名称概括扩写
+
+# 输出形态（一句话，执行层据此校验）
+output:
+  format: plain_text
+
+prompt_template: |
+  请根据我提供的【功能名称】和【功能点】，扩写出一段50～100字的功能说明。
+
+  【功能名称】：{{feature_name}}
+  【功能点】：{{feature_points}}
+
+  写作要求：
+  1. 只输出一段功能说明正文，不要标题、编号、分点或解释。
+  2. 说明该功能面向什么场景或用户，解决什么问题，包含哪些关键操作或能力，以及最终结果或价值。
+  3. 必须覆盖输入的功能点，但可合并、概括表达，避免简单罗列。
+  4. 只基于输入信息扩写，不编造具体字段、接口、数值、权限或业务规则；信息不足时使用概括性表述。
+  5. 语言专业、简洁、通顺，符合产品需求文档风格。
+  6. 总字数含标点控制在50～100字。

@@ -26,6 +26,7 @@ import re
 from typing import Annotated, Any, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -43,8 +44,26 @@ from core.llm import model
 class PlanStep(BaseModel):
     """执行计划中的单个步骤。"""
     step_id: str = Field(description="步骤唯一标识，如 step_1")
-    tool: str = Field(description="要调用的 worker agent 名称")
-    input: str = Field(description="输入内容，可用 ${output_key} 引用前序步骤输出")
+    tool: str = Field(description="要调用的 worker agent 名称，必须取自能力注册表")
+    skill: str = Field(
+        default="",
+        description=(
+            "要执行的技能名，必须取自该 tool 在能力注册表中的技能列表；"
+            "Executor 据此一步直达，无需 worker 内部再选技能；"
+            "compose/ask/confirm 等不执行业务技能的步骤留空"
+        ),
+    )
+    inputs: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "技能输入参数，键名和取值必须符合技能 inputs 契约；"
+            "值中可用 ${output_key} 引用前序步骤输出；必填项缺失时应改用 ask 模式"
+        ),
+    )
+    input: str = Field(
+        default="",
+        description="未指定 skill 时的自由文本任务输入，可用 ${output_key} 引用前序步骤输出",
+    )
     output_key: str = Field(description="本步骤结果的存储键名")
     is_final: bool = Field(default=False, description="是否为最终输出步骤")
     mode: str = Field(
@@ -83,25 +102,23 @@ class SupervisorState(TypedDict):
 
 
 # ════════════════════════════════════════════════════════════════
-# 2. Worker 注册表（从 YAML 配置加载）
+# 2. 能力注册表（唯一事实来源，从 agents/configs + skills 的 yaml 加载）
 # ════════════════════════════════════════════════════════════════
-
-# name → {description, risk_level}
-_WORKER_REGISTRY: dict[str, dict] = {}
 
 # 需要人工审批的模式
 HIGH_RISK_MODES = {"confirm"}
 
+# supervisor YAML 中的 system_prompt（分派规则），作为 planner 额外指令
+_EXTRA_INSTRUCTIONS: str = ""
 
-def init_worker_registry(config: dict) -> None:
-    """从 supervisor YAML 配置的 tools 字段初始化 worker 描述。"""
-    _WORKER_REGISTRY.clear()
-    for spec in config.get("tools", []) or []:
-        if isinstance(spec, dict) and "agent" in spec:
-            _WORKER_REGISTRY[spec["agent"]] = {
-                "description": spec.get("description", ""),
-                "risk_level": spec.get("risk_level", "low"),
-            }
+
+def init_capability_registry(config: dict) -> None:
+    """从 supervisor YAML 的成员清单初始化能力注册表（含 Agent↔技能绑定与校验）。"""
+    from agents.capability_registry import init_registry_from_supervisor
+
+    global _EXTRA_INSTRUCTIONS
+    init_registry_from_supervisor(config)
+    _EXTRA_INSTRUCTIONS = config.get("system_prompt", "") or ""
 
 
 # ════════════════════════════════════════════════════════════════
@@ -109,32 +126,33 @@ def init_worker_registry(config: dict) -> None:
 # ════════════════════════════════════════════════════════════════
 
 def _build_planner_prompt(extra_instructions: str = "") -> str:
-    """根据可用 worker 列表动态生成 planner 的系统提示。"""
-    worker_list = "\n".join(
-        f"  - {name}（风险: {info.get('risk_level', 'low')}）: {info.get('description', '')}"
-        for name, info in _WORKER_REGISTRY.items()
-    )
+    """根据能力注册表动态生成 planner 的系统提示（注册表是唯一事实来源）。"""
+    from agents.capability_registry import render_planner_catalog
+
+    catalog = render_planner_catalog()
     return f"""你是汽车电子智能平台的总调度（Planner）。
 
 职责：分析用户意图，生成 JSON 执行计划。你只负责规划，绝不产出任何业务内容。
 
-可用 Worker Agent：
-{worker_list}
+可用能力目录（唯一事实来源，tool / skill / inputs 必须严格取自此处，禁止臆造）：
+{catalog}
 
 执行计划模式说明：
-- single:   单步执行，调用一个 worker 完成任务，is_final=true
-- chain:    链式执行，前一步输出作为下一步输入（用 ${{output_key}} 引用）
+- single:   单步执行，选定 tool+skill 一步完成任务，is_final=true
+- chain:    链式执行，前一步输出作为下一步技能输入（inputs 的值用 ${{output_key}} 引用）
 - compose:  组合多个步骤的输出为最终结果（不调 worker，模板拼装，is_final=true）
-- ask:      用户意图不清，暂停等待用户补充信息（is_final=false）
-- confirm:  高风险操作，暂停等待人工确认后才执行（is_final=false）
+- ask:      用户意图不清或技能必填输入缺失，暂停等待用户补充信息（is_final=false）
+- confirm:  高风险操作（技能风险=high），暂停等待人工确认后才执行（is_final=false）
 
-输出格式：严格输出 JSON，不要附加任何解释文字或 markdown 标记。
+输出格式：输出紧凑 JSON，不要换行和缩进，不要附加任何解释文字或 markdown 标记。
 {{
   "steps": [
     {{
       "step_id": "step_1",
-      "tool": "worker名称",
-      "input": "任务描述，可用 ${{prev_key}} 引用前序结果",
+      "tool": "能力目录中的 Agent 名",
+      "skill": "该 Agent 技能列表中的技能名",
+      "inputs": {{"参数名": "参数值，可引用 ${{prev_key}}"}},
+      "input": "仅在未指定 skill 时使用：自由文本任务描述",
       "output_key": "result_1",
       "is_final": true,
       "mode": "single"
@@ -143,20 +161,23 @@ def _build_planner_prompt(extra_instructions: str = "") -> str:
 }}
 
 规划规则：
-1. 至少一个步骤的 is_final 为 true
-2. 引用前序结果用 ${{output_key}} 格式（如 ${{feature_def}}）
-3. 意图不清时用 ask 模式向用户提问
-4. 高风险操作用 confirm 模式
-5. 不要自己编造业务内容，所有产出必须通过 worker 完成或 compose 拼装
+1. tool 必须与 skill 配对：先按能力描述选定 skill，其所属 Agent 即 tool；不要凭 Agent 摘要猜测输出形态。
+2. inputs 的键必须与技能输入契约完全一致，必填参数必须给出；用户未提供且无法推断时，先用 ask 模式追问，禁止编造。
+3. 至少一个步骤的 is_final 为 true；引用前序结果一律用 ${{output_key}} 格式。
+4. 技能风险=high 时必须用 confirm 模式；风险=low 直接执行。
+5. 不要自己编造业务内容，所有产出必须通过 tool+skill 完成或 compose 拼装。
 {extra_instructions}"""
 
 
 def planner_node(state: SupervisorState) -> dict:
     """Planner 节点：LLM 只输出 JSON 执行计划，不产出业务内容。"""
-    # with_structured_output 强制 LLM 返回符合 PlanSchema 的结构化 JSON
-    structured_model = model.with_structured_output(PlanSchema)
+    # 用 json_mode（response_format=json_object），兼容不支持 json_schema 的端点（如 DeepSeek）
+    # 提示词已强约束输出格式，Pydantic 做二次校验
+    structured_model = model.with_structured_output(
+        PlanSchema, method="json_mode"
+    )
 
-    prompt = _build_planner_prompt()
+    prompt = _build_planner_prompt(_EXTRA_INSTRUCTIONS)
     messages = [SystemMessage(content=prompt)] + state["messages"]
 
     plan: PlanSchema = structured_model.invoke(messages)
@@ -182,20 +203,29 @@ def _resolve_input(text: str, results: dict[str, str]) -> str:
     return re.sub(r"\$\{(\w+)\}", _replacer, text)
 
 
-def _call_worker(tool_name: str, task: str) -> str:
+def _call_worker(tool_name: str, task: str, runnable_config=None) -> str:
     """调用现有 worker agent，返回其最终文本输出。worker 不做任何修改。"""
     from agents.registry import get_worker
 
     worker = get_worker(tool_name)
+    invoke_kwargs = {}
+    if runnable_config is not None:
+        invoke_kwargs["config"] = runnable_config
     result = worker.invoke(
-        {"messages": [HumanMessage(content=task)]}
+        {"messages": [HumanMessage(content=task)]},
+        **invoke_kwargs,
     )
     return result["messages"][-1].content
 
 
-def executor_node(state: SupervisorState) -> dict:
-    """Executor 节点：纯代码按计划调用 worker agent。
+def executor_node(
+    state: SupervisorState,
+    config: RunnableConfig,
+) -> dict:
+    """Executor 节点：纯代码按计划调用 worker agent / 直连执行技能。
 
+    - 计划指定 skill → execute_skill 直连，Agent 角色提示 + 技能模板，一次 LLM 调用完成
+    - 未指定 skill   → 走 worker agent 自由文本调用（向后兼容）
     - is_final=True → 直接透传结果并设置 final_output
     - is_final=False → 存入 results[output_key] 继续下一步
     - confirm 模式 → interrupt 暂停等待人工审批
@@ -211,13 +241,20 @@ def executor_node(state: SupervisorState) -> dict:
 
     step = plan[step_index]
     tool_name = step["tool"]
-    raw_input = step["input"]
+    skill_name = step.get("skill") or ""
     output_key = step["output_key"]
     is_final = step.get("is_final", False)
     mode = step.get("mode", "single")
 
-    # 解析输入中的变量引用 ${output_key}
-    resolved_input = _resolve_input(raw_input, state.get("results", {}))
+    prior_results = state.get("results", {})
+
+    # 技能输入：解析值中的 ${output_key} 引用
+    skill_inputs = {
+        key: _resolve_input(str(value), prior_results)
+        for key, value in (step.get("inputs") or {}).items()
+    }
+    # 自由文本输入（未指定 skill 时使用）
+    resolved_input = _resolve_input(step.get("input", ""), prior_results)
 
     # ── compose 模式：不调 worker，直接拼装前序结果 ──
     if mode == "compose":
@@ -241,7 +278,8 @@ def executor_node(state: SupervisorState) -> dict:
         approval = interrupt({
             "step_id": step["step_id"],
             "tool": tool_name,
-            "input": resolved_input,
+            "skill": skill_name,
+            "input": resolved_input or skill_inputs,
             "message": f"步骤 {step['step_id']} 需要人工确认。输入 'yes' 继续，'no' 取消。",
         })
         if approval != "yes":
@@ -251,8 +289,17 @@ def executor_node(state: SupervisorState) -> dict:
                 "needs_human": False,
             }
 
-    # ── 调用 worker agent（single / chain / ask 后续 / confirm 后续）──
-    output = _call_worker(tool_name, resolved_input)
+    # ── 执行业务步骤 ──
+    if skill_name:
+        # tool+skill 一步直达：无需 worker 内部多轮选择技能
+        from agents.capability_registry import execute_skill
+
+        output = execute_skill(
+            tool_name, skill_name, skill_inputs, runnable_config=config
+        )
+    else:
+        # 向后兼容：未指定技能，交给 worker agent 自行决策
+        output = _call_worker(tool_name, resolved_input, config)
 
     # 更新状态
     new_results = {**state.get("results", {}), output_key: output}
@@ -309,8 +356,8 @@ def build_supervisor_graph(config: dict, base_dir=None) -> Any:
         内置 MemorySaver checkpointer 支持多轮记忆。
         调用时需传 config={"configurable": {"thread_id": "xxx"}}。
     """
-    # 初始化 worker 注册表（从 YAML 的 tools 字段加载可用 worker 及风险等级）
-    init_worker_registry(config)
+    # 初始化能力注册表（agents/configs + skills yaml 绑定校验，planner 目录据此生成）
+    init_capability_registry(config)
 
     # ── 构建 StateGraph ──
     graph = StateGraph(SupervisorState)

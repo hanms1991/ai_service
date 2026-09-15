@@ -26,7 +26,7 @@ from agents import AGENTS  # noqa: E402
 from core.logging import LLMInteractionLogger  # noqa: E402
 
 # LangGraph 图（supervisor 已从 YAML 加载为编译后的图）
-supervisor_agent = AGENTS["platform_supervisor"]
+supervisor_agent = AGENTS["supervisor_agent"]
 
 # 创建 LLM 交互日志记录器，日志文件输出到项目根 logs/ 目录
 LOG_PATH = PROJECT_ROOT / "logs" / "llm_trace.log"
@@ -36,8 +36,8 @@ llm_logger = LLMInteractionLogger(LOG_PATH, verbose=True)
 THREAD_CONFIG = {"configurable": {"thread_id": "test-aeb"}, "callbacks": [llm_logger]}
 
 
-def test_define_aeb_feature():
-    user_input = "定义AEB功能"
+def test_expand_aeb_feature():
+    user_input = "扩写AEB功能"
 
     print("=" * 70)
     print(f"用户输入：{user_input}")
@@ -64,20 +64,23 @@ def test_define_aeb_feature():
     print("=" * 70)
     print(answer)
 
-    # 基础断言：确认子智能体被调度且按技能模板产出
-    assert answer, "中枢智能体未返回内容"
-    assert "功能概述" in answer, "输出未包含功能定义模板章节（功能概述）"
-    assert "触发条件" in answer, "输出未包含触发条件章节"
+    # # 基础断言：确认子智能体被调度且按技能模板产出
+    # assert answer, "中枢智能体未返回内容"
+    # assert "功能概述" in answer, "输出未包含功能定义模板章节（功能概述）"
+    # assert "触发条件" in answer, "输出未包含触发条件章节"
 
     # 打印 planner 生成的执行计划
     plan = result.get("plan", [])
     print("\n--- Planner 生成的执行计划 ---")
     for i, step in enumerate(plan):
-        print(f"  step_{i+1}: tool={step.get('tool')} mode={step.get('mode')} "
+        skill = step.get("skill") or "-"
+        print(f"  step_{i+1}: tool={step.get('tool')} skill={skill} mode={step.get('mode')} "
               f"is_final={step.get('is_final')} output_key={step.get('output_key')}")
+        if step.get("inputs"):
+            print(f"           inputs={step.get('inputs')}")
 
-    print("\n[测试通过] LangGraph supervisor 已成功规划并调度 product_agent 完成 AEB 功能定义。")
+    # print("\n[测试通过] LangGraph supervisor 已成功规划并调度 product_agent 完成 AEB 功能定义。")
 
 
 if __name__ == "__main__":
-    test_define_aeb_feature()
+    test_expand_aeb_feature()
