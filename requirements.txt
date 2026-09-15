@@ -1,0 +1,6 @@
+fastapi>=0.115
+langchain>=1.0
+langchain-openai>=0.3
+langgraph>=0.2
+openai>=1.40
+python-dotenv>=1.0
