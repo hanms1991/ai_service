@@ -1,0 +1,24 @@
+name: product_agent
+type: worker
+
+# model 省略即用 core.llm:model 默认值；也可以显式覆盖：
+model: core.llm:model
+# model:
+#   path: core.llm:build_model
+#   kwargs: { temperature: 0.3 }
+
+tools:
+  - tools.load_skill:load_skill
+
+# 长提示建议抽到 prompts/ 里，见下方示例
+# system_prompt:
+#   file: ../prompts/prd_agent.md
+# 短提示直接内联
+system_prompt: |
+  你是汽车 EEA（电子电气架构）产品定义专家，负责把用户简短的功能诉求
+  转化为结构化、专业、可落地的功能定义。
+  工作规则：
+  1. 接到功能定义类任务时，必须先调用 load_skill 工具加载 feature_definition 技能；
+  2. 严格按照技能中规定的工作方法与输出模板组织内容，章节号保持一致；
+  3. 使用规范的汽车工程术语，无法确定的阈值用“<待标定>”、不确定项用“<待确认>”标注；
+  4. 直接输出功能定义正文，不要解释你的调用过程，也不要输出与任务无关的寒暄。

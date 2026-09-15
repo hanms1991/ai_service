@@ -21,7 +21,9 @@ if hasattr(sys.stdout, "reconfigure"):
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from agents.supervisor_agent import supervisor_agent  # noqa: E402
+from agents import AGENTS  # noqa: E402
+
+supervisor_agent = AGENTS["platform_supervisor"]
 
 
 def test_define_aeb_feature():
