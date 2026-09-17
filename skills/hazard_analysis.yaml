@@ -1,0 +1,64 @@
+name: hazard_analysis
+display_name: 功能安全危害分析
+description: 基于功能/系统描述与运行场景，识别危害事件、原因与后果，完成初步风险评估并给出安全目标建议。
+version: 1.0.0
+risk_level: medium
+domain:
+  - 功能安全
+  - 汽车电子
+tags:
+  - 危害分析
+  - HARA
+  - 风险评估
+  - 安全目标
+  - ISO 26262
+
+model_hint:
+  reasoning: enabled
+
+inputs:
+  item_definition:
+    type: string
+    required: true
+    desc: 分析对象/功能/系统描述，例如 AEB 自动紧急制动系统
+  operational_scenarios:
+    type: string
+    required: false
+    desc: 运行场景、边界条件、环境与人员状态，例如高速跟车、雨天、驾驶员分心
+  known_hazards:
+    type: string
+    required: false
+    desc: 已知危害/关注点/失效模式，多个可用顿号或分号分隔
+  standard:
+    type: string
+    required: false
+    desc: 适用标准，例如 ISO 26262、IEC 61508；未提供时按通用功能安全方法分析
+
+output:
+  format: markdown
+  schema: |
+    ## 分析范围
+    ...
+    ## 危害分析表
+    | 危害事件 | 运行场景 | 危害原因 | 潜在后果 | S | E | C | ASIL | 安全目标 |
+    |---|---|---|---|---|---|---|---|---|
+    ...
+    ## 安全目标建议
+    ...
+
+prompt_template: |
+  请根据以下输入，完成功能安全危害分析（HARA）。
+
+  【分析对象/功能】：{{item_definition}}
+  【运行场景/边界条件】：{{operational_scenarios}}
+  【已知危害/关注点】：{{known_hazards}}
+  【适用标准】：{{standard}}
+
+  输出要求：
+  1. 使用 Markdown 输出，包含“分析范围”“危害分析表”“安全目标建议”三部分。
+  2. 危害分析表至少包含：危害事件、运行场景、危害原因、潜在后果、严重度 S、暴露度 E、可控性 C、ASIL、安全目标。
+  3. S/E/C 按适用标准定义评估；若标准未提供，使用通用功能安全 HARA 方法，并标注为初步评估。
+  4. ASIL 根据 S/E/C 组合给出；若为非汽车领域，可输出 SIL 或等效完整性等级。
+  5. 只基于输入信息分析，不编造具体字段、接口、数值、权限或业务规则；信息不足时明确标注“待确认”。
+  6. 安全目标应可验证、可追溯，并与危害事件对应。
+  7. 总字数控制在 300～800 字（不含表格格式符号）。

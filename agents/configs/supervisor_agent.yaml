@@ -19,4 +19,5 @@ tools:
   # 本中枢的成员清单：只声明 agent 名，能力描述与风险等级一律以能力注册表为准
   # （agents/configs/<agent>.yaml + skills/<skill>.yaml 为唯一事实来源）
   - agent: product_agent
+  - agent: functional_safety_agent
   - agent: fallback_agent
