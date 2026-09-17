@@ -64,11 +64,6 @@ def test_expand_aeb_feature():
     print("=" * 70)
     print(answer)
 
-    # # 基础断言：确认子智能体被调度且按技能模板产出
-    # assert answer, "中枢智能体未返回内容"
-    # assert "功能概述" in answer, "输出未包含功能定义模板章节（功能概述）"
-    # assert "触发条件" in answer, "输出未包含触发条件章节"
-
     # 打印 planner 生成的执行计划
     plan = result.get("plan", [])
     print("\n--- Planner 生成的执行计划 ---")
