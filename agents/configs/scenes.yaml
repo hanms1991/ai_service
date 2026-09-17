@@ -1,0 +1,39 @@
+# 场景码 → (agent, skill) 映射，后端只传 scene，不传 agent/skill 名称
+# 改名/拆分/换 Agent 时只需改本文件，后端零改动
+scenes:
+  ONE_CLICK_EXPAND:
+    description: 一键扩写功能说明（50~100字）
+    agent: product_agent
+    skill: feature_expand
+    response_format: text          # text | json
+    timeout_seconds: 30            # 可覆盖请求级默认超时
+
+  DEFINE_FEATURE:
+    description: 定义完整功能（10章结构化定义）
+    agent: product_agent
+    skill: feature_definition
+    response_format: text
+    timeout_seconds: 120
+
+  PROMPT_EXPAND:
+    description: 提示词扩写
+    agent: product_agent
+    skill: prompt_expand
+    response_format: text
+    timeout_seconds: 30
+
+  # 以下为预留场景码（对应技能尚未创建时，启动校验会报错 → 先注释
+  # 等业务后台真正用到的场景码再启用，避免启动期报错阻塞）
+  # GENERATE_UC:
+  #   description: 生成结构化用例（JSON）
+  #   agent: product_agent
+  #   skill: use_case_generate
+  #   response_format: json
+  #   timeout_seconds: 60
+
+  # GENERATE_PRD:
+  #   description: 生成完整 PRD 文档（多步链式，走 Planner）
+  #   agent: product_agent
+  #   skill: ""                     # 空 skill = 走 Planner 智能编排
+  #   response_format: text
+  #   timeout_seconds: 600

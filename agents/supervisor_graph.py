@@ -344,16 +344,19 @@ def route_after_executor(
 # 6. 图组装
 # ════════════════════════════════════════════════════════════════
 
-def build_supervisor_graph(config: dict, base_dir=None) -> Any:
+def build_supervisor_graph(config: dict, base_dir=None, checkpointer: Any = None) -> Any:
     """构建规划-执行分离的 Supervisor LangGraph。
 
     Args:
         config:   supervisor YAML 配置字典
         base_dir: YAML 文件所在目录（用于解析 system_prompt 外部文件引用）
+        checkpointer: 可注入的 LangGraph checkpointer（默认 None → 内部 MemorySaver）。
+                      FastAPI 启动时注入 AsyncSqliteSaver 实现跨进程持久化，
+                      test/test.py 等独立运行场景保持默认 MemorySaver 不变。
 
     Returns:
         编译后的 CompiledStateGraph，支持 invoke / stream，
-        内置 MemorySaver checkpointer 支持多轮记忆。
+        内置 Checkpointer 支持多轮记忆。
         调用时需传 config={"configurable": {"thread_id": "xxx"}}。
     """
     # 初始化能力注册表（agents/configs + skills yaml 绑定校验，planner 目录据此生成）
@@ -380,5 +383,7 @@ def build_supervisor_graph(config: dict, base_dir=None) -> Any:
     )
 
     # ── 编译图，带 Checkpointer 支持多轮记忆 ──
-    checkpointer = MemorySaver()
+    # 未注入时回退到 MemorySaver（保持向后兼容 test.py）；API 启动时注入 AsyncSqliteSaver
+    if checkpointer is None:
+        checkpointer = MemorySaver()
     return graph.compile(checkpointer=checkpointer)

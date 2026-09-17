@@ -18,7 +18,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -400,6 +402,220 @@ def execute_skill(
         **invoke_kwargs,
     )
     return response.content
+
+
+# ════════════════════════════════════════════════════════════════
+# 5B. 技能执行 v2（对外 API 使用：返回结构化结果 + usage + reference_data 注入）
+# ════════════════════════════════════════════════════════════════
+
+# reference_data 注入阈值：50KB（硬阈值，超限直接报错，不做摘要降级）
+REFERENCE_DATA_MAX_BYTES = 50 * 1024
+
+
+@dataclass
+class SkillResult:
+    """技能执行的统一返回结构（v2）。
+
+    text:       LLM 原始文本输出（结构化技能时为未解析的 JSON 字符串）
+    structured: 按 output.schema 校验通过的对象；非结构化技能为 None
+    usage:      token 使用统计（从 response.usage_metadata 提取）
+    """
+    text: str
+    structured: dict | list | None = None
+    usage: dict[str, Any] = field(default_factory=dict)
+
+
+def _extract_usage(response: Any) -> dict[str, Any]:
+    """从 LLM 响应中提取 token 使用统计（兼容 usage_metadata 与 response_metadata）。"""
+    usage_meta = getattr(response, "usage_metadata", None)
+    if usage_meta and isinstance(usage_meta, dict):
+        return {
+            "prompt_tokens": usage_meta.get("input_tokens", usage_meta.get("prompt_tokens", 0)),
+            "completion_tokens": usage_meta.get("output_tokens", usage_meta.get("completion_tokens", 0)),
+            "total_tokens": usage_meta.get("total_tokens", 0),
+        }
+    # 兜底：response_metadata.openai_token_usage
+    resp_meta = getattr(response, "response_metadata", {}) or {}
+    token_usage = resp_meta.get("token_usage") or resp_meta.get("openai_token_usage") or {}
+    if token_usage:
+        return {
+            "prompt_tokens": token_usage.get("prompt_tokens", 0),
+            "completion_tokens": token_usage.get("completion_tokens", 0),
+            "total_tokens": token_usage.get("total_tokens", 0),
+        }
+    return {}
+
+
+def _build_reference_block(reference_data: dict[str, Any] | None) -> str:
+    """把 reference_data 渲染成注入 prompt 末尾的只读参考段。
+
+    - None 或空 → 返回空串（不注入）
+    - 超过 50KB → ValueError（调用方需捕获转 REFERENCE_DATA_TOO_LARGE）
+    """
+    if not reference_data:
+        return ""
+
+    # 紧凑 JSON 序列化后取字节数（UTF-8 编码下与字符长度的近似估计）
+    compact = json.dumps(reference_data, ensure_ascii=False, separators=(",", ":"))
+    if len(compact.encode("utf-8")) > REFERENCE_DATA_MAX_BYTES:
+        raise ValueError(
+            f"reference_data 超过 {REFERENCE_DATA_MAX_BYTES // 1024}KB 阈值，"
+            f"当前 {len(compact.encode('utf-8'))} 字节；请后台预取时做裁剪/分页"
+        )
+
+    return (
+        "\n\n【参考数据（只读资料，仅供你参考，不要原样罗列或照搬其字段名）】\n"
+        f"{compact}"
+    )
+
+
+def _validate_structured_output(raw_text: str, schema: dict | None) -> dict | list | None:
+    """对结构化技能：用 output.schema 校验 LLM 输出。
+
+    - schema 为 None → 返回 None（非结构化技能）
+    - 解析 + 校验失败 → ValueError（由调用方转为 SKILL_OUTPUT_INVALID）
+    """
+    if not schema:
+        return None
+
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"结构化技能输出无法解析为 JSON：{e}；原始文本前 200 字符：{raw_text[:200]!r}"
+        ) from e
+
+    # 一期做轻量校验：type / required 字段存在性
+    # （完整 JSON Schema 校验可后续引入 jsonschema 库）
+    _lightweight_schema_check(parsed, schema)
+    return parsed
+
+
+def _lightweight_schema_check(instance: Any, schema: dict, path: str = "$") -> None:
+    """对 JSON Schema Draft 2020-12 子集做轻量校验。
+
+    覆盖：type / required / properties / items。
+    不覆盖：additionalProperties、pattern、format、min/max 等。
+    """
+    if not isinstance(schema, dict):
+        return
+
+    # type 校验
+    expected_type = schema.get("type")
+    if expected_type:
+        type_map = {
+            "object": dict, "array": list, "string": str,
+            "number": (int, float), "integer": int, "boolean": bool,
+        }
+        py_type = type_map.get(expected_type)
+        if py_type and not isinstance(instance, py_type):
+            raise ValueError(
+                f"{path} 类型应为 {expected_type}，实际为 {type(instance).__name__}"
+            )
+
+    # object：required + properties 递归
+    if isinstance(instance, dict):
+        required = schema.get("required") or []
+        missing = [k for k in required if k not in instance]
+        if missing:
+            raise ValueError(f"{path} 缺少必填字段：{', '.join(missing)}")
+        properties = schema.get("properties") or {}
+        for k, v in instance.items():
+            if k in properties:
+                _lightweight_schema_check(v, properties[k], f"{path}.{k}")
+
+    # array：items 递归（校验每个元素）
+    if isinstance(instance, list) and "items" in schema:
+        items_schema = schema["items"]
+        for i, item in enumerate(instance):
+            _lightweight_schema_check(item, items_schema, f"{path}[{i}]")
+
+
+def execute_skill_v2(
+    agent_name: str,
+    skill_name: str,
+    inputs: dict[str, Any],
+    *,
+    reference_data: dict[str, Any] | None = None,
+    runnable_config: Any = None,
+) -> SkillResult:
+    """对外 API 使用的技能执行入口（v2）。
+
+    与旧 execute_skill 的区别：
+      1. 返回 SkillResult(text, structured, usage)，而非裸字符串；
+      2. 支持 output.schema 结构化校验（json_mode + 轻量 schema 校验）；
+      3. 支持 reference_data 注入（模式 A，只读上下文追加到用户消息末尾）；
+      4. 旧函数保留不动，向 LangGraph Executor 完全兼容。
+
+    Args:
+        agent_name:     Agent 名（必须存在于注册表）
+        skill_name:     技能名（必须由该 Agent 绑定）
+        inputs:         技能输入，键必须符合技能 inputs 契约
+        reference_data: 后端预取的业务资料（只读注入，50KB 阈值）
+        runnable_config: LangChain RunnableConfig（透传 callbacks，使日志记录生效）
+
+    Raises:
+        ValueError: reference_data 超阈值 / 结构化输出未通过校验
+        KeyError:   Agent/技能未在注册表绑定
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    from agents.generate_agent import _resolve_model, _resolve_system_prompt
+
+    skill_cfg = validate_binding(agent_name, skill_name)
+    agent_cfg = load_agent_config(agent_name)
+
+    rendered = render_prompt_template(
+        skill_cfg["prompt_template"],
+        inputs or {},
+        skill_cfg.get("inputs", {}),
+    )
+
+    # ── 模式 A：reference_data 注入（只读段追加到 prompt 末尾） ──
+    ref_block = _build_reference_block(reference_data)
+    user_message = rendered + ref_block
+
+    # ── model_hint：叠加 skill 的推理开关/档位等 ──
+    llm = _build_model_with_hint(
+        _resolve_model(agent_cfg.get("model")),
+        skill_cfg.get("model_hint"),
+    )
+
+    # ── system_prompt 覆盖策略：skill 优先，agent 兜底 ──
+    skill_system = skill_cfg.get("system_prompt")
+    if skill_system:
+        system_prompt = _resolve_system_prompt(skill_system, SKILLS_DIR)
+    else:
+        system_prompt = _resolve_system_prompt(
+            agent_cfg.get("default_system_prompt", ""), CONFIGS_DIR
+        )
+
+    # ── 结构化技能：json_mode 约束 LLM 输出 ──
+    output_cfg = skill_cfg.get("output", {}) or {}
+    output_format = output_cfg.get("format", "plain_text")
+    output_schema = output_cfg.get("schema")
+
+    invoke_model = llm
+    if output_format == "json" and output_schema:
+        # json_mode：要求 LLM 输出合法 JSON（提示词已强约束 schema）
+        invoke_model = llm.bind(response_format={"type": "json_object"})
+
+    invoke_kwargs: dict[str, Any] = {}
+    if runnable_config is not None:
+        invoke_kwargs["config"] = runnable_config
+
+    response = invoke_model.invoke(
+        [SystemMessage(content=system_prompt), HumanMessage(content=user_message)],
+        **invoke_kwargs,
+    )
+    raw_text = response.content if isinstance(response.content, str) else str(response.content)
+
+    # ── 结构化校验：失败抛 ValueError，由 API 层转 SKILL_OUTPUT_INVALID ──
+    structured = _validate_structured_output(raw_text, output_schema)
+
+    usage = _extract_usage(response)
+
+    return SkillResult(text=raw_text, structured=structured, usage=usage)
 
 
 # ════════════════════════════════════════════════════════════════
