@@ -273,7 +273,7 @@ def render_planner_catalog(registry: dict[str, Any] | None = None) -> str:
     for agent_name, info in registry.get("agents", {}).items():
         lines = [f"### {agent_name}", f"定位：{info.get('description') or '（未填写 description）'}"]
         if info.get("skills"):
-            lines.append("技能（tool 必须与 skill 配对，且 skill 必须取自本列表）：")
+            lines.append("技能（skill 可选；选用 skill 时必须取自本列表；省略 skill 表示用该 Agent 的通用对话能力）：")
             for skill_name, skill in info["skills"].items():
                 output = skill.get("output", {})
                 out_desc = output.get("format", "plain_text")

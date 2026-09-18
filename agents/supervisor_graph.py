@@ -31,7 +31,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.types import interrupt
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import TypedDict
 
 from core.llm import model
@@ -44,13 +44,20 @@ from core.llm import model
 class PlanStep(BaseModel):
     """执行计划中的单个步骤。"""
     step_id: str = Field(description="步骤唯一标识，如 step_1")
-    tool: str = Field(description="要调用的 worker agent 名称，必须取自能力注册表")
+    tool: str = Field(
+        default="",
+        description=(
+            "要调用的 worker agent 名称，必须取自能力注册表；"
+            "闲聊/通用问答等中枢自行处理的步骤留空（tool=''）；"
+            "compose 等不调用 worker 的步骤也留空"
+        ),
+    )
     skill: str = Field(
         default="",
         description=(
             "要执行的技能名，必须取自该 tool 在能力注册表中的技能列表；"
             "Executor 据此一步直达，无需 worker 内部再选技能；"
-            "compose/ask/confirm 等不执行业务技能的步骤留空"
+            "compose/ask/confirm/闲聊 等不执行业务技能的步骤留空"
         ),
     )
     inputs: dict[str, str] | None = Field(
@@ -76,6 +83,12 @@ class PlanStep(BaseModel):
             "confirm: 高风险，暂停等待人工确认"
         ),
     )
+
+    # LLM 常输出 null 表示"无"，Pydantic 默认拒绝 null → 强制转为空串
+    @field_validator("tool", "skill", mode="before")
+    @classmethod
+    def _coerce_none_to_empty(cls, v: Any) -> str:
+        return v if isinstance(v, str) else ""
 
 
 class PlanSchema(BaseModel):
@@ -138,9 +151,11 @@ def _build_planner_prompt(extra_instructions: str = "") -> str:
 {catalog}
 
 执行计划模式说明：
-- single:   单步执行，选定 tool+skill 一步完成任务，is_final=true
+- single:   单步执行。选定 tool+skill 一步完成任务，is_final=true；
+            若只需该 Agent 通用对话（如功能简介、常识问答），省略 skill，把用户意图写入 input 字段即可
 - chain:    链式执行，前一步输出作为下一步技能输入（inputs 的值用 ${{output_key}} 引用）
-- compose:  组合多个步骤的输出为最终结果（不调 worker，模板拼装，is_final=true）
+- compose:  组合多个步骤的输出为最终结果（不调 worker，tool 与 skill 留空，is_final=true）；
+            在 input 中写含 ${{output_key}} 的拼装模板，或在 inputs 中按展示顺序给出各 ${{output_key}} 引用
 - ask:      用户意图不清或技能必填输入缺失，暂停等待用户补充信息（is_final=false）
 - confirm:  高风险操作（技能风险=high），暂停等待人工确认后才执行（is_final=false）
 
@@ -149,8 +164,8 @@ def _build_planner_prompt(extra_instructions: str = "") -> str:
   "steps": [
     {{
       "step_id": "step_1",
-      "tool": "能力目录中的 Agent 名",
-      "skill": "该 Agent 技能列表中的技能名",
+      "tool": "能力目录中的 Agent 名，闲聊自处理时留空",
+      "skill": "该 Agent 技能列表中的技能名，不执行技能时留空",
       "inputs": {{"参数名": "参数值，可引用 ${{prev_key}}"}},
       "input": "仅在未指定 skill 时使用：自由文本任务描述",
       "output_key": "result_1",
@@ -161,11 +176,16 @@ def _build_planner_prompt(extra_instructions: str = "") -> str:
 }}
 
 规划规则：
-1. tool 必须与 skill 配对：先按能力描述选定 skill，其所属 Agent 即 tool；不要凭 Agent 摘要猜测输出形态。
+1. tool 与 skill 均可选：
+   - 闲聊、通用问答、寒暄等不涉及专业能力的请求：tool 与 skill 均留空（""），
+     把用户原文写入 input 字段，mode=single，is_final=true——由中枢自行回答。
+   - 需要某 Agent 通用对话（如"介绍 XX 功能"）：只填 tool，省略 skill，把意图写入 input。
+   - 需要执行具体技能（如"写功能定义"）：tool + skill 配对，inputs 按契约填写。
+   判断依据：用户请求是否匹配某 Agent 的专业领域或某技能的输入契约——都不匹配则中枢自处理。
 2. inputs 的键必须与技能输入契约完全一致，必填参数必须给出；用户未提供且无法推断时，先用 ask 模式追问，禁止编造。
 3. 至少一个步骤的 is_final 为 true；引用前序结果一律用 ${{output_key}} 格式。
 4. 技能风险=high 时必须用 confirm 模式；风险=low 直接执行。
-5. 不要自己编造业务内容，所有产出必须通过 tool+skill 完成或 compose 拼装。
+5. 不要自己编造业务内容，所有产出必须通过 tool（含 skill 或通用对话）或 compose 拼装完成。
 {extra_instructions}"""
 
 
@@ -218,6 +238,28 @@ def _call_worker(tool_name: str, task: str, runnable_config=None) -> str:
     return result["messages"][-1].content
 
 
+# 中枢自处理时使用的系统提示（闲聊、通用问答、澄清等不需派给专业 Agent 的场景）
+_SELF_HANDLE_PROMPT: str = (
+    "你是汽车研发智能平台的中枢助手。当前用户请求属于闲聊或通用问答，"
+    "无需派发给专业子 Agent，由你直接回答。\n"
+    "要求：自然、简洁、友好地回复；不知道就如实说明，不要编造。"
+    "若用户有汽车研发专业需求（功能定义、功能扩写、功能安全等），"
+    "可简要说明平台能提供哪些帮助。"
+)
+
+
+def _self_handle(task: str, runnable_config=None) -> str:
+    """中枢自行处理闲聊/通用问答：用核心模型直接回答，不派给 worker agent。"""
+    invoke_kwargs = {}
+    if runnable_config is not None:
+        invoke_kwargs["config"] = runnable_config
+    response = model.invoke(
+        [SystemMessage(content=_SELF_HANDLE_PROMPT), HumanMessage(content=task)],
+        **invoke_kwargs,
+    )
+    return response.content
+
+
 def executor_node(
     state: SupervisorState,
     config: RunnableConfig,
@@ -240,7 +282,7 @@ def executor_node(
         return {"final_output": state.get("final_output") or "计划已执行完毕。"}
 
     step = plan[step_index]
-    tool_name = step["tool"]
+    tool_name = step.get("tool", "")
     skill_name = step.get("skill") or ""
     output_key = step["output_key"]
     is_final = step.get("is_final", False)
@@ -258,10 +300,18 @@ def executor_node(
 
     # ── compose 模式：不调 worker，直接拼装前序结果 ──
     if mode == "compose":
+        # 优先用 input 拼装模板（其中 ${output_key} 已解析）；
+        # 模板为空时，按 inputs 中各引用片段的声明顺序拼接
+        if resolved_input.strip():
+            composed = resolved_input
+        else:
+            composed = "\n\n".join(
+                str(v).strip() for v in skill_inputs.values() if str(v).strip()
+            )
         return {
-            "final_output": resolved_input,
+            "final_output": composed,
             "step_index": step_index + 1,
-            "messages": [AIMessage(content=resolved_input)],
+            "messages": [AIMessage(content=composed)],
         }
 
     # ── ask 模式：interrupt 等待用户补充信息 ──
@@ -297,9 +347,12 @@ def executor_node(
         output = execute_skill(
             tool_name, skill_name, skill_inputs, runnable_config=config
         )
-    else:
-        # 向后兼容：未指定技能，交给 worker agent 自行决策
+    elif tool_name:
+        # 指定了 tool 但未指定 skill：交给 worker agent 通用对话
         output = _call_worker(tool_name, resolved_input, config)
+    else:
+        # tool 也为空：中枢自处理闲聊/通用问答
+        output = _self_handle(resolved_input, config)
 
     # 更新状态
     new_results = {**state.get("results", {}), output_key: output}

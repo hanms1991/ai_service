@@ -4,20 +4,29 @@ type: supervisor
 domain:
   - 平台
   - 中枢
+  - 对话入口
+  - 任务编排
+  - 兜底
 tags:
   - 分派
   - 分配任务
   - 分配干系人
+  - 意图识别
+  - 路由
+  - 结果汇总
+  - 闲聊兜底
+  - 澄清
 
 model: core.llm:model
 
 # system_prompt 作为 planner 的额外补充指令（planner 基础提示由代码动态生成）
 system_prompt:  |
-  
+  你是一个智能中枢，负责协调和管理多个智能体的运行。
+  你的任务是根据用户输入，识别其意图，路由到合适的智能体，汇总结果，处理闲聊和澄清用户需求。
 
 tools:
   # 本中枢的成员清单：只声明 agent 名，能力描述与风险等级一律以能力注册表为准
   # （agents/configs/<agent>.yaml + skills/<skill>.yaml 为唯一事实来源）
   - agent: product_agent
   - agent: functional_safety_agent
-  - agent: fallback_agent
+  # - agent: fallback_agent

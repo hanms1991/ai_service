@@ -26,6 +26,7 @@ from typing import AsyncIterator
 import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.deps import get_api_keys
@@ -250,6 +251,15 @@ def create_app() -> FastAPI:
     app.include_router(invoke.router, prefix="/api/v1")
     app.include_router(tasks.router, prefix="/api/v1")
     app.include_router(capabilities.router, prefix="/api/v1")
+
+    # Playground 静态调试台（同源免 CORS；html=True 使 /playground 直达 index.html）
+    playground_dir = PROJECT_ROOT / "playground"
+    if playground_dir.is_dir():
+        app.mount(
+            "/playground",
+            StaticFiles(directory=str(playground_dir), html=True),
+            name="playground",
+        )
 
     return app
 

@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agent Playground</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- 顶栏：服务地址 / 密钥 / 就绪状态 / 会话操作 -->
+  <header id="topbar">
+    <span class="brand">Agent Playground</span>
+    <input id="api-base" class="top-input" placeholder="API Base（留空 = 同源）" spellcheck="false" />
+    <input id="api-key" class="top-input" type="password" placeholder="X-API-Key" spellcheck="false" />
+    <button id="btn-ready" class="btn ghost" data-action="check-ready" title="重新检测服务就绪状态">
+      <span id="ready-dot" class="dot gray"></span><span id="ready-text">检测就绪</span>
+    </button>
+    <span class="spacer"></span>
+    <button id="btn-new" class="btn" data-action="new-session">新建会话</button>
+  </header>
+
+  <main id="layout">
+    <!-- 左：对话区 -->
+    <section id="chat-pane">
+      <!-- 场景 / 发送方式 / inputs -->
+      <div id="scene-bar">
+        <select id="scene-select" title="场景码（选定后跳过 Planner 直达技能）"></select>
+        <select id="mode-select" title="发送方式">
+          <option value="sync">同步 /invoke</option>
+          <option value="async">异步 /tasks</option>
+        </select>
+        <button id="btn-inputs" class="btn ghost" data-action="toggle-inputs">inputs</button>
+      </div>
+      <textarea id="inputs-json" class="hidden" rows="4" spellcheck="false"
+        placeholder='inputs JSON（选定场景后生效），例如：{"requirement_id": "REQ-001"}'></textarea>
+
+      <!-- 消息流 -->
+      <div id="messages"></div>
+
+      <!-- 输入区 -->
+      <div id="composer">
+        <textarea id="user-input" rows="2" placeholder="输入消息…（Enter 发送，Shift+Enter 换行）"></textarea>
+        <button id="btn-send" data-action="send">发送</button>
+      </div>
+    </section>
+
+    <!-- 右：调试面板 -->
+    <aside id="debug-pane">
+      <div class="pane-title">调试面板</div>
+      <div id="debug-meta" class="debug-meta">尚未发起请求</div>
+      <div class="pane-sec">最近请求体</div>
+      <pre id="debug-req" class="debug-pre">// -</pre>
+      <div class="pane-sec">最近响应</div>
+      <pre id="debug-res" class="debug-pre">// -</pre>
+      <div class="pane-sec">历史会话</div>
+      <ul id="session-list"></ul>
+    </aside>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
