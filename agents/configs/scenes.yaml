@@ -8,19 +8,28 @@ scenes:
     response_format: text          # text | json
     timeout_seconds: 30            # 可覆盖请求级默认超时
 
-  DEFINE_FEATURE:
-    description: 定义完整功能（10章结构化定义）
+  PRD_GENERATE:
+    description: 生成完整汽车功能 PRD 文档（Markdown）
     agent: product_agent
-    skill: feature_definition
+    skill: prd_generation
     response_format: text
     timeout_seconds: 120
 
-  PROMPT_EXPAND:
-    description: 提示词扩写
-    agent: product_agent
-    skill: prompt_expand
-    response_format: text
-    timeout_seconds: 30
+  # 以下场景码已弃用（对应 skill 已从 product_agent.yaml 的 skills 列表移除）
+  # 如需恢复：先在 product_agent.yaml 取消对应 skill 的注释，再取消下方注释
+  # DEFINE_FEATURE:
+  #   description: 定义完整功能（10章结构化定义）
+  #   agent: product_agent
+  #   skill: feature_definition
+  #   response_format: text
+  #   timeout_seconds: 120
+  #
+  # PROMPT_EXPAND:
+  #   description: 提示词扩写
+  #   agent: product_agent
+  #   skill: prompt_expand
+  #   response_format: text
+  #   timeout_seconds: 30
 
   # 以下为预留场景码（对应技能尚未创建时，启动校验会报错 → 先注释
   # 等业务后台真正用到的场景码再启用，避免启动期报错阻塞）
