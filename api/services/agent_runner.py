@@ -12,7 +12,9 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +43,11 @@ from agents.capability_registry import (
     get_registry,
     validate_binding,
 )
+
+
+# ── 同步 invoke 默认超时（秒）：scene 未配置且请求未指定时使用 ──
+# 与异步任务默认时限对齐（_DEFAULT_ASYNC_TIMEOUT=600）
+_DEFAULT_SYNC_TIMEOUT = int(os.getenv("SYNC_INVOKE_TIMEOUT_SECONDS", "600"))
 
 
 # ── 单例图句柄（lifespan 启动时注入） ──
@@ -168,14 +175,24 @@ async def run_invoke(
                 inputs or {}, skill_cfg.get("inputs", {}), binding.skill
             )
 
+            # 同步路径整体时限：req 优先 → scene 配置 → 默认 600s
+            # 超时抛 INVOKE_TIMEOUT（408），避免 vLLM 后台继续吐 token 而客户端已断
+            effective_timeout = (
+                timeout_seconds or binding.timeout_seconds or _DEFAULT_SYNC_TIMEOUT
+            )
             try:
-                result: SkillResult = await _execute_skill_v2_async(
-                    binding.agent,
-                    binding.skill,
-                    inputs or {},
-                    reference_data=reference_data,
-                    runnable_config=runnable_config,
+                result: SkillResult = await asyncio.wait_for(
+                    _execute_skill_v2_async(
+                        binding.agent,
+                        binding.skill,
+                        inputs or {},
+                        reference_data=reference_data,
+                        runnable_config=runnable_config,
+                    ),
+                    timeout=effective_timeout,
                 )
+            except asyncio.TimeoutError:
+                raise invoke_timeout(task_id, effective_timeout)
             except ValueError as e:
                 if "reference_data" in str(e):
                     # 二次防御：阈值已在上面检查，但 execute_skill_v2 内仍可能触发
@@ -212,19 +229,35 @@ async def run_invoke(
             user_message = message or ""
             if not user_message:
                 raise skill_input_missing(["message"], f"scene={scene}(空 skill)")
-            return await _run_planner(
-                user_message, thread_id, task_id, scene,
-                reference_data, runnable_config, trace_id,
+            effective_timeout = (
+                timeout_seconds or binding.timeout_seconds or _DEFAULT_SYNC_TIMEOUT
             )
+            try:
+                return await asyncio.wait_for(
+                    _run_planner(
+                        user_message, thread_id, task_id, scene,
+                        reference_data, runnable_config, trace_id,
+                    ),
+                    timeout=effective_timeout,
+                )
+            except asyncio.TimeoutError:
+                raise invoke_timeout(task_id, effective_timeout)
 
     # ── 无 scene → 智能编排，message 必填 ──
     if not message:
         raise skill_input_missing(["message"], "智能编排")
 
-    return await _run_planner(
-        message, thread_id, task_id, None,
-        reference_data, runnable_config, trace_id,
-    )
+    effective_timeout = timeout_seconds or _DEFAULT_SYNC_TIMEOUT
+    try:
+        return await asyncio.wait_for(
+            _run_planner(
+                message, thread_id, task_id, None,
+                reference_data, runnable_config, trace_id,
+            ),
+            timeout=effective_timeout,
+        )
+    except asyncio.TimeoutError:
+        raise invoke_timeout(task_id, effective_timeout)
 
 
 async def _execute_skill_v2_async(

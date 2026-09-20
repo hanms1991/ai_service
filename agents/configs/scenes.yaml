@@ -13,7 +13,7 @@ scenes:
     agent: product_agent
     skill: prd_generation
     response_format: text
-    timeout_seconds: 120
+    timeout_seconds: 600            # PRD 8 章节长文档，实测 3-5 分钟，给 10 分钟余量
 
   # 以下场景码已弃用（对应 skill 已从 product_agent.yaml 的 skills 列表移除）
   # 如需恢复：先在 product_agent.yaml 取消对应 skill 的注释，再取消下方注释

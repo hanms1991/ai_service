@@ -31,13 +31,16 @@ class LLMInteractionLogger(BaseCallbackHandler):
     文件写入完整内容，控制台输出超长时截断。
     """
 
-    def __init__(self, log_path: str | Path, *, verbose: bool = True):
+    def __init__(self, log_path: str | Path, *, verbose: bool = True, stream_chunk_size: int = 2000):
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         # 每次实例化时清空文件，开始新的日志
         self.log_path.write_text("", encoding="utf-8")
         self.verbose = verbose
         self._depth: dict[str, int] = {}  # run_id → 嵌套层级
+        # 流式 token 缓冲：run_id → 累积文本
+        self._stream_buf: dict[str, str] = {}
+        self._stream_chunk_size = stream_chunk_size  # 每 N 字符 flush 一次流式分片
 
     # ---------- 工具方法 ----------
     def _ts(self) -> str:
@@ -91,6 +94,26 @@ class LLMInteractionLogger(BaseCallbackHandler):
         self._write(self._format_messages(messages))
         self._write(f"{ind}{'─' * 60}")
 
+    def on_llm_new_token(
+        self,
+        token: str,
+        *,
+        run_id: str,
+        parent_run_id: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """流式生成时按 chunk 刷新日志，避免长任务期间 log 无输出。"""
+        rid = str(run_id)
+        buf = self._stream_buf.get(rid, "") + token
+        # 达到 chunk 阈值时 flush 一段
+        if len(buf) >= self._stream_chunk_size:
+            ind = self._indent(run_id, parent_run_id)
+            self._write(f"{ind}[{self._ts()}] LLM_STREAM run_id={rid[:8]} ({len(buf)} chars)")
+            self._write(f"{ind}  {buf}")
+            self._write(f"{ind}{'·' * 60}")
+            buf = ""
+        self._stream_buf[rid] = buf
+
     def on_llm_end(
         self,
         response: LLMResult,
@@ -100,6 +123,13 @@ class LLMInteractionLogger(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         ind = self._indent(run_id, parent_run_id)
+        # flush 流式缓冲中剩余的未满 chunk
+        rid = str(run_id)
+        remaining = self._stream_buf.pop(rid, "")
+        if remaining:
+            self._write(f"{ind}[{self._ts()}] LLM_STREAM (tail) run_id={rid[:8]} ({len(remaining)} chars)")
+            self._write(f"{ind}  {remaining}")
+            self._write(f"{ind}{'·' * 60}")
         for gen_batch in response.generations:
             for gen in gen_batch:
                 msg = gen.message

@@ -37,7 +37,7 @@ THREAD_CONFIG = {"configurable": {"thread_id": "test-aeb"}, "callbacks": [llm_lo
 
 
 def test_expand_aeb_feature():
-    user_input = "功能安全危害分析AEB功能"
+    user_input = "帮我写位置灯的PRD"
 
     print("=" * 70)
     print(f"用户输入：{user_input}")
