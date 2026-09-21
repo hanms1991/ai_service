@@ -148,7 +148,12 @@ async def run_invoke(
         "callbacks": [logger],
     }
 
-    # ── 场景直达：skill 非空 → execute_skill_v2 ──
+    # ── scene 作为 hint：解析后传给 Planner，不再直达技能 ──
+    # 前端按钮选中的 scene 只是意图倾向，最终是否执行对应技能由 Planner 判断
+    hint_agent = ""
+    hint_skill = ""
+    effective_timeout = timeout_seconds or _DEFAULT_SYNC_TIMEOUT
+
     if scene:
         resolver = get_scene_resolver()
         try:
@@ -160,98 +165,23 @@ async def run_invoke(
         if response_format and response_format != binding.response_format:
             raise output_format_conflict(scene, binding.response_format, response_format)
 
-        if binding.skill:
-            # ── 直达：跳过 Planner，execute_skill_v2 一次 LLM 调用 ──
-            registry = get_registry()
-            if binding.agent not in registry.get("agents", {}):
-                raise agent_not_found(binding.agent)
-            try:
-                skill_cfg = validate_binding(binding.agent, binding.skill)
-            except KeyError as e:
-                raise skill_not_found(binding.skill, binding.agent) from e
+        hint_agent = binding.agent
+        hint_skill = binding.skill
+        effective_timeout = (
+            timeout_seconds or binding.timeout_seconds or _DEFAULT_SYNC_TIMEOUT
+        )
 
-            # 必填输入校验（不消耗 LLM）
-            _validate_inputs_against_schema(
-                inputs or {}, skill_cfg.get("inputs", {}), binding.skill
-            )
-
-            # 同步路径整体时限：req 优先 → scene 配置 → 默认 600s
-            # 超时抛 INVOKE_TIMEOUT（408），避免 vLLM 后台继续吐 token 而客户端已断
-            effective_timeout = (
-                timeout_seconds or binding.timeout_seconds or _DEFAULT_SYNC_TIMEOUT
-            )
-            try:
-                result: SkillResult = await asyncio.wait_for(
-                    _execute_skill_v2_async(
-                        binding.agent,
-                        binding.skill,
-                        inputs or {},
-                        reference_data=reference_data,
-                        runnable_config=runnable_config,
-                    ),
-                    timeout=effective_timeout,
-                )
-            except asyncio.TimeoutError:
-                raise invoke_timeout(task_id, effective_timeout)
-            except ValueError as e:
-                if "reference_data" in str(e):
-                    # 二次防御：阈值已在上面检查，但 execute_skill_v2 内仍可能触发
-                    raise reference_data_too_large(
-                        len(json.dumps(reference_data or {}, ensure_ascii=False).encode("utf-8")),
-                        REFERENCE_DATA_MAX_BYTES,
-                    ) from e
-                raise skill_output_invalid(str(e)) from e
-            except Exception as e:
-                raise llm_upstream_error(str(e)) from e
-
-            # 按 response_format 决定填充 output / structured
-            output_text = None
-            structured = None
-            if binding.response_format == "json":
-                structured = result.structured or _try_parse_json(result.text)
-            else:
-                output_text = result.text
-
-            return InvokeResponse(
-                thread_id=thread_id,
-                task_id=task_id,
-                mode="skill_direct",
-                scene=scene,
-                output=output_text,
-                structured=structured,
-                plan=None,
-                interrupt=None,
-                usage=result.usage,
-                trace_id=trace_id,
-            )
-        else:
-            # ── scene.skill 为空 → 走 Planner 智能编排（message 作为用户输入） ──
-            user_message = message or ""
-            if not user_message:
-                raise skill_input_missing(["message"], f"scene={scene}(空 skill)")
-            effective_timeout = (
-                timeout_seconds or binding.timeout_seconds or _DEFAULT_SYNC_TIMEOUT
-            )
-            try:
-                return await asyncio.wait_for(
-                    _run_planner(
-                        user_message, thread_id, task_id, scene,
-                        reference_data, runnable_config, trace_id,
-                    ),
-                    timeout=effective_timeout,
-                )
-            except asyncio.TimeoutError:
-                raise invoke_timeout(task_id, effective_timeout)
-
-    # ── 无 scene → 智能编排，message 必填 ──
-    if not message:
+    # 所有请求统一走 Planner 智能编排（intent_router → planner → executor）
+    # Planner 从用户 message 中提取技能参数；提取不到则对话式追问
+    user_message = message or ""
+    if not user_message:
         raise skill_input_missing(["message"], "智能编排")
 
-    effective_timeout = timeout_seconds or _DEFAULT_SYNC_TIMEOUT
     try:
         return await asyncio.wait_for(
             _run_planner(
-                message, thread_id, task_id, None,
+                user_message, thread_id, task_id, scene,
+                hint_agent, hint_skill,
                 reference_data, runnable_config, trace_id,
             ),
             timeout=effective_timeout,
@@ -286,6 +216,8 @@ async def _run_planner(
     thread_id: str,
     task_id: str,
     scene: str | None,
+    hint_agent: str,
+    hint_skill: str,
     reference_data: dict[str, Any] | None,
     runnable_config: dict,
     trace_id: str,
@@ -294,6 +226,7 @@ async def _run_planner(
 
     一期同步等待；超时由上层 (asyncio.wait_for) 控制，未在 M1 实现自动转异步。
     reference_data 注入到 user_message 末尾（只读段）。
+    scene/hint_agent/hint_skill 作为场景提示注入 SupervisorState，由 Planner 参考。
     """
     # reference_data 注入到 message 末尾
     if reference_data:
@@ -306,7 +239,12 @@ async def _run_planner(
 
     try:
         result = await graph.ainvoke(
-            {"messages": [HumanMessage(content=user_message)]},
+            {
+                "messages": [HumanMessage(content=user_message)],
+                "scene": scene or "",
+                "hint_agent": hint_agent or "",
+                "hint_skill": hint_skill or "",
+            },
             config=runnable_config,
         )
     except Exception as e:
@@ -452,6 +390,7 @@ async def submit_task(req: AgentRequest, trace_id: str) -> TaskRecord:
     store = get_task_store()
 
     # ── 解析场景码 + 校验冲突（不消耗 LLM） ──
+    # scene 作为 hint 传入 graph，不再在此校验技能输入
     binding: SceneBinding | None = None
     if req.scene:
         resolver = get_scene_resolver()
@@ -462,18 +401,6 @@ async def submit_task(req: AgentRequest, trace_id: str) -> TaskRecord:
         if req.response_format and req.response_format != binding.response_format:
             raise output_format_conflict(
                 req.scene, binding.response_format, req.response_format
-            )
-        # 直达技能的必填输入校验（不消耗 LLM）
-        if binding.skill:
-            registry = get_registry()
-            if binding.agent not in registry.get("agents", {}):
-                raise agent_not_found(binding.agent)
-            try:
-                skill_cfg = validate_binding(binding.agent, binding.skill)
-            except KeyError as e:
-                raise skill_not_found(binding.skill, binding.agent) from e
-            _validate_inputs_against_schema(
-                req.inputs or {}, skill_cfg.get("inputs", {}), binding.skill
             )
 
     # ── reference_data 阈值前置检查（不消耗 LLM） ──
@@ -538,13 +465,12 @@ async def _run_task_async(record: TaskRecord) -> None:
     cb_client = get_callback_client()
 
     try:
-        # ── 状态置 planning（编排模式）/ running（直达模式） ──
+        # ── 状态置 planning（所有任务统一走 Planner 编排） ──
         snap = record.request_snapshot
-        is_direct = bool(snap.get("binding") and snap["binding"].get("skill"))
         await store.update(
             record.task_id,
-            status=TaskStatus.PLANNING if not is_direct else TaskStatus.RUNNING,
-            mode="skill_direct" if is_direct else "orchestrated",
+            status=TaskStatus.PLANNING,
+            mode="orchestrated",
         )
 
         # ── 内核执行：复用 run_invoke 的内核，但需要把结果回写到 store ──

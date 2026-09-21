@@ -127,7 +127,7 @@ class InvokeResponse(BaseModel):
     """POST /agent/invoke 的统一响应体（设计文档 7.1）。"""
     thread_id: str
     task_id: str
-    mode: str = Field(description="skill_direct | orchestrated")
+    mode: str = Field(description="orchestrated（所有请求统一走 Planner 编排）")
     scene: str | None = None
     output: str | None = None
     structured: dict | list | None = None
@@ -173,7 +173,7 @@ class TaskDetailResponse(BaseModel):
     task_id: str
     thread_id: str
     status: TaskStatus
-    mode: str | None = Field(default=None, description="skill_direct | orchestrated")
+    mode: str | None = Field(default=None, description="orchestrated")
     scene: str | None = None
     progress: ProgressPayload | None = None
     plan: list[dict] | None = None

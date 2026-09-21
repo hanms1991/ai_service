@@ -104,11 +104,12 @@ def _load_planner_template() -> str:
     return _TEMPLATE_CACHE["planner"]
 
 
-def _build_planner_prompt(extra_instructions: str = "") -> str:
+def _build_planner_prompt(extra_instructions: str = "", scene_hint: str = "") -> str:
     """根据能力注册表动态生成 planner 的系统提示（注册表是唯一事实来源）。
 
     模板占位符：
       {catalog}            ← render_planner_catalog() 渲染的可用能力目录
+      {scene_hint}         ← 场景码提示（告知 Planner 用户倾向的技能）
       {extra_instructions} ← supervisor YAML 的 system_prompt 字段
 
     用 str.replace 替换（不用 .format，避免 JSON 示例里的裸 { 触发 KeyError）。
@@ -120,6 +121,7 @@ def _build_planner_prompt(extra_instructions: str = "") -> str:
     return (
         template
         .replace("{catalog}", catalog)
+        .replace("{scene_hint}", scene_hint)
         .replace("{extra_instructions}", extra_instructions)
     )
 
@@ -142,7 +144,20 @@ def planner_node(state: SupervisorState) -> dict:
     )
 
     # 通过模块对象访问 _EXTRA_INSTRUCTIONS，拿到 registry_init 写入的最新值
-    prompt = _build_planner_prompt(constants._EXTRA_INSTRUCTIONS)
+    # 构建 scene hint：告知 Planner 用户倾向的技能，由 Planner 从 message 中提取参数
+    hint_agent = state.get("hint_agent", "") or ""
+    hint_skill = state.get("hint_skill", "") or ""
+    scene_hint = ""
+    if hint_skill:
+        scene_hint = (
+            f"\n\n【场景提示】用户通过前端按钮选择了场景码，倾向使用 "
+            f"{hint_agent} 的 {hint_skill} 技能。"
+            f"请优先匹配该技能，并从用户消息中提取必填参数填入 inputs。"
+            f"但如果用户消息明显与该技能无关（如闲聊、问候），按用户实际意图处理，"
+            f"不要强行调用该技能。"
+        )
+
+    prompt = _build_planner_prompt(constants._EXTRA_INSTRUCTIONS, scene_hint)
     messages = [SystemMessage(content=prompt)] + state["messages"]
 
     plan: PlanSchema | None = None

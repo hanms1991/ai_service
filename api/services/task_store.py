@@ -39,7 +39,7 @@ class TaskRecord:
     thread_id: str
     status: TaskStatus
     trace_id: str = ""
-    mode: str | None = None             # skill_direct | orchestrated
+    mode: str | None = None             # orchestrated（统一走 Planner 编排）
     scene: str | None = None
     progress: dict | None = None
     plan: list[dict] | None = None

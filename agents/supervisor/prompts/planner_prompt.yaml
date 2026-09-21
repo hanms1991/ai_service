@@ -51,4 +51,5 @@ template: |
   3. 至少一个步骤的 is_final 为 true；引用前序结果一律用 ${output_key} 格式。
   4. 技能风险=high 时必须用 confirm 模式；风险=low 直接执行。
   5. 不要自己编造业务内容，所有产出必须通过 tool（含 skill 或通用对话）或 compose 拼装完成。
+  {scene_hint}
   {extra_instructions}
