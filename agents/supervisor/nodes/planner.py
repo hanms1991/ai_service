@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field, field_validator
 
 from agents.supervisor import constants
@@ -129,7 +129,12 @@ def _build_planner_prompt(extra_instructions: str = "") -> str:
 # ════════════════════════════════════════════════════════════════
 
 def planner_node(state: SupervisorState) -> dict:
-    """Planner 节点：LLM 只输出 JSON 执行计划，不产出业务内容。"""
+    """Planner 节点：LLM 只输出 JSON 执行计划，不产出业务内容。
+
+    带 Schema 修复重试：LLM 输出格式不合法时，把错误信息追加为
+    HumanMessage 提示 LLM 修正（最多重试 2 次）。最终仍失败则
+    fallback 到 self_handle 单步计划，由中枢直接回答用户。
+    """
     # 用 json_mode（response_format=json_object），兼容不支持 json_schema 的端点（如 DeepSeek）
     # 提示词已强约束输出格式，Pydantic 做二次校验
     structured_model = model.with_structured_output(
@@ -140,7 +145,40 @@ def planner_node(state: SupervisorState) -> dict:
     prompt = _build_planner_prompt(constants._EXTRA_INSTRUCTIONS)
     messages = [SystemMessage(content=prompt)] + state["messages"]
 
-    plan: PlanSchema = structured_model.invoke(messages)
+    plan: PlanSchema | None = None
+    max_retries = 2  # 首次 + 2 次修复重试
+
+    for attempt in range(max_retries + 1):
+        try:
+            plan = structured_model.invoke(messages)
+            break
+        except Exception as e:
+            if attempt < max_retries:
+                # 修复重试：把错误信息加入 messages 提示 LLM 修正
+                print(f"[planner] 第 {attempt + 1} 次输出校验失败：{type(e).__name__}: {e}，正在重试...")
+                messages = messages + [
+                    HumanMessage(
+                        content=(
+                            f"上一次输出格式有误：{type(e).__name__}: {e}。"
+                            "请重新输出严格符合格式的 JSON 计划，不要附加任何解释。"
+                        )
+                    )
+                ]
+            else:
+                # 最终 fallback：生成 self_handle 单步计划
+                print(f"[planner] 重试 {max_retries} 次后仍失败，fallback 到 self_handle")
+                user_msg = state["messages"][-1].content if state["messages"] else ""
+                plan = PlanSchema(steps=[
+                    PlanStep(
+                        step_id="step_1",
+                        tool="",
+                        skill="",
+                        input=user_msg,
+                        output_key="result_1",
+                        is_final=True,
+                        mode="single",
+                    )
+                ])
 
     return {
         "plan": [step.model_dump() for step in plan.steps],

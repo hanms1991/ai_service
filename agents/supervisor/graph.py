@@ -1,7 +1,14 @@
-"""顶层 Graph 串联：planner → executor → [route_after_executor]。
+"""顶层 Graph 串联：intent_router → [chat | planner] → executor → [route]。
 
 本文件只做"节点 + 边 + checkpointer"的组装，不含任何节点逻辑。
 改节点逻辑 → 改 nodes/ 下对应文件；改文案 → 改 prompts/ 下 yaml。
+
+图结构：
+  START → intent_router → [route_by_intent]
+    ├── chat  → chat_node → END          （闲聊快路径，跳过 planner）
+    └── task → planner → executor → [route_after_executor]
+                                              ├── executor（继续执行）
+                                              └── END（结束）
 """
 from __future__ import annotations
 
@@ -11,6 +18,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from agents.supervisor.nodes.executor import executor_node
+from agents.supervisor.nodes.intent_router import chat_node, intent_router_node, route_by_intent
 from agents.supervisor.nodes.planner import planner_node
 from agents.supervisor.nodes.router import route_after_executor
 from agents.supervisor.registry_init import init_capability_registry
@@ -18,7 +26,7 @@ from agents.supervisor.state import SupervisorState
 
 
 def build_supervisor_graph(config: dict, base_dir=None, checkpointer: Any = None) -> Any:
-    """构建规划-执行分离的 Supervisor LangGraph。
+    """构建意图路由 + 规划-执行分离的 Supervisor LangGraph。
 
     Args:
         config:   supervisor YAML 配置字典
@@ -39,16 +47,28 @@ def build_supervisor_graph(config: dict, base_dir=None, checkpointer: Any = None
     graph = StateGraph(SupervisorState)
 
     # 添加节点
+    graph.add_node("intent_router", intent_router_node)
+    graph.add_node("chat", chat_node)
     graph.add_node("planner", planner_node)
     graph.add_node("executor", executor_node)
 
     # 添加边
-    graph.add_edge(START, "planner")          # 入口 → planner
-    graph.add_edge("planner", "executor")      # planner → executor
-    graph.add_conditional_edges(              # executor → 条件路由
+    graph.add_edge(START, "intent_router")       # 入口 → 意图分类
+
+    graph.add_conditional_edges(                # intent_router → 条件路由
+        "intent_router",
+        route_by_intent,
+        {
+            "chat": "chat",
+            "planner": "planner",
+        },
+    )
+
+    graph.add_edge("chat", END)                  # 闲聊 → 直接结束
+    graph.add_edge("planner", "executor")        # planner → executor
+    graph.add_conditional_edges(                 # executor → 条件路由
         "executor",
         route_after_executor,
-        # 路由目标：继续执行 or 结束
         {
             "executor": "executor",
             END: END,

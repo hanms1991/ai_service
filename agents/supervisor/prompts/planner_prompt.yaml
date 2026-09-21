@@ -16,7 +16,7 @@ template: |
   - chain:    链式执行，前一步输出作为下一步技能输入（inputs 的值用 ${output_key} 引用）
   - compose:  组合多个步骤的输出为最终结果（不调 worker，tool 与 skill 留空，is_final=true）；
               在 input 中写含 ${output_key} 的拼装模板，或在 inputs 中按展示顺序给出各 ${output_key} 引用
-  - ask:      用户意图不清或技能必填输入缺失，暂停等待用户补充信息（is_final=false）
+  - ask:      （已废弃，禁止使用）参数缺失时改用 single 模式 + tool="" + skill="" 对话式追问
   - confirm:  高风险操作（技能风险=high），暂停等待人工确认后才执行（is_final=false）
 
   输出格式：输出紧凑 JSON，不要换行和缩进，不要附加任何解释文字或 markdown 标记。
@@ -42,7 +42,12 @@ template: |
      - 需要某 Agent 通用对话（如"介绍 XX 功能"）：只填 tool，省略 skill，把意图写入 input。
      - 需要执行具体技能（如"写功能定义"）：tool + skill 配对，inputs 按契约填写。
      判断依据：用户请求是否匹配某 Agent 的专业领域或某技能的输入契约——都不匹配则中枢自处理。
-  2. inputs 的键必须与技能输入契约完全一致，必填参数必须给出；用户未提供且无法推断时，先用 ask 模式追问，禁止编造。
+  2. inputs 的键必须与技能输入契约完全一致，必填参数必须给出。
+     用户未提供且无法推断必填参数时，禁止使用 ask 模式（已废弃），
+     改为生成 single 步骤：tool="" + skill="" + mode="single" + is_final=true，
+     在 input 字段中写自然语言的追问（如"我可以帮你生成PRD，请告诉我具体的功能名称是什么？"），
+     由中枢 self_handle 对话式回复。用户下一轮回复时，intent_router 会将其判为 task 重新规划。
+     绝不编造参数值。
   3. 至少一个步骤的 is_final 为 true；引用前序结果一律用 ${output_key} 格式。
   4. 技能风险=high 时必须用 confirm 模式；风险=low 直接执行。
   5. 不要自己编造业务内容，所有产出必须通过 tool（含 skill 或通用对话）或 compose 拼装完成。
