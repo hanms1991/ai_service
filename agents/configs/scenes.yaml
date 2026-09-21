@@ -4,7 +4,7 @@ scenes:
   ONE_CLICK_EXPAND:
     description: 一键扩写功能说明（50~100字）
     agent: product_agent
-    skill: feature_expand
+    skill: feature_definition
     response_format: text          # text | json
     timeout_seconds: 30            # 可覆盖请求级默认超时
 
@@ -13,16 +13,16 @@ scenes:
     agent: product_agent
     skill: prd_generation
     response_format: text
-    timeout_seconds: 600            # PRD 8 章节长文档，实测 3-5 分钟，给 10 分钟余量
+    timeout_seconds: 1200            # PRD 8 章节长文档，实测 3-5 分钟，给 10 分钟余量
 
   # 以下场景码已弃用（对应 skill 已从 product_agent.yaml 的 skills 列表移除）
   # 如需恢复：先在 product_agent.yaml 取消对应 skill 的注释，再取消下方注释
-  # DEFINE_FEATURE:
-  #   description: 定义完整功能（10章结构化定义）
-  #   agent: product_agent
-  #   skill: feature_definition
-  #   response_format: text
-  #   timeout_seconds: 120
+  FEATURE_DEFINITION:
+    description: 定义完整功能说明（50~100字）
+    agent: product_agent
+    skill: feature_definition
+    response_format: text
+    timeout_seconds: 120
   #
   # PROMPT_EXPAND:
   #   description: 提示词扩写
