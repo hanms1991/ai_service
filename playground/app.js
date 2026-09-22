@@ -111,14 +111,19 @@ function renderAssistantMsg(m) {
       <div class="muted">请直接回复以继续该会话。</div>
     </div>` : '';
   const outBlock = m.output ? `<div class="out">${esc(m.output)}</div>` : '';
+  // 流式进行中且尚无输出时显示"正在生成…"光标
+  const streamingBlock = (m.streaming && !m.output)
+    ? '<span class="streaming-cursor">正在生成<span class="cursor-dot">…</span></span>'
+    : '';
   const structBlock = m.structured
     ? `<details><summary>structured</summary><pre class="debug-pre">${esc(fmtJson(m.structured))}</pre></details>` : '';
   const planBlock = m.plan && m.plan.length
     ? `<details><summary>plan（${m.plan.length} 步）</summary><pre class="debug-pre">${esc(fmtJson(m.plan))}</pre></details>` : '';
   const usageTxt = m.usage && Object.keys(m.usage).length ? ` · usage ${esc(fmtJson(m.usage))}` : '';
   const head = [m.mode, m.scene].filter(Boolean).join(' · ');
+  const emptyHint = (interruptBlock || streamingBlock) ? '' : '<span class="muted">（空输出）</span>';
   return `<div class="msg assistant">
-    <div class="bubble">${outBlock || (interruptBlock ? '' : '<span class="muted">（空输出）</span>')}${interruptBlock}${structBlock}${planBlock}</div>
+    <div class="bubble">${outBlock}${streamingBlock}${emptyHint}${interruptBlock}${structBlock}${planBlock}</div>
     <div class="meta">${esc(head)}${m.elapsed != null ? ` · ${m.elapsed}ms` : ''}${usageTxt}
       ${m.traceId ? ` · <span class="copyable" data-action="copy-trace" data-trace="${esc(m.traceId)}" title="点击复制">trace ${esc(m.traceId)}</span>` : ''}
       <details class="raw"><summary>原始 JSON</summary><pre class="debug-pre">${esc(m.rawJson || '')}</pre></details>
@@ -220,7 +225,8 @@ async function send() {
   state.sending = true;
   setSendDisabled(true);
   try {
-    if (state.mode === 'sync') await invokeSync(body);
+    if (state.mode === 'stream') await invokeStream(body);
+    else if (state.mode === 'sync') await invokeSync(body);
     else await submitTask(body);
   } finally {
     state.sending = false;
@@ -245,6 +251,143 @@ async function invokeSync(body) {
   }
   saveSession();
   renderMessages();
+}
+
+/** 流式调用 POST /api/v1/agent/invoke/stream（NDJSON 逐 token 渲染） */
+async function invokeStream(body) {
+  const started = performance.now();
+  // 先插入一条空 assistant 消息占位
+  const msgIdx = state.messages.length;
+  const assistantMsg = {
+    kind: 'assistant', output: '', structured: null, plan: null,
+    interrupt: null, usage: {}, mode: 'orchestrated', scene: body.scene || null,
+    traceId: '', elapsed: null, rawJson: '', time: nowTime(), streaming: true,
+  };
+  state.messages.push(assistantMsg);
+  renderMessages();
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-API-Key': state.apiKey,
+    'X-Trace-Id': genTraceId(),
+  };
+
+  try {
+    const resp = await fetch(apiUrl('/api/v1/agent/invoke/stream'), {
+      method: 'POST', headers,
+      body: JSON.stringify(body),
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch { data = text; }
+      showDebug(body, { ok: false, status: resp.status, data, elapsed: Math.round(performance.now() - started) });
+      // 移除占位消息，显示错误
+      state.messages.splice(msgIdx, 1);
+      pushError({ ok: false, status: resp.status, data });
+      saveSession();
+      renderMessages();
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let fullOutput = '';
+    let traceId = '';
+    let scene = body.scene || null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // 保留未完整的行
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let evt;
+        try { evt = JSON.parse(line); } catch { continue; }
+
+        if (evt.type === 'token') {
+          fullOutput += evt.content;
+          assistantMsg.output = fullOutput;
+          // 直接更新 DOM，避免全量重绘闪烁
+          updateStreamingOutput(msgIdx, fullOutput);
+        } else if (evt.type === 'done') {
+          fullOutput = evt.output || fullOutput;
+          assistantMsg.output = fullOutput;
+          if (evt.trace_id) { traceId = evt.trace_id; assistantMsg.traceId = traceId; }
+          if (evt.scene != null) scene = evt.scene;
+          assistantMsg.scene = scene;
+          assistantMsg.taskId = evt.task_id;
+          if (evt.thread_id) state.threadId = evt.thread_id;
+        } else if (evt.type === 'error') {
+          state.messages.splice(msgIdx, 1);
+          state.messages.push({
+            kind: 'error', code: evt.code || 'STREAM_ERROR',
+            message: evt.message || '流式输出出错', traceId,
+          });
+          saveSession();
+          renderMessages();
+          return;
+        }
+      }
+    }
+
+    assistantMsg.streaming = false;
+    assistantMsg.elapsed = Math.round(performance.now() - started);
+    assistantMsg.rawJson = fmtJson({ output: fullOutput, trace_id: traceId, scene });
+    showDebug(body, {
+      ok: true, status: 200,
+      data: { output: fullOutput, trace_id: traceId, scene },
+      elapsed: assistantMsg.elapsed,
+    });
+    saveSession();
+    renderMessages();
+  } catch (e) {
+    assistantMsg.streaming = false;
+    state.messages.splice(msgIdx, 1);
+    pushError({ ok: false, status: 0, data: null, networkError: String(e) });
+    saveSession();
+    renderMessages();
+  }
+}
+
+/** 流式渲染：直接更新第 idx 条 assistant 消息的输出文本，避免全量重绘 */
+function updateStreamingOutput(idx, text) {
+  const box = $('messages');
+  const msgEls = box.querySelectorAll('.msg.assistant');
+  // 找到第 idx 条 assistant 消息（按 DOM 顺序）
+  const target = msgEls[idx - countNonAssistantBefore(idx)];
+  if (!target) return;
+
+  const out = target.querySelector('.out');
+  if (out) {
+    out.textContent = text;
+  } else {
+    // 首次输出：移除"正在生成…"占位，插入 .out 元素
+    const cursor = target.querySelector('.streaming-cursor');
+    if (cursor) cursor.remove();
+    const bubble = target.querySelector('.bubble');
+    if (bubble) {
+      const div = document.createElement('div');
+      div.className = 'out';
+      div.textContent = text;
+      bubble.insertBefore(div, bubble.firstChild);
+    }
+  }
+  box.scrollTop = box.scrollHeight;
+}
+
+/** 计算 idx 之前非 assistant 消息的数量（用于定位 DOM 中的 assistant 元素） */
+function countNonAssistantBefore(idx) {
+  let count = 0;
+  for (let i = 0; i < idx; i++) {
+    if (state.messages[i] && state.messages[i].kind !== 'assistant') count++;
+  }
+  return count;
 }
 
 /** P2 异步提交 POST /api/v1/agent/tasks（202）→ 启动轮询 */

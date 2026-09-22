@@ -13,6 +13,7 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
 
 # LLM 原生兼容 OpenAI 协议，只需替换 base_url
+# streaming=True 让模型内部走 SSE 接收 token，配合 graph.astream_events 可实现前端实时流式输出
 model = ChatOpenAI(
     model=os.getenv("LLM_MODEL", "deepseek-chat"),
     api_key=os.getenv("LLM_API_KEY", "EMPTY"),
@@ -20,4 +21,5 @@ model = ChatOpenAI(
     temperature=float(os.getenv("LLM_TEMPERATURE", "0.7")),
     max_tokens=int(os.getenv("LLM_MAX_TOKENS", "8192")),
     timeout=float(os.getenv("LLM_TIMEOUT", "120")),
+    streaming=True,
 )

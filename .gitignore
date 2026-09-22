@@ -3,7 +3,7 @@ __pycache__/
 .env
 .venv/
 logs/
-docs/
 data/
+docs/
 .trae/
 .gitignore/

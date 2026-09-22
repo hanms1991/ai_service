@@ -190,6 +190,151 @@ async def run_invoke(
         raise invoke_timeout(task_id, effective_timeout)
 
 
+async def run_invoke_stream(
+    message: str | None,
+    scene: str | None,
+    inputs: dict[str, Any] | None,
+    thread_id: str | None,
+    context: dict[str, Any] | None,
+    reference_data: dict[str, Any] | None,
+    response_format: str | None,
+    timeout_seconds: int | None,
+    trace_id: str | None,
+):
+    """流式执行入口：通过 graph.astream_events 将 LLM token 实时推送给前端。
+
+    协议：NDJSON（每行一个 JSON 对象），事件类型：
+      {"type": "token", "content": "..."}      —— LLM 输出的文本片段
+      {"type": "done", "output": "...", ...}   —— 执行完成，附带完整结果
+
+    只推送最终输出节点（chat / executor）的 on_chat_model_stream 事件，
+    不推送 planner 的 JSON 中间结果和 intent_router 的分类结果。
+    """
+    if trace_id is None:
+        trace_id = _new_trace_id()
+    task_id = _new_task_id()
+    if thread_id is None:
+        thread_id = _new_thread_id()
+
+    # ── reference_data 阈值前置检查 ──
+    if reference_data:
+        compact = json.dumps(reference_data, ensure_ascii=False, separators=(",", ":"))
+        size = len(compact.encode("utf-8"))
+        if size > REFERENCE_DATA_MAX_BYTES:
+            raise reference_data_too_large(size, REFERENCE_DATA_MAX_BYTES)
+
+    # ── scene 作为 hint 解析 ──
+    hint_agent = ""
+    hint_skill = ""
+    effective_timeout = timeout_seconds or _DEFAULT_SYNC_TIMEOUT
+    if scene:
+        resolver = get_scene_resolver()
+        try:
+            binding = resolver.resolve(scene)
+        except KeyError:
+            raise scene_not_found(scene)
+        if response_format and response_format != binding.response_format:
+            raise output_format_conflict(scene, binding.response_format, response_format)
+        hint_agent = binding.agent
+        hint_skill = binding.skill
+        effective_timeout = timeout_seconds or binding.timeout_seconds or _DEFAULT_SYNC_TIMEOUT
+
+    user_message = message or ""
+    if not user_message:
+        raise skill_input_missing(["message"], "智能编排")
+
+    # reference_data 注入到 message 末尾
+    if reference_data:
+        compact = json.dumps(reference_data, ensure_ascii=False, separators=(",", ":"))
+        user_message = (
+            f"{user_message}\n\n【参考数据（只读资料，仅供你参考，不要原样罗列或照搬其字段名）】\n{compact}"
+        )
+
+    logger = _make_llm_logger(trace_id)
+    runnable_config = {
+        "configurable": {"thread_id": thread_id},
+        "callbacks": [logger],
+    }
+
+    graph = get_supervisor_graph()
+
+    # 最终输出节点：只有这些节点的 LLM 输出才推送给前端
+    # chat 节点 → 闲聊回复；executor 节点 → 技能执行 / self_handle / worker 调用
+    output_nodes = {"chat", "executor"}
+    full_output: list[str] = []
+
+    # 注意：不能 asyncio.wait_for(astream_events(...))，因为 wait_for 返回 coroutine 不是 async iterator。
+    # 正确做法：先拿到 async iterator，再对每次 __anext__ 单独 wait_for 以控制两次事件间的超时。
+    events = graph.astream_events(
+        {
+            "messages": [HumanMessage(content=user_message)],
+            "scene": scene or "",
+            "hint_agent": hint_agent,
+            "hint_skill": hint_skill,
+        },
+        config=runnable_config,
+        version="v2",
+    )
+
+    try:
+        while True:
+            # 两个事件之间允许的最长等待（LLM 卡住则超时）
+            event = await asyncio.wait_for(events.__anext__(), timeout=effective_timeout)
+            event_type = event.get("event")
+            # 只处理 chat model 的 token 流事件
+            if event_type != "on_chat_model_stream":
+                continue
+            # 过滤：只推送最终输出节点的 token
+            metadata = event.get("metadata", {}) or {}
+            node_name = metadata.get("langgraph_node", "")
+            if node_name not in output_nodes:
+                continue
+            chunk = event.get("data", {}).get("chunk")
+            if chunk is None:
+                continue
+            content = getattr(chunk, "content", "")
+            if not content:
+                continue
+            # 兼容 content 为 list 的情况（多模态输出）
+            if isinstance(content, list):
+                text_parts = [
+                    item.get("text", "") if isinstance(item, dict) else str(item)
+                    for item in content
+                ]
+                content = "".join(text_parts)
+            if not content:
+                continue
+            full_output.append(content)
+            yield json.dumps({"type": "token", "content": content}, ensure_ascii=False) + "\n"
+    except StopAsyncIteration:
+        # 事件流正常结束
+        pass
+    except asyncio.TimeoutError:
+        yield json.dumps({
+            "type": "error",
+            "code": "INVOKE_TIMEOUT",
+            "message": f"执行超时（{effective_timeout}s 内未收到新事件）",
+        }, ensure_ascii=False) + "\n"
+        return
+    except Exception as e:
+        yield json.dumps({
+            "type": "error",
+            "code": "LLM_UPSTREAM_ERROR",
+            "message": str(e),
+        }, ensure_ascii=False) + "\n"
+        return
+
+    # 完成：发送 done 事件，附带完整输出和元信息
+    yield json.dumps({
+        "type": "done",
+        "task_id": task_id,
+        "thread_id": thread_id,
+        "trace_id": trace_id,
+        "scene": scene,
+        "output": "".join(full_output),
+    }, ensure_ascii=False) + "\n"
+
+
 async def _execute_skill_v2_async(
     agent_name: str,
     skill_name: str,

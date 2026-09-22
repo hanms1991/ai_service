@@ -147,6 +147,15 @@ body {
 }
 .bubble .out { white-space: pre-wrap; }
 
+/* 流式输出光标 */
+.streaming-cursor { color: var(--muted); font-size: 13px; }
+.cursor-dot {
+  display: inline-block;
+  animation: blink 1s steps(2, start) infinite;
+  margin-left: 2px;
+}
+@keyframes blink { to { visibility: hidden; } }
+
 /* 元信息行 */
 .meta {
   font-size: 11px;
