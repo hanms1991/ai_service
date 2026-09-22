@@ -159,9 +159,14 @@ def _format_violation_feedback(violations: list[dict]) -> str:
     """把必填参数违规拼成喂回 LLM 的修复指令。"""
     lines = ["上一次计划中存在「技能必填参数缺失」的步骤，按当前状态无法执行："]
     for v in violations:
+        missing_text = "、".join(
+            ("（" + " 或 ".join(str(m).split("|")) + "，至少提供其一）")
+            if "|" in str(m) else str(m)
+            for m in v["missing"]
+        )
         lines.append(
             f"- 步骤 {v['step_id']}：{v['tool']} 的技能 {v['skill']} "
-            f"缺少必填输入 {', '.join(v['missing'])}。"
+            f"缺少必填输入 {missing_text}。"
         )
     lines.append(
         "请重新生成完整 JSON 计划并二选一："

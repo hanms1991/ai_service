@@ -136,9 +136,44 @@ def executor_node(
             )
             output = _self_handle(clarify_task, config)
         else:
-            output = execute_skill(
-                tool_name, skill_name, skill_inputs, runnable_config=config
-            )
+            from agents.capability_registry import SkillInputError
+
+            try:
+                output = execute_skill(
+                    tool_name, skill_name, skill_inputs, runnable_config=config
+                )
+            except SkillInputError as e:
+                # file_id 文档不存在/已过期/无法解析：对话式提示用户重新上传或改用文字描述
+                print(f"[executor] 技能 {skill_name} 输入文档读取失败：{e}")
+                display = skill_name
+                try:
+                    skill_cfg = validate_binding(tool_name, skill_name)
+                    display = skill_cfg.get("display_name") or skill_name
+                except KeyError:
+                    pass
+                clarify_task = (
+                    f"执行「{display}」前读取用户上传的文档失败：{e} "
+                    "请以你的口吻告知用户文档无法读取（可能已过期、损坏或为扫描件），"
+                    "请用户重新上传相关项定义文档（docx/xlsx/pdf），或直接用文字描述分析对象的"
+                    "范围、功能与边界后重试。不要提及任何内部执行机制。"
+                )
+                output = _self_handle(clarify_task, config)
+            except Exception as e:  # noqa: BLE001 - 执行链最后防线，避免请求 500
+                print(f"[executor] 技能 {skill_name} 执行失败：{type(e).__name__}: {e}")
+                display = skill_name
+                try:
+                    skill_cfg = validate_binding(tool_name, skill_name)
+                    display = skill_cfg.get("display_name") or skill_name
+                except KeyError:
+                    pass
+                failure_task = (
+                    f"执行「{display}」时未能完成（{type(e).__name__}）。"
+                    "请以你的口吻简短告知用户本次分析未能完成，可建议用户："
+                    "1）若提供了文档，确认文档内容与分析目标匹配后重试；"
+                    "2）用文字补充更明确的相关项范围/功能描述后重试。"
+                    f"内部错误摘要（不要原样转述技术细节）：{str(e)[:200]}"
+                )
+                output = _self_handle(failure_task, config)
     elif tool_name:
         # 指定了 tool 但未指定 skill：交给 worker agent 通用对话
         output = _call_worker(tool_name, resolved_input, config)

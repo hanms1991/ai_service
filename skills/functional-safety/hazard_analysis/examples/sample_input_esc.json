@@ -1,0 +1,63 @@
+{
+  "item": {
+    "name": "Electronic Stability Control",
+    "abbr": "ESC",
+    "project": "Project Phoenix — MY2027 Compact SUV",
+    "doc_id": "HARA-ESC-001",
+    "revision": "0.1",
+    "date": "2026-04-28",
+    "author": "(your name)",
+    "approver": "(approver name)",
+    "company": "(company)"
+  },
+  "scope_description": "ESC is a chassis-control item that maintains lateral stability by selectively applying brake pressure to individual wheels and modulating engine torque when vehicle yaw rate deviates from driver-intended yaw rate. Item includes the ESC ECU, software, internal sensors (yaw / lateral acceleration via IMU, wheel speeds, steering angle via shared sensor) and the hydraulic modulator. Item does NOT include the brake pedal, master cylinder, instrument cluster, or driver-assistance ECUs.",
+  "boundary_diagram_notes": "Insert ESC boundary block diagram here. Show: (1) ESC ECU + HSM at the center, (2) inputs from wheel speed sensors x4, IMU, steering angle sensor, brake pressure sensor, (3) outputs to hydraulic modulator and CAN bus (engine torque request, warning lamp), (4) driver as supervising agent.",
+  "assumptions": [
+    {"id": "A01", "category": "Vehicle",   "assumption": "Passenger SUV, GVW 1800–2400 kg, AWD.",                                            "rationale": "Project scope."},
+    {"id": "A02", "category": "Driver",    "assumption": "Average non-expert driver, valid license, not impaired.",                          "rationale": "Per ISO 26262-3 controllability definition."},
+    {"id": "A03", "category": "Markets",   "assumption": "North America and Europe, LHD and RHD.",                                            "rationale": "Project scope."},
+    {"id": "A04", "category": "Lifecycle", "assumption": "HARA covers normal operation; service/repair states excluded.",                     "rationale": "Per ISO 26262-3, Clause 6."},
+    {"id": "A05", "category": "Cybersec",  "assumption": "Cybersecurity threats handled separately under ISO/SAE 21434.",                     "rationale": "Scope partition."},
+    {"id": "A06", "category": "Tires",     "assumption": "OEM-specified tire size and friction coefficient envelope.",                        "rationale": "Out-of-spec tires excluded from HARA."}
+  ],
+  "interfaces": [
+    {"id": "I01", "interface": "Hydraulic modulator",     "direction": "Out", "description": "Per-wheel brake pressure command (0–250 bar)"},
+    {"id": "I02", "interface": "Wheel speed sensors x4",  "direction": "In",  "description": "Per-wheel rotational speed via dedicated lines"},
+    {"id": "I03", "interface": "IMU (yaw + lat acc)",     "direction": "In",  "description": "Vehicle motion state at 100 Hz"},
+    {"id": "I04", "interface": "Steering angle sensor",   "direction": "In",  "description": "Driver intent via CAN"},
+    {"id": "I05", "interface": "Engine torque request",   "direction": "Out", "description": "CAN message to powertrain ECU"},
+    {"id": "I06", "interface": "Driver display lamp",     "direction": "Out", "description": "MIL / warning to driver via CAN"}
+  ],
+  "functions": [
+    {"id": "F01", "name": "Yaw stability control",        "description": "Compares measured yaw rate with reference yaw rate from steering angle and vehicle speed; applies brake pressure to individual wheels to correct deviations.", "kinetic_authority": "high"},
+    {"id": "F02", "name": "Engine torque modulation",     "description": "Requests reduction of engine torque via CAN when wheel slip exceeds threshold or yaw correction requires additional deceleration.",                          "kinetic_authority": "high"},
+    {"id": "F03", "name": "Driver warning lamp control",  "description": "Illuminates ESC warning lamp during active intervention or when system fault is detected.",                                                                "kinetic_authority": "low"},
+    {"id": "F04", "name": "Self-diagnostic monitoring",   "description": "Continuously monitors sensor plausibility and actuator response; reports DTCs and disables intervention on persistent faults.",                            "kinetic_authority": "none"}
+  ],
+  "function_malfunction_ratings": [
+    {"function_id": "F01", "malfunction_id": "M01", "classification": "SC", "hazard_description": "loss of yaw stability intervention during loss-of-traction event causing vehicle spin or departure"},
+    {"function_id": "F01", "malfunction_id": "M02", "classification": "SC", "subsumed_by": "M01", "hazard_description": "ESC stops mid-event; same hazard as M01"},
+    {"function_id": "F01", "malfunction_id": "M03", "classification": "SC", "hazard_description": "unintended brake application causing yaw moment and loss of vehicle control"},
+    {"function_id": "F01", "malfunction_id": "M04", "classification": "SC", "hazard_description": "ESC stuck applying brakes regardless of conditions, causing unintended deceleration and yaw"},
+    {"function_id": "F01", "malfunction_id": "M05", "classification": "SC", "hazard_description": "excessive brake pressure on a single wheel causing strong yaw moment beyond driver control"},
+    {"function_id": "F01", "malfunction_id": "M06", "classification": "SC", "hazard_description": "insufficient brake intervention during instability event leading to vehicle departure"},
+    {"function_id": "F01", "malfunction_id": "M07", "classification": "NSC", "rationale": "Yaw control has no discrete trigger; early activation manifests as M03 unintended."},
+    {"function_id": "F01", "malfunction_id": "M08", "classification": "SC", "hazard_description": "ESC activates after stability event has progressed past recovery, secondary impact"},
+    {"function_id": "F01", "malfunction_id": "M09", "classification": "SC", "subsumed_by": "M02", "hazard_description": "Brake application released early; same hazard as M02"},
+    {"function_id": "F01", "malfunction_id": "M10", "classification": "SC", "hazard_description": "Brake pressure held longer than needed causing unintended deceleration and trailing yaw"},
+    {"function_id": "F01", "malfunction_id": "M11", "classification": "SC", "subsumed_by": "M08", "hazard_description": "Latent intervention; same hazard as M08"},
+    {"function_id": "F01", "malfunction_id": "M12", "classification": "SC", "hazard_description": "Brake pressure applied to opposite wheel set, amplifying instability"},
+    {"function_id": "F01", "malfunction_id": "M13", "classification": "SC", "hazard_description": "Erratic per-wheel braking during stable cruise causes driver-perceived loss of control"},
+    {"function_id": "F01", "malfunction_id": "M14", "classification": "SC", "hazard_description": "Asymmetric per-wheel braking during straight-line driving causes pull and lane departure"},
+
+    {"function_id": "F02", "malfunction_id": "M01", "classification": "NSC", "rationale": "Loss of torque modulation reverts to driver-controlled throttle; not safety critical."},
+    {"function_id": "F02", "malfunction_id": "M03", "classification": "SC", "hazard_description": "Unrequested engine torque cut at highway speed causing loss of expected acceleration"},
+    {"function_id": "F02", "malfunction_id": "M05", "classification": "SC", "hazard_description": "Excessive engine torque cut causing unintended deceleration"},
+    {"function_id": "F02", "malfunction_id": "M12", "classification": "SC", "hazard_description": "Inverse: ESC requests torque INCREASE during instability event, worsening it"},
+
+    {"function_id": "F03", "malfunction_id": "M01", "classification": "NSC", "rationale": "Loss of warning lamp does not directly cause harm; degraded UX."},
+    {"function_id": "F03", "malfunction_id": "M03", "classification": "NSC", "rationale": "Spurious warning is a nuisance, not a hazard."},
+
+    {"function_id": "F04", "malfunction_id": "M01", "classification": "NSC", "rationale": "Loss of self-diagnostic results in latent faults handled by FSC, not direct hazard."}
+  ]
+}

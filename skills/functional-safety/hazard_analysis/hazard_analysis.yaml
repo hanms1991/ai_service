@@ -1,0 +1,125 @@
+name: hazard_analysis
+display_name: 功能安全危害分析（HARA）
+description: 基于相关项定义文档或功能/系统描述，按 ISO 26262 完成功能枚举、M01-M14 失效过滤、S/E/C 评级与 ASIL 矩阵，产出审计级多 Tab HARA 工作簿（xlsx）与安全目标清单。
+version: 2.0.0
+risk_level: medium
+domain:
+  - 功能安全
+  - 汽车电子
+tags:
+  - 危害分析
+  - HARA
+  - ASIL
+  - 安全目标
+  - ISO 26262
+
+model_hint:
+  reasoning: enabled
+
+# ────────────────────────────────────────────────────────────────────
+# 输入契约
+# item_definition 与 file_id 二者至少提供其一（required_any）：
+#   - 对话直述 → item_definition
+#   - 上传相关项文档 → file_id（平台经 read_document 自动读取并追加为文档段落）
+# ────────────────────────────────────────────────────────────────────
+inputs:
+  item_definition:
+    type: string
+    required: false
+    desc: 分析对象/功能/系统的文字描述，例如 AEB 自动紧急制动系统的范围、功能与边界
+  file_id:
+    type: string
+    required: false
+    desc: 用户通过 /agent/files/upload 上传的相关项定义文档 file_id（docx/xlsx/pdf 等）；提供后平台自动读取文档内容用于分析
+  operational_scenarios:
+    type: string
+    required: false
+    desc: 运行场景、边界条件、环境与人员状态，例如高速跟车、雨天、驾驶员分心
+  known_hazards:
+    type: string
+    required: false
+    desc: 已知危害/关注点/失效模式，多个可用顿号或分号分隔
+  standard:
+    type: string
+    required: false
+    desc: 适用标准，例如 ISO 26262；未提供时按 ISO 26262 通用 HARA 方法分析
+
+# 条件必填：每组中至少一个输入有值，否则执行链转为对话式澄清
+required_any:
+  - [item_definition, file_id]
+
+# 文档源：执行技能前把 file_id 对应文档读为 Markdown，作为只读段落追加到用户消息
+document_source:
+  file_id_input: file_id
+
+# ────────────────────────────────────────────────────────────────────
+# 系统提示与方法论参考（reference_files 由平台拼接在 system_prompt 之后）
+# ────────────────────────────────────────────────────────────────────
+system_prompt:
+  file: system_prompt.md
+reference_files:
+  - references/malfunctions.md
+  - references/severity_ais.md
+  - references/exposure.md
+  - references/controllability.md
+  - references/asil_matrix.md
+  - references/operating_environments.md
+  - references/fsc_handoff.md
+
+# ────────────────────────────────────────────────────────────────────
+# 输出：结构化 JSON（轻量 schema 校验）→ 确定性渲染器生成 xlsx 交付物
+# ────────────────────────────────────────────────────────────────────
+output:
+  format: json
+  example_file: examples/sample_input_esc.json
+  schema:
+    type: object
+    required: [item, functions]
+    properties:
+      item:
+        type: object
+        required: [name]
+        properties:
+          name: {type: string}
+          abbr: {type: string}
+      scope_description: {type: string}
+      boundary_diagram_notes: {type: string}
+      assumptions:
+        type: array
+        items: {type: object}
+      interfaces:
+        type: array
+        items: {type: object}
+      functions:
+        type: array
+        items:
+          type: object
+          required: [id, name]
+      function_malfunction_ratings:
+        type: array
+        items: {type: object}
+      rating_overrides:
+        type: array
+        items: {type: object}
+  # 渲染器：输入 JSON 写临时文件 → 调用脚本 entrypoint(input_path, output_path)
+  # → xlsx 存入文件沙箱，经 /agent/files/{file_id}/download 下载
+  renderer:
+    type: python_script
+    script: scripts/generate_hara.py
+    entrypoint: generate
+    format: xlsx
+    filename_template: "HARA_{abbr}_{date}.xlsx"
+
+prompt_template: |
+  请完成功能安全危害分析（HARA），并按系统提示词要求只输出工作簿输入 JSON。
+
+  【分析对象/功能描述】：{{item_definition}}
+  【运行场景/边界条件】：{{operational_scenarios}}
+  【已知危害/关注点】：{{known_hazards}}
+  【适用标准】：{{standard}}
+
+  要点：
+  1. 若下方提供了【相关项文档】，以文档为主要事实来源提取相关项、接口、假设与功能；
+  2. 每个功能必须评估全部 14 个失效指导词（M01-M14），NSC/NA 也要保留并给理由；
+  3. S/E/C 与 ASIL 由工作簿自动计算，你只输出功能、失效过滤分类、危害描述与必要的 overrides；
+  4. 只输出一个 JSON 对象，不要 Markdown 代码围栏或任何解释文字。

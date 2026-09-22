@@ -176,3 +176,29 @@ def task_timeout(task_id: str, timeout_seconds: int) -> ApiError:
         http_status=504,
         task_id=task_id,
     )
+
+
+# ── 文件上传（文档类技能输入） ──
+
+def file_too_large(current_bytes: int, limit_bytes: int) -> ApiError:
+    return ApiError(
+        "FILE_TOO_LARGE",
+        f"文件大小 {current_bytes} 字节，超过上限 {limit_bytes // (1024 * 1024)}MB",
+        http_status=413,
+    )
+
+
+def file_type_not_allowed(ext: str, allowed: list[str]) -> ApiError:
+    return ApiError(
+        "FILE_TYPE_NOT_ALLOWED",
+        f"不支持的文件类型：{ext or '（无扩展名）'}；允许：{', '.join(allowed)}",
+        http_status=415,
+    )
+
+
+def file_not_found(file_id: str) -> ApiError:
+    return ApiError(
+        "FILE_NOT_FOUND",
+        f"文件 {file_id!r} 不存在或已被清理",
+        http_status=404,
+    )

@@ -1,5 +1,8 @@
 """POST /agent/invoke 同步执行端点。
 
+- POST /agent/invoke 同步执行端点。
+- POST /agent/invoke/stream 流式执行端点。
+
 设计文档 7.1 节：同步执行并返回最终结果，适用于快任务。
 M1 范围：scene 直达 + 智能编排 + reference_data 注入（50KB 阈值报错）。
 """

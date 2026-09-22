@@ -34,10 +34,13 @@ skills:
   # - change_impact_analysis
   # - vv_planning
 
-# 如需额外工具（非 load_skill），在下方按 "module.path:attr" 形式声明：
-# tools:
+# 额外工具（非 load_skill），按 "module.path:attr" 形式声明：
+# read_document：读取用户上传的需求文档/清单（docx/xlsx/pptx/pdf → Markdown）
+# 外部 ALM 接入（DOORS/Polarion）预留：
 #   - integrations.doors:query_requirements
 #   - integrations.polarion:create_work_item
+tools:
+  - tools.read_document:read_document
 
 # default_system_prompt：Agent 的身份与安全边界（兜底用）。
 # 经 Planner 调度执行技能时，调度层会用 skill.system_prompt 覆盖此字段，

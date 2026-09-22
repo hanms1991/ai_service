@@ -31,7 +31,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.deps import get_api_keys
 from api.errors import ApiError, internal_error
-from api.routes import capabilities, invoke, tasks
+from api.routes import capabilities, files, invoke, tasks
 from api.services.agent_runner import set_supervisor_graph
 from api.services.callbacks import CallbackClient, load_whitelist_from_env, set_callback_client
 from api.services.scene_resolver import init_scene_resolver
@@ -251,6 +251,7 @@ def create_app() -> FastAPI:
     app.include_router(invoke.router, prefix="/api/v1")
     app.include_router(tasks.router, prefix="/api/v1")
     app.include_router(capabilities.router, prefix="/api/v1")
+    app.include_router(files.router, prefix="/api/v1")
 
     # Playground 静态调试台（同源免 CORS；html=True 使 /playground 直达 index.html）
     playground_dir = PROJECT_ROOT / "playground"

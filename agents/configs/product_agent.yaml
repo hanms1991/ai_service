@@ -25,9 +25,10 @@ skills:
   - feature_definition
   - prd_generation
 
-# 如需额外工具（非 load_skill），在下方按 "module.path:attr" 形式声明：
-# tools:
-#   - some.module:some_tool
+# 额外工具（非 load_skill），按 "module.path:attr" 形式声明：
+# read_document：读取用户上传的功能描述/竞品资料等文档（docx/xlsx/pptx/pdf → Markdown）
+tools:
+  - tools.read_document:read_document
 
 # default_system_prompt：Agent 的身份与安全边界（兜底用）。
 # 经 Planner 调度执行技能时，调度层会用 skill.system_prompt 覆盖此字段，

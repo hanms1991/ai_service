@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -256,12 +257,29 @@ def validate_binding(agent_name: str, skill_name: str) -> dict:
     return skills[skill_name]
 
 
+def _is_value_provided(value: Any) -> bool:
+    """输入值是否算"已提供"：None/空白字符串/空集合视为缺失。"""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (dict, list, tuple, set)):
+        return bool(value)
+    return True
+
+
 def get_missing_required_inputs(
     agent_name: str,
     skill_name: str,
     inputs: dict[str, Any] | None,
 ) -> list[str]:
-    """预校验技能步骤的必填输入是否齐全，返回缺失的必填参数名列表。
+    """预校验技能步骤的必填输入是否齐全，返回缺失项列表。
+
+    两种必填约束：
+      1. inputs.<name>.required: true     —— 单参数必填
+      2. required_any: [[a, b], ...]      —— 每组至少一个有值（条件必填），
+         整组缺失时以 "a|b" 形式作为一个元素返回，由 describe_skill_params
+         渲染成"a 或 b（至少提供其一）"。
 
     供 Planner 出口自修复与 Executor 兜底共用，把"缺参"拦截在执行崩溃之前。
     - 未指定 skill（self_handle/compose/worker 通用对话）→ 不校验，返回 []
@@ -275,26 +293,42 @@ def get_missing_required_inputs(
     except KeyError:
         return []
     provided = inputs or {}
+
+    def _provided(name: str) -> bool:
+        value = provided.get(name)
+        if isinstance(value, str) and value.strip().startswith("${"):
+            return True  # chain 前序结果引用
+        return _is_value_provided(value)
+
     missing: list[str] = []
     for name, spec in (skill_cfg.get("inputs") or {}).items():
-        if not spec.get("required"):
-            continue
-        value = provided.get(name)
-        if value is None:
+        if spec.get("required") and not _provided(name):
             missing.append(name)
-        elif isinstance(value, str) and not value.strip():
-            missing.append(name)
+
+    for group in skill_cfg.get("required_any") or []:
+        if isinstance(group, list) and group and not any(_provided(n) for n in group):
+            missing.append("|".join(str(n) for n in group))
     return missing
 
 
 def describe_skill_params(skill_cfg: dict, param_names: list[str]) -> str:
-    """把缺失参数渲染成给用户看的自然语言说明（用技能契约中的 desc）。"""
+    """把缺失参数渲染成给用户看的自然语言说明（用技能契约中的 desc）。
+
+    元素可能是单参数名（"file_id"）或条件必填组（"item_definition|file_id"）。
+    """
     schema = skill_cfg.get("inputs") or {}
     parts = []
-    for name in param_names:
-        spec = schema.get(name) or {}
-        desc = spec.get("desc") or name
-        parts.append(f"{desc}（{name}）")
+    for token in param_names:
+        names = token.split("|")
+        if len(names) > 1:
+            rendered = " 或 ".join(
+                f"{(schema.get(n) or {}).get('desc') or n}（{n}）" for n in names
+            )
+            parts.append(f"{rendered}，至少提供其一")
+        else:
+            name = names[0]
+            spec = schema.get(name) or {}
+            parts.append(f"{spec.get('desc') or name}（{name}）")
     return "、".join(parts)
 
 
@@ -367,11 +401,21 @@ def render_planner_catalog(registry: dict[str, Any] | None = None) -> str:
                 sections = output.get("sections")
                 if sections:
                     out_desc += f"，含章节【{'/'.join(sections)}】"
+                renderer = output.get("renderer") or {}
+                if renderer.get("format"):
+                    out_desc += f"，确定性渲染交付物：{renderer['format']}（返回文件 ID 与下载链接）"
+                # 条件必填组（required_any）在目录中显式提示，避免 Planner 误判缺参
+                required_any = skill.get("required_any") or []
+                any_desc = ""
+                if required_any:
+                    groups = [" 或 ".join(str(n) for n in g) for g in required_any if isinstance(g, list)]
+                    any_desc = f" ｜ 条件必填（每组至少提供其一）：{'；'.join(groups)}"
                 lines.append(
                     f"  - skill: {skill_name}"
                     f" ｜ {skill.get('display_name')}"
                     f" ｜ 能力: {skill.get('description')}"
                     f" ｜ 输入: {_format_inputs(skill.get('inputs', {}))}"
+                    f"{any_desc}"
                     f" ｜ 输出: {out_desc}"
                     f" ｜ 风险: {skill.get('risk_level', 'low')}"
                 )
@@ -434,29 +478,267 @@ def _build_model_with_hint(base_llm: Any, model_hint: dict[str, Any] | None) -> 
     return base_llm.bind(extra_body=model_kwargs)
 
 
-def execute_skill(
+class SkillInputError(ValueError):
+    """技能执行期的可纠正输入错误（如 file_id 对应文档不存在/无法解析）。
+
+    Executor 捕获后转为对话式提示，而不是让请求 500。
+    """
+
+
+def _load_reference_texts(skill_cfg: dict) -> str:
+    """拼接技能声明的 reference_files（相对技能 yaml 所在目录）。"""
+    base = _skill_base_dir(skill_cfg)
+    blocks: list[str] = []
+    for rel in skill_cfg.get("reference_files") or []:
+        path = base / rel
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"技能 {skill_cfg.get('name')} 的参考文档不存在：{path}"
+            )
+        blocks.append(
+            f"\n\n# ══ 参考文档：{path.name} ══\n"
+            + path.read_text(encoding="utf-8")
+        )
+    return "".join(blocks)
+
+
+def _build_skill_system_prompt(skill_cfg: dict, agent_cfg: dict) -> str:
+    """组装系统提示词：skill.system_prompt + reference_files；skill 缺省时用 agent 兜底。"""
+    from agents.generate_agent import _resolve_system_prompt
+
+    skill_system = skill_cfg.get("system_prompt")
+    if skill_system:
+        prompt = _resolve_system_prompt(skill_system, _skill_base_dir(skill_cfg))
+    else:
+        prompt = _resolve_system_prompt(
+            agent_cfg.get("default_system_prompt", ""), CONFIGS_DIR
+        )
+    return prompt + _load_reference_texts(skill_cfg)
+
+
+def _resolve_document_block(skill_cfg: dict, inputs: dict[str, Any]) -> str:
+    """按 document_source 声明读取用户上传文档，返回追加到用户消息的只读段落。
+
+    document_source:
+        file_id_input: file_id   # inputs 中承载 file_id 的字段名
+    读取失败（文件过期/损坏）抛 SkillInputError，由 Executor 转为对话式提示。
+    """
+    source_cfg = skill_cfg.get("document_source") or {}
+    file_id_input = source_cfg.get("file_id_input")
+    if not file_id_input:
+        return ""
+    file_id = str(inputs.get(file_id_input) or "").strip()
+    if not file_id:
+        return ""
+
+    from tools.read_document import read_document
+
+    content = read_document.invoke({"file_id": file_id})
+    if not isinstance(content, str) or content.startswith("[读取失败]") or content.startswith("[读取成功但内容为空]"):
+        raise SkillInputError(
+            f"无法读取 file_id={file_id} 对应的文档：{content[:200]}。"
+            "请提示用户重新上传文档（docx/xlsx/pptx/pdf 等），或直接用文字描述相关项信息。"
+        )
+    # content 已自带文件名/长度头，整体作为只读文档段落
+    return "\n\n【相关项文档（Markdown，平台从用户上传文件转换，分析以此为主要事实来源）】\n" + content
+
+
+def _build_schema_example_block(skill_cfg: dict) -> str:
+    """把 output.example_file 的样例 JSON 渲染成输出示例段落（无则空串）。"""
+    output_cfg = skill_cfg.get("output", {}) or {}
+    rel = output_cfg.get("example_file")
+    if not rel:
+        return ""
+    path = _skill_base_dir(skill_cfg) / rel
+    if not path.is_file():
+        return ""
+    text = path.read_text(encoding="utf-8").strip()
+    return (
+        "\n\n【输出 JSON 结构示例（展示字段结构与枚举写法；内容必须来自本次分析，"
+        "不要照抄示例数据）】\n" + text
+    )
+
+
+# 渲染器模块缓存（同一脚本只导入一次）
+_renderer_cache: dict[str, Any] = {}
+
+
+def _run_renderer(
+    skill_cfg: dict, structured: dict | list
+) -> tuple[Any, dict]:
+    """执行技能声明的 output.renderer，把结构化结果渲染成文件并落入文件沙箱。
+
+    返回 (artifact_meta, stats)；未声明渲染器返回 (None, {})。
+    """
+    output_cfg = skill_cfg.get("output", {}) or {}
+    renderer_cfg = output_cfg.get("renderer")
+    if not renderer_cfg:
+        return None, {}
+    if not isinstance(structured, dict):
+        raise ValueError("渲染器要求结构化输出为 JSON 对象")
+
+    import importlib.util
+    import tempfile
+    from datetime import datetime
+
+    from core.file_sandbox import save_generated
+
+    base = _skill_base_dir(skill_cfg)
+    script_rel = renderer_cfg.get("script")
+    entrypoint = renderer_cfg.get("entrypoint", "generate")
+    out_format = renderer_cfg.get("format", "xlsx").lstrip(".")
+    if not script_rel:
+        raise ValueError(f"技能 {skill_cfg.get('name')} 的 renderer 缺少 script 配置")
+    script_path = (base / script_rel).resolve()
+    if not script_path.is_file():
+        raise FileNotFoundError(f"渲染器脚本不存在：{script_path}")
+
+    cache_key = str(script_path)
+    module = _renderer_cache.get(cache_key)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(
+            f"skill_renderer_{skill_cfg.get('name')}_{script_path.stem}", script_path
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _renderer_cache[cache_key] = module
+    fn = getattr(module, entrypoint, None)
+    if not callable(fn):
+        raise AttributeError(f"渲染器 {script_path} 不存在入口函数 {entrypoint!r}")
+
+    # 文件名模板：{abbr}/{name}/{date}，净化为安全文件名
+    item = structured.get("item") or {}
+    raw_abbr = str(item.get("abbr") or item.get("name") or skill_cfg.get("name") or "out")
+    safe_abbr = re.sub(r"[^\w\-.]+", "_", raw_abbr).strip("_")[:40] or "out"
+    template = renderer_cfg.get("filename_template") or f"{skill_cfg.get('name')}_{'{date}'}.{out_format}"
+    filename = (
+        template
+        .replace("{abbr}", safe_abbr)
+        .replace("{name}", safe_abbr)
+        .replace("{date}", datetime.now().strftime("%Y%m%d"))
+    )
+
+    tmp_in = tmp_out = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        ) as f:
+            json.dump(structured, f, ensure_ascii=False, indent=2)
+            tmp_in = f.name
+        fd, tmp_out = tempfile.mkstemp(suffix=f".{out_format}")
+        os.close(fd)
+
+        stats = fn(tmp_in, tmp_out) or {}
+        content = Path(tmp_out).read_bytes()
+        meta = save_generated(filename, content)
+        return meta, stats if isinstance(stats, dict) else {}
+    finally:
+        for p in (tmp_in, tmp_out):
+            try:
+                if p:
+                    Path(p).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _extract_safety_goals(artifact_path: Path, limit: int = 15) -> list[dict]:
+    """从生成的 HARA 工作簿 13_Safety_Goals 表读取安全目标摘要（尽力而为）。"""
+    try:
+        import openpyxl
+
+        wb = openpyxl.load_workbook(artifact_path, read_only=True, data_only=False)
+        if "13_Safety_Goals" not in wb.sheetnames:
+            return []
+        ws = wb["13_Safety_Goals"]
+        goals: list[dict] = []
+        for row in ws.iter_rows(min_row=5, values_only=True):
+            sg_id = row[0] if len(row) > 0 else None
+            if not sg_id or not str(sg_id).startswith("SG-"):
+                break
+            goals.append({
+                "sg_id": sg_id,
+                "function": row[1] if len(row) > 1 else "",
+                "asil": row[3] if len(row) > 3 else "",
+                "goal": row[5] if len(row) > 5 else "",
+            })
+            if len(goals) >= limit:
+                break
+        wb.close()
+        return goals
+    except Exception:
+        return []
+
+
+def _format_artifact_summary(
+    skill_cfg: dict, meta: Any, stats: dict, artifact_path: Path | None
+) -> str:
+    """把渲染产物组织成面向用户的中文摘要（替代裸 JSON 输出）。"""
+    name = skill_cfg.get("display_name") or skill_cfg.get("name")
+    lines = [
+        f"## {name}已完成",
+        "",
+        f"**交付物**：{meta.original_name}（{meta.size / 1024:.1f} KB）",
+        f"文件 ID：`{meta.file_id}`",
+        f"下载方式：`GET /api/v1/agent/files/{meta.file_id}/download`（需携带 API Key）",
+        "",
+    ]
+    if stats:
+        stat_labels = {
+            "functions": "功能数",
+            "function_malfunction_pairs": "功能×失效组合",
+            "safety_critical_pairs": "安全关键（SC）组合",
+            "hara_rows": "HARA 工况行（笛卡尔展开）",
+            "significant_rows": "ASIL≥A 显著行",
+            "safety_goals": "安全目标数",
+        }
+        lines.append("**工作簿统计**：")
+        for key, label in stat_labels.items():
+            if key in stats:
+                lines.append(f"- {label}：{stats[key]}")
+        lines.append("")
+
+    if skill_cfg.get("name") == "hazard_analysis" and artifact_path is not None:
+        goals = _extract_safety_goals(artifact_path)
+        if goals:
+            lines.append(f"**安全目标清单（按最高 ASIL 排序，前 {len(goals)} 条，全量见工作簿）**：")
+            lines.append("")
+            lines.append("| SG ID | ASIL | 功能 | 安全目标 |")
+            lines.append("|---|---|---|---|")
+            for g in goals:
+                goal_text = str(g["goal"]).replace("|", "／").replace("\n", " ")
+                lines.append(f"| {g['sg_id']} | {g['asil']} | {g['function']} | {goal_text} |")
+            lines.append("")
+
+    lines.append(
+        "> 工作簿含封面、假设、架构边界、功能清单、M01–M14 失效词、S/E/C 参考表、"
+        "ASIL 矩阵、功能×失效过滤表（全量保留可审计）、笛卡尔 HARA 工作表"
+        "（ASIL 为活公式，修改 S/E/C 后自动重算）、安全目标与 FSC 交接表。"
+        "自动 S/E/C 评级均为建议值，请逐条复核理由列后由责任人签署确认。"
+    )
+    return "\n".join(lines)
+
+
+def _execute_skill_core(
     agent_name: str,
     skill_name: str,
     inputs: dict[str, Any],
+    *,
+    reference_data: dict[str, Any] | None = None,
     runnable_config: Any = None,
-) -> str:
-    """直接用某 Agent 的模型执行指定技能，只产生一次 LLM 调用。
+) -> SkillResult:
+    """技能执行统一内核（v1/v2 共用）。
 
-    system_prompt 优先级（避免 Agent 与 Skill 的约束冲突误导模型）：
-      - skill.system_prompt       （角色 + 输出格式，优先）
-      - agent.default_system_prompt（身份 + 安全边界，仅兜底）
-
-    model_hint：skill 可声明 reasoning 档位（disabled/low/medium/high）或原生
-      model_kwargs，调度层据此调整本次调用的模型行为（如简单技能关闭推理）。
-
-    用户消息 = 技能 prompt_template 用 inputs 渲染后的内容。
-
-    Args:
-        runnable_config: LangChain RunnableConfig（透传 callbacks，使日志记录生效）
+    流程：
+      1. 校验绑定、渲染 prompt 模板；
+      2. document_source：先读用户上传文档，追加为只读文档段落；
+      3. 组装 system_prompt（skill + reference_files）；
+      4. 结构化技能：json_mode 调用 → schema 轻量校验；
+      5. output.renderer：JSON → 确定性文件渲染 → 落文件沙箱 → 中文摘要；
+      6. 返回 SkillResult（text/structured/usage/artifacts）。
     """
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    from agents.generate_agent import _resolve_model, _resolve_system_prompt
+    from agents.generate_agent import _resolve_model
 
     skill_cfg = validate_binding(agent_name, skill_name)
     agent_cfg = load_agent_config(agent_name)
@@ -466,29 +748,82 @@ def execute_skill(
         inputs or {},
         skill_cfg.get("inputs", {}),
     )
-    # 基于 Agent 的模型配置，叠加 skill 的 model_hint（推理开关/档位等）
+
+    # ── 执行链前置：读取上传文档（file_id → Markdown 段落） ──
+    doc_block = _resolve_document_block(skill_cfg, inputs or {})
+
+    # ── 外部 reference_data 注入（API 后台预取资料） ──
+    ref_block = _build_reference_block(reference_data)
+
+    # ── 输出 JSON Schema 说明与示例段落 ──
+    output_cfg = skill_cfg.get("output", {}) or {}
+    output_format = output_cfg.get("format", "plain_text")
+    output_schema = output_cfg.get("schema")
+    schema_example_block = (
+        _build_schema_example_block(skill_cfg) if output_format == "json" else ""
+    )
+
+    user_message = rendered + doc_block + ref_block + schema_example_block
+
+    # ── model_hint：叠加 skill 的推理开关/档位等 ──
     llm = _build_model_with_hint(
         _resolve_model(agent_cfg.get("model")),
         skill_cfg.get("model_hint"),
     )
 
-    # ── system_prompt 覆盖策略：skill 优先，agent 兜底 ──
-    skill_system = skill_cfg.get("system_prompt")
-    if skill_system:
-        system_prompt = _resolve_system_prompt(skill_system, _skill_base_dir(skill_cfg))
-    else:
-        system_prompt = _resolve_system_prompt(
-            agent_cfg.get("default_system_prompt", ""), CONFIGS_DIR
-        )
+    system_prompt = _build_skill_system_prompt(skill_cfg, agent_cfg)
 
-    invoke_kwargs = {}
+    invoke_model = llm
+    if output_format == "json" and output_schema:
+        invoke_model = llm.bind(response_format={"type": "json_object"})
+
+    invoke_kwargs: dict[str, Any] = {}
     if runnable_config is not None:
         invoke_kwargs["config"] = runnable_config
-    response = llm.invoke(
-        [SystemMessage(content=system_prompt), HumanMessage(content=rendered)],
+
+    response = invoke_model.invoke(
+        [SystemMessage(content=system_prompt), HumanMessage(content=user_message)],
         **invoke_kwargs,
     )
-    return response.content
+    raw_text = response.content if isinstance(response.content, str) else str(response.content)
+
+    structured = _validate_structured_output(raw_text, output_schema)
+    usage = _extract_usage(response)
+
+    result = SkillResult(text=raw_text, structured=structured, usage=usage)
+
+    # ── 确定性渲染：JSON → 文件交付物 ──
+    if output_format == "json" and structured is not None:
+        meta, stats = _run_renderer(skill_cfg, structured)
+        if meta is not None:
+            from core.file_sandbox import resolve_stored_path
+
+            artifact_path = resolve_stored_path(meta.file_id)
+            result.artifacts = [{
+                "file_id": meta.file_id,
+                "filename": meta.original_name,
+                "format": meta.ext.lstrip("."),
+                "size": meta.size,
+            }]
+            result.text = _format_artifact_summary(skill_cfg, meta, stats, artifact_path)
+
+    return result
+
+
+def execute_skill(
+    agent_name: str,
+    skill_name: str,
+    inputs: dict[str, Any],
+    runnable_config: Any = None,
+) -> str:
+    """直接用某 Agent 的模型执行指定技能（LangGraph Executor 入口）。
+
+    支持：system_prompt/reference_files 装配、document_source 先读文档、
+    结构化 JSON 输出、output.renderer 确定性文件渲染（渲染产物时返回中文摘要）。
+    """
+    return _execute_skill_core(
+        agent_name, skill_name, inputs, runnable_config=runnable_config
+    ).text
 
 
 # ════════════════════════════════════════════════════════════════
@@ -503,13 +838,15 @@ REFERENCE_DATA_MAX_BYTES = 50 * 1024
 class SkillResult:
     """技能执行的统一返回结构（v2）。
 
-    text:       LLM 原始文本输出（结构化技能时为未解析的 JSON 字符串）
+    text:       面向用户的输出文本（渲染产物时为产物摘要，否则为 LLM 原始输出）
     structured: 按 output.schema 校验通过的对象；非结构化技能为 None
     usage:      token 使用统计（从 response.usage_metadata 提取）
+    artifacts:  确定性渲染产物列表 [{file_id, filename, format, size}]
     """
     text: str
     structured: dict | list | None = None
     usage: dict[str, Any] = field(default_factory=dict)
+    artifacts: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _extract_usage(response: Any) -> dict[str, Any]:
@@ -628,81 +965,23 @@ def execute_skill_v2(
 ) -> SkillResult:
     """对外 API 使用的技能执行入口（v2）。
 
-    与旧 execute_skill 的区别：
-      1. 返回 SkillResult(text, structured, usage)，而非裸字符串；
+    与 _execute_skill_core 共用同一执行链路：
+      1. 返回 SkillResult(text, structured, usage, artifacts)；
       2. 支持 output.schema 结构化校验（json_mode + 轻量 schema 校验）；
-      3. 支持 reference_data 注入（模式 A，只读上下文追加到用户消息末尾）；
-      4. 旧函数保留不动，向 LangGraph Executor 完全兼容。
-
-    Args:
-        agent_name:     Agent 名（必须存在于注册表）
-        skill_name:     技能名（必须由该 Agent 绑定）
-        inputs:         技能输入，键必须符合技能 inputs 契约
-        reference_data: 后端预取的业务资料（只读注入，50KB 阈值）
-        runnable_config: LangChain RunnableConfig（透传 callbacks，使日志记录生效）
+      3. 支持 reference_data 注入（只读上下文追加到用户消息）；
+      4. 支持 document_source（file_id 先读文档）与 output.renderer（文件交付物）。
 
     Raises:
-        ValueError: reference_data 超阈值 / 结构化输出未通过校验
+        ValueError: reference_data 超阈值 / 结构化输出未通过校验 / 渲染失败
         KeyError:   Agent/技能未在注册表绑定
     """
-    from langchain_core.messages import HumanMessage, SystemMessage
-
-    from agents.generate_agent import _resolve_model, _resolve_system_prompt
-
-    skill_cfg = validate_binding(agent_name, skill_name)
-    agent_cfg = load_agent_config(agent_name)
-
-    rendered = render_prompt_template(
-        skill_cfg["prompt_template"],
-        inputs or {},
-        skill_cfg.get("inputs", {}),
+    return _execute_skill_core(
+        agent_name,
+        skill_name,
+        inputs,
+        reference_data=reference_data,
+        runnable_config=runnable_config,
     )
-
-    # ── 模式 A：reference_data 注入（只读段追加到 prompt 末尾） ──
-    ref_block = _build_reference_block(reference_data)
-    user_message = rendered + ref_block
-
-    # ── model_hint：叠加 skill 的推理开关/档位等 ──
-    llm = _build_model_with_hint(
-        _resolve_model(agent_cfg.get("model")),
-        skill_cfg.get("model_hint"),
-    )
-
-    # ── system_prompt 覆盖策略：skill 优先，agent 兜底 ──
-    skill_system = skill_cfg.get("system_prompt")
-    if skill_system:
-        system_prompt = _resolve_system_prompt(skill_system, _skill_base_dir(skill_cfg))
-    else:
-        system_prompt = _resolve_system_prompt(
-            agent_cfg.get("default_system_prompt", ""), CONFIGS_DIR
-        )
-
-    # ── 结构化技能：json_mode 约束 LLM 输出 ──
-    output_cfg = skill_cfg.get("output", {}) or {}
-    output_format = output_cfg.get("format", "plain_text")
-    output_schema = output_cfg.get("schema")
-
-    invoke_model = llm
-    if output_format == "json" and output_schema:
-        # json_mode：要求 LLM 输出合法 JSON（提示词已强约束 schema）
-        invoke_model = llm.bind(response_format={"type": "json_object"})
-
-    invoke_kwargs: dict[str, Any] = {}
-    if runnable_config is not None:
-        invoke_kwargs["config"] = runnable_config
-
-    response = invoke_model.invoke(
-        [SystemMessage(content=system_prompt), HumanMessage(content=user_message)],
-        **invoke_kwargs,
-    )
-    raw_text = response.content if isinstance(response.content, str) else str(response.content)
-
-    # ── 结构化校验：失败抛 ValueError，由 API 层转 SKILL_OUTPUT_INVALID ──
-    structured = _validate_structured_output(raw_text, output_schema)
-
-    usage = _extract_usage(response)
-
-    return SkillResult(text=raw_text, structured=structured, usage=usage)
 
 
 # ════════════════════════════════════════════════════════════════
