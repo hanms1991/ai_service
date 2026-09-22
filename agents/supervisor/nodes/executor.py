@@ -1,12 +1,13 @@
 """Executor 节点：按计划调用 worker agent / 直连执行技能 / 中枢自处理。
 
 分支逻辑（与原 supervisor_graph.py 完全一致，仅做模块拆分）：
-  - skill 非空 → execute_skill 直连，Agent 角色提示 + 技能模板，一次 LLM 调用完成
+  - skill 非空且必填齐全 → execute_skill 直连，Agent 角色提示 + 技能模板，一次 LLM 调用完成
+  - skill 非空但必填缺失 → 确定性转为 self_handle 对话式澄清（Planner 预校验的第二道兜底）
   - 未指定 skill   → 走 worker agent 自由文本调用（向后兼容）
   - is_final=True → 直接透传结果并设置 final_output
   - is_final=False → 存入 results[output_key] 继续下一步
   - confirm 模式 → interrupt 暂停等待人工审批
-  - ask 模式 → interrupt 暂停等待用户补充信息
+  - ask 模式 → （已废弃）历史计划兼容，interrupt 暂停等待用户补充信息
   - compose 模式 → 不调 worker，拼装前序结果为最终输出
 """
 from __future__ import annotations
@@ -104,11 +105,40 @@ def executor_node(
     # ── 执行业务步骤 ──
     if skill_name:
         # tool+skill 一步直达：无需 worker 内部多轮选择技能
-        from agents.capability_registry import execute_skill
-
-        output = execute_skill(
-            tool_name, skill_name, skill_inputs, runnable_config=config
+        from agents.capability_registry import (
+            describe_skill_params,
+            execute_skill,
+            get_missing_required_inputs,
+            validate_binding,
         )
+
+        # 兜底防线：Planner 出口预校验理论上已拦截缺参计划，
+        # 此处确保任何漏网情况都转为对话式澄清，而不是抛异常导致请求 500
+        missing = get_missing_required_inputs(tool_name, skill_name, skill_inputs)
+        if missing:
+            try:
+                skill_cfg = validate_binding(tool_name, skill_name)
+                display = skill_cfg.get("display_name") or skill_name
+                param_text = describe_skill_params(skill_cfg, missing)
+                clarify_task = (
+                    f"用户希望执行「{display}」，但必要信息尚不完整，还缺少：{param_text}。"
+                    f"请以你的口吻向用户追问这些信息，一次只问必要内容并可给出简短示例；"
+                    f"不要提及任何内部执行机制。"
+                )
+            except KeyError:
+                clarify_task = (
+                    f"当前任务缺少必要信息（{', '.join(missing)}），"
+                    f"请向用户追问补充后再继续。"
+                )
+            print(
+                f"[executor] 技能 {skill_name} 缺少必填输入 {missing}，"
+                f"转为对话式澄清（Planner 预校验漏网兜底）"
+            )
+            output = _self_handle(clarify_task, config)
+        else:
+            output = execute_skill(
+                tool_name, skill_name, skill_inputs, runnable_config=config
+            )
     elif tool_name:
         # 指定了 tool 但未指定 skill：交给 worker agent 通用对话
         output = _call_worker(tool_name, resolved_input, config)

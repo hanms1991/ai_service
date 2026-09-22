@@ -256,6 +256,48 @@ def validate_binding(agent_name: str, skill_name: str) -> dict:
     return skills[skill_name]
 
 
+def get_missing_required_inputs(
+    agent_name: str,
+    skill_name: str,
+    inputs: dict[str, Any] | None,
+) -> list[str]:
+    """预校验技能步骤的必填输入是否齐全，返回缺失的必填参数名列表。
+
+    供 Planner 出口自修复与 Executor 兜底共用，把"缺参"拦截在执行崩溃之前。
+    - 未指定 skill（self_handle/compose/worker 通用对话）→ 不校验，返回 []
+    - agent/skill 未注册（绑定错误）→ 不拦截，交给执行期原有的 KeyError 路径
+    - 值为 ${output_key} 引用（chain 模式引用前序结果）→ 视为已提供
+    """
+    if not skill_name:
+        return []
+    try:
+        skill_cfg = validate_binding(agent_name, skill_name)
+    except KeyError:
+        return []
+    provided = inputs or {}
+    missing: list[str] = []
+    for name, spec in (skill_cfg.get("inputs") or {}).items():
+        if not spec.get("required"):
+            continue
+        value = provided.get(name)
+        if value is None:
+            missing.append(name)
+        elif isinstance(value, str) and not value.strip():
+            missing.append(name)
+    return missing
+
+
+def describe_skill_params(skill_cfg: dict, param_names: list[str]) -> str:
+    """把缺失参数渲染成给用户看的自然语言说明（用技能契约中的 desc）。"""
+    schema = skill_cfg.get("inputs") or {}
+    parts = []
+    for name in param_names:
+        spec = schema.get(name) or {}
+        desc = spec.get("desc") or name
+        parts.append(f"{desc}（{name}）")
+    return "、".join(parts)
+
+
 _PLACEHOLDER_RE = re.compile(r"\{\{\s*(\w+)\s*\}\}")
 
 
@@ -266,7 +308,8 @@ def render_prompt_template(
 ) -> str:
     """用实际输入渲染技能模板（{{param}} 占位符）。
 
-    - 必填输入缺失 → ValueError（Planner 应改用 ask 模式补齐）
+    - 必填输入缺失 → ValueError（正常情况下 Planner 出口预校验与 Executor
+      兜底已将缺参转为对话式澄清，不应到达此处；该异常是最后防线）
     - 可选输入缺失 → 填充“（未提供）”
     - 模板中出现 schema 未声明的占位符 → ValueError
     """
@@ -286,7 +329,8 @@ def render_prompt_template(
     if missing_required:
         raise ValueError(
             f"缺少必填输入: {', '.join(missing_required)}；"
-            f"若用户信息不足，Planner 应使用 ask 模式先追问"
+            f"调度层应先以对话式澄清（tool/skill 留空的 self_handle 步骤）"
+            f"向用户追问补齐后再执行该技能，禁止带缺参直接调用"
         )
 
     def _replacer(match: re.Match) -> str:
