@@ -1,0 +1,29 @@
+# 天枢 AI Service — 生产编排
+# 启动：docker compose up -d --build
+# 查看日志：docker compose logs -f
+services:
+  ai-service:
+    build: .
+    image: tianshu-ai-service:latest
+    container_name: ai_service
+    restart: unless-stopped
+    ports:
+      # 宿主机端口取 .env 中的 AGENT_PORT（默认 8300），容器内固定 8300
+      - "${AGENT_PORT:-8300}:8300"
+    env_file:
+      - .env
+    environment:
+      # 容器内必须监听 0.0.0.0 才能被端口映射访问到
+      AGENT_HOST: 0.0.0.0
+      AGENT_PORT: 8300
+    volumes:
+      # LangGraph 线程状态持久化（checkpoints.db）
+      - ./data:/app/data
+      # LLM 交互日志（llm_trace.log）
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8300/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

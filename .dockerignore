@@ -1,0 +1,29 @@
+# 版本控制与 IDE
+.git
+.gitignore
+.trae/
+
+# 密钥与环境配置（不入镜像，运行时通过 env_file 注入）
+.env
+.env.*
+
+# 运行时数据（通过 docker-compose 卷挂载，不打入镜像）
+data/
+logs/
+
+# 文档与测试（镜像内不需要）
+docs/
+test/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Docker 自身
+Dockerfile
+docker-compose.yml
+.dockerignore

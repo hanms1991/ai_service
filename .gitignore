@@ -3,7 +3,8 @@ __pycache__/
 .env
 .venv/
 logs/
+*.db
 data/
 docs/
 .trae/
-.gitignore/
+.gitignore
