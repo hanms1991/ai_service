@@ -45,7 +45,9 @@ class PlanStep(BaseModel):
         default=None,
         description=(
             "技能输入参数，键名和取值必须符合技能 inputs 契约；"
-            "值中可用 ${output_key} 引用前序步骤输出；必填项缺失时应改用 ask 模式"
+            "值中可用 ${output_key} 引用前序步骤输出；"
+            "必填项在用户消息中缺失时，禁止带空参调用技能，"
+            "应改为 tool/skill 留空的对话式澄清步骤向用户追问"
         ),
     )
     input: str = Field(
@@ -130,6 +132,83 @@ def _build_planner_prompt(extra_instructions: str = "", scene_hint: str = "") ->
 # 3. Planner 节点
 # ════════════════════════════════════════════════════════════════
 
+def _check_plan_required_inputs(plan: PlanSchema) -> list[dict]:
+    """业务校验：逐步骤检查带 skill 的步骤是否覆盖技能契约中的必填参数。
+
+    返回违规列表 [{step_id, tool, skill, missing: [参数名...]}]；
+    self_handle（tool/skill 留空）与 compose 步骤不校验。
+    """
+    from agents.capability_registry import get_missing_required_inputs
+
+    violations: list[dict] = []
+    for step in plan.steps:
+        if not step.skill:
+            continue
+        missing = get_missing_required_inputs(step.tool, step.skill, step.inputs)
+        if missing:
+            violations.append({
+                "step_id": step.step_id,
+                "tool": step.tool,
+                "skill": step.skill,
+                "missing": missing,
+            })
+    return violations
+
+
+def _format_violation_feedback(violations: list[dict]) -> str:
+    """把必填参数违规拼成喂回 LLM 的修复指令。"""
+    lines = ["上一次计划中存在「技能必填参数缺失」的步骤，按当前状态无法执行："]
+    for v in violations:
+        lines.append(
+            f"- 步骤 {v['step_id']}：{v['tool']} 的技能 {v['skill']} "
+            f"缺少必填输入 {', '.join(v['missing'])}。"
+        )
+    lines.append(
+        "请重新生成完整 JSON 计划并二选一："
+        "①用户消息中确有该信息——提取后填入对应 inputs 再执行技能；"
+        "②用户消息中确实没有——不要调用该技能，改为单个对话式澄清步骤"
+        "（tool=\"\"、skill=\"\"、mode=single、is_final=true，在 input 中以第一人称「我」"
+        "向用户追问缺失的必要信息，禁止提及中枢/Agent/技能/调度等内部术语）。"
+    )
+    return "\n".join(lines)
+
+
+def _self_handle_fallback(task: str) -> PlanSchema:
+    """构造单步 self_handle 计划（格式修复失败 / 业务校验失败的通用降级）。"""
+    return PlanSchema(steps=[
+        PlanStep(
+            step_id="step_1",
+            tool="",
+            skill="",
+            input=task,
+            output_key="result_1",
+            is_final=True,
+            mode="single",
+        )
+    ])
+
+
+def _clarification_fallback(violation: dict) -> PlanSchema:
+    """业务校验重试用尽后的确定性降级：基于技能契约生成追问步骤。"""
+    from agents.capability_registry import (
+        describe_skill_params,
+        validate_binding,
+    )
+
+    text = "请告诉我需要补充的信息，我再继续为你处理。"
+    try:
+        skill_cfg = validate_binding(violation["tool"], violation["skill"])
+        display = skill_cfg.get("display_name") or violation["skill"]
+        param_text = describe_skill_params(skill_cfg, violation["missing"])
+        text = (
+            f"我可以帮你完成「{display}」。开始前还需要你提供：{param_text}。"
+            f"补充后我就开始处理。"
+        )
+    except KeyError:
+        pass
+    return _self_handle_fallback(text)
+
+
 def planner_node(state: SupervisorState) -> dict:
     """Planner 节点：LLM 只输出 JSON 执行计划，不产出业务内容。
 
@@ -160,16 +239,16 @@ def planner_node(state: SupervisorState) -> dict:
     prompt = _build_planner_prompt(constants._EXTRA_INSTRUCTIONS, scene_hint)
     messages = [SystemMessage(content=prompt)] + state["messages"]
 
+    user_msg = state["messages"][-1].content if state["messages"] else ""
     plan: PlanSchema | None = None
     max_retries = 2  # 首次 + 2 次修复重试
 
     for attempt in range(max_retries + 1):
         try:
-            plan = structured_model.invoke(messages)
-            break
+            candidate: PlanSchema = structured_model.invoke(messages)
         except Exception as e:
+            # ── 格式/Schema 错误：喂回错误信息让 LLM 修正 ──
             if attempt < max_retries:
-                # 修复重试：把错误信息加入 messages 提示 LLM 修正
                 print(f"[planner] 第 {attempt + 1} 次输出校验失败：{type(e).__name__}: {e}，正在重试...")
                 messages = messages + [
                     HumanMessage(
@@ -179,21 +258,32 @@ def planner_node(state: SupervisorState) -> dict:
                         )
                     )
                 ]
-            else:
-                # 最终 fallback：生成 self_handle 单步计划
-                print(f"[planner] 重试 {max_retries} 次后仍失败，fallback 到 self_handle")
-                user_msg = state["messages"][-1].content if state["messages"] else ""
-                plan = PlanSchema(steps=[
-                    PlanStep(
-                        step_id="step_1",
-                        tool="",
-                        skill="",
-                        input=user_msg,
-                        output_key="result_1",
-                        is_final=True,
-                        mode="single",
-                    )
-                ])
+                continue
+            # 最终 fallback：self_handle 单步计划
+            print(f"[planner] 格式重试 {max_retries} 次后仍失败，fallback 到 self_handle")
+            plan = _self_handle_fallback(user_msg)
+            break
+
+        # ── 业务校验：技能步骤必填参数是否齐全（不合法但 JSON 结构正确，Schema 校验拦不住）──
+        violations = _check_plan_required_inputs(candidate)
+        if not violations:
+            plan = candidate
+            break
+
+        if attempt < max_retries:
+            print(
+                f"[planner] 第 {attempt + 1} 次计划存在缺参步骤 "
+                f"{[v['skill'] for v in violations]}，要求 LLM 重规划..."
+            )
+            messages = messages + [
+                HumanMessage(content=_format_violation_feedback(violations))
+            ]
+            continue
+
+        # 重规划用尽：确定性降级为对话式澄清（Executor 还有第二道兜底）
+        print(f"[planner] 缺参重规划 {max_retries} 次后仍不合规，降级为对话式澄清")
+        plan = _clarification_fallback(violations[0])
+        break
 
     return {
         "plan": [step.model_dump() for step in plan.steps],

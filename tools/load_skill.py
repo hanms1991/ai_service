@@ -1,6 +1,7 @@
 """技能加载工具：从 skills/ 目录读取 YAML 格式的技能契约。
 
-技能以 skills/<skill_name>.yaml 形式存在（能力注册表的同源文件），
+技能以 skills/**/<skill_name>.yaml 形式存在（支持按域分子文件夹，
+如 skills/requirement/uc_analyze.yaml；能力注册表的同源文件），
 新增技能只需新增 yaml 并在对应 Agent 的 skills 字段中声明。
 
 本工具供 worker Agent 独立运行（未经过 Planner 直连）时使用：
@@ -20,11 +21,14 @@ SKILLS_DIR = PROJECT_ROOT / "skills"
 
 
 def _load_skill_cfg(skill_name: str) -> dict | None:
-    """读取技能 yaml；不存在返回 None。"""
+    """读取技能 yaml（递归查找 skills/**/<name>.yaml）；不存在返回 None。"""
     import yaml
 
-    path = SKILLS_DIR / f"{skill_name}.yaml"
-    if not path.exists():
+    # 复用能力注册表的递归发现逻辑（重名检测、_template 排除保持一致）
+    from agents.capability_registry import find_skill_path
+
+    path = find_skill_path(skill_name)
+    if path is None:
         return None
     with path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
@@ -80,7 +84,9 @@ def make_load_skill_tool(allowed_skills: list[str] | None = None):
     """
     # 确定可用技能列表
     if not allowed_skills:
-        allowed_skills = [p.stem for p in SKILLS_DIR.glob("*.y*ml")]
+        from agents.capability_registry import iter_skill_files
+
+        allowed_skills = [p.stem for p in iter_skill_files()]
 
     skill_lines = "\n".join(
         f"    - {name}：{_skill_summary(name)}"
