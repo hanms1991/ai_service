@@ -35,12 +35,30 @@
       <textarea id="inputs-json" class="hidden" rows="4" spellcheck="false"
         placeholder='inputs JSON（选定场景后生效），例如：{"requirement_id": "REQ-001"}'></textarea>
 
+      <!-- 文档与交付物面板 -->
+      <div id="files-bar">
+        <div id="files-bar-head">
+          <button id="btn-toggle-files" class="btn ghost small" data-action="toggle-files"
+            title="折叠/展开文档面板">📄 文档与交付物（<span id="files-count">0</span>）</button>
+          <button id="btn-upload" class="btn ghost small" data-action="pick-file">⬆ 上传文档</button>
+          <button id="btn-refresh-files" class="btn ghost small" data-action="refresh-files" title="重新拉取文件列表">↻ 刷新</button>
+          <input type="file" id="file-input" class="hidden"
+            accept=".docx,.xlsx,.pptx,.pdf,.txt,.md,.csv,.json,.html,.htm" />
+          <span id="files-hint" class="muted"></span>
+        </div>
+        <div id="files-panel">
+          <div id="files-drop" class="files-drop hidden">松开以上传文档…</div>
+          <ul id="files-list"></ul>
+        </div>
+      </div>
+
       <!-- 消息流 -->
       <div id="messages"></div>
 
       <!-- 输入区 -->
       <div id="composer">
-        <textarea id="user-input" rows="2" placeholder="输入消息…（Enter 发送，Shift+Enter 换行）"></textarea>
+        <textarea id="user-input" rows="2"
+          placeholder="输入消息…（Enter 发送，Shift+Enter 换行；可直接粘贴/拖入 file_id 或文档）"></textarea>
         <button id="btn-send" data-action="send">发送</button>
       </div>
     </section>

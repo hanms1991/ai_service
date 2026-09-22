@@ -32,6 +32,9 @@ const STATUS_COLOR = {
   timeout: 'red', cancelled: 'muted', rejected: 'red',
 };
 
+/* file_id：32 位十六进制 */
+const FILE_ID_RE = /\b[0-9a-f]{32}\b/;
+
 /* ── 全局状态 ── */
 const state = {
   apiBase: localStorage.getItem('pg_api_base') || '',
@@ -44,6 +47,9 @@ const state = {
   pollTimer: null,      // 轮询定时器
   pollTaskId: null,
   lastTraceId: '',
+  files: [],            // /agent/files 列表
+  filesLimits: null,    // {max_upload_mb, allowed_extensions}
+  filesCollapsed: localStorage.getItem('pg_files_collapsed') === '1',
 };
 
 /* ── URL / fetch 封装 ── */
@@ -73,6 +79,104 @@ async function apiFetch(path, { method = 'GET', body = null, timeoutMs = 0 } = {
   } catch (e) {
     return { ok: false, status: 0, data: null, elapsed: Math.round(performance.now() - started), networkError: String(e) };
   } finally { if (timer) clearTimeout(timer); }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * 轻量安全 Markdown 渲染（无第三方依赖）
+ * 支持：# 标题 / **加粗** / `行内代码` / GFM 表格 / > 引用 / 列表 / ---
+ * 特殊：行内代码中的 /agent/files/<32hex>/download 渲染为下载按钮
+ * ═══════════════════════════════════════════════════════════════ */
+
+function mdInline(text, slots) {
+  let s = esc(text);
+  /* `code`：下载链接 → 按钮；普通代码 → <code>（用占位符避免被后续规则破坏） */
+  s = s.replace(/`([^`\n]+)`/g, (whole, code) => {
+    const dm = code.match(/([0-9a-f]{32})\/download\s*[^`]*$/);
+    if (dm) {
+      slots.push(
+        `<button class="btn small dl-btn" data-action="download-file" data-id="${dm[1]}"` +
+        ` title="需携带 API Key，已由前端自动附加">⬇ 下载交付物</button>`
+      );
+      return `\u0000${slots.length - 1}\u0000`;
+    }
+    slots.push(`<code>${code}</code>`);
+    return `\u0000${slots.length - 1}\u0000`;
+  });
+  /* [text](https?://url) */
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  /* **bold** */
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  /* 裸 32hex file_id：加等宽样式并提供复制（不自动下载） */
+  s = s.replace(/(?<![\w/])([0-9a-f]{32})(?!\w)/g,
+    '<code class="fid" title="点击复制 file_id">$1</code>');
+  /* 还原占位符 */
+  s = s.replace(/\u0000(\d+)\u0000/g, (_, i) => slots[+i] || '');
+  return s;
+}
+
+function splitMdRow(line) {
+  return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
+}
+
+function renderMarkdown(src) {
+  const text = String(src ?? '').replace(/\r\n/g, '\n');
+  if (!text.trim()) return '';
+  const lines = text.split('\n');
+  const slots = [];
+  let html = '';
+  let listType = null;
+  const closeList = () => { if (listType) { html += `</${listType}>`; listType = null; } };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    /* GFM 表格：当前行含 | 且下一行为 --- 分隔行 */
+    if (line.includes('|') && i + 1 < lines.length
+        && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1]) && lines[i + 1].includes('-')) {
+      closeList();
+      const header = splitMdRow(line);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) {
+        rows.push(splitMdRow(lines[i]));
+        i++;
+      }
+      i--;
+      html += '<table class="md-table"><thead><tr>'
+        + header.map((h) => `<th>${mdInline(h, slots)}</th>`).join('')
+        + '</tr></thead><tbody>';
+      for (const r of rows) {
+        html += '<tr>' + header.map((_, c) => `<td>${mdInline(r[c] || '', slots)}</td>`).join('') + '</tr>';
+      }
+      html += '</tbody></table>';
+      continue;
+    }
+
+    if (!line.trim()) { closeList(); continue; }
+
+    let m;
+    if ((m = line.match(/^(#{1,4})\s+(.*)$/))) {
+      closeList();
+      const lv = m[1].length;
+      html += `<h${lv} class="md-h md-h${lv}">${mdInline(m[2], slots)}</h${lv}>`;
+    } else if (/^\s*-{3,}\s*$/.test(line)) {
+      closeList(); html += '<hr class="md-hr" />';
+    } else if ((m = line.match(/^\s*>\s?(.*)$/))) {
+      closeList(); html += `<blockquote class="md-quote">${mdInline(m[1], slots)}</blockquote>`;
+    } else if ((m = line.match(/^\s*[-*]\s+(.*)$/))) {
+      if (listType !== 'ul') { closeList(); html += '<ul class="md-ul">'; listType = 'ul'; }
+      html += `<li>${mdInline(m[1], slots)}</li>`;
+    } else if ((m = line.match(/^\s*\d+\.\s+(.*)$/))) {
+      if (listType !== 'ol') { closeList(); html += '<ol class="md-ol">'; listType = 'ol'; }
+      html += `<li>${mdInline(m[1], slots)}</li>`;
+    } else {
+      closeList();
+      html += `<p class="md-p">${mdInline(line, slots)}</p>`;
+    }
+  }
+  closeList();
+  return html;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -110,7 +214,9 @@ function renderAssistantMsg(m) {
       ${m.interrupt.message ? `<div>${esc(m.interrupt.message)}</div>` : ''}
       <div class="muted">请直接回复以继续该会话。</div>
     </div>` : '';
-  const outBlock = m.output ? `<div class="out">${esc(m.output)}</div>` : '';
+  const outBlock = m.output
+    ? `<div class="out${m.streaming ? '' : ' md'}">${m.streaming ? esc(m.output) : renderMarkdown(m.output)}</div>`
+    : '';
   // 流式进行中且尚无输出时显示"正在生成…"光标
   const streamingBlock = (m.streaming && !m.output)
     ? '<span class="streaming-cursor">正在生成<span class="cursor-dot">…</span></span>'
@@ -149,7 +255,8 @@ function renderTaskMsg(m) {
         <button class="btn small" data-action="resume" data-task="${esc(m.taskId)}">恢复执行</button>
       </div>
     </div>` : '';
-  const outBlock = m.output ? `<div class="out">${esc(m.output)}</div>` : '';
+  const outBlock = m.output
+    ? `<div class="out md">${renderMarkdown(m.output)}</div>` : '';
   const structBlock = m.structured
     ? `<details><summary>structured</summary><pre class="debug-pre">${esc(fmtJson(m.structured))}</pre></details>` : '';
   const planBlock = m.plan && m.plan.length
@@ -246,6 +353,8 @@ async function invokeSync(body) {
       interrupt: r.data.interrupt, usage: r.data.usage, mode: r.data.mode, scene: r.data.scene,
       traceId: r.data.trace_id, elapsed: r.elapsed, rawJson: fmtJson(r.data), time: nowTime(),
     });
+    /* 技能可能产出交付物（xlsx 等），刷新文件列表 */
+    loadFiles();
   } else {
     pushError(r);
   }
@@ -339,6 +448,8 @@ async function invokeStream(body) {
     assistantMsg.streaming = false;
     assistantMsg.elapsed = Math.round(performance.now() - started);
     assistantMsg.rawJson = fmtJson({ output: fullOutput, trace_id: traceId, scene });
+    /* 终态后刷新交付物列表 */
+    loadFiles();
     showDebug(body, {
       ok: true, status: 200,
       data: { output: fullOutput, trace_id: traceId, scene },
@@ -431,7 +542,12 @@ async function pollOnce(taskId) {
   }
   if (!r.ok || !r.data) return; /* 瞬时抖动，等下一轮 */
   if (r.data.thread_id && !state.threadId) state.threadId = r.data.thread_id;
+  const wasTerminal = TERMINAL.has(
+    (state.messages.find((x) => x.kind === 'task' && x.taskId === taskId) || {}).status || ''
+  );
   updateTaskCard(taskId, r.data);
+  /* 进入终态（成功）时刷新交付物列表 */
+  if (TERMINAL.has(r.data.status) && r.data.status === 'completed' && !wasTerminal) loadFiles();
   if (TERMINAL.has(r.data.status)) stopPolling();
 }
 
@@ -484,6 +600,259 @@ async function cancelTask(taskId) {
   showDebug(null, r);
   if (r.ok && r.data) updateTaskCard(taskId, r.data);
   else { pushError(r); renderMessages(); }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * 文档与交付物（/agent/files）
+ *   上传（multipart）/ 列表 / 插入 file_id / 一键 HARA / 复制 /
+ *   带 API Key 的鉴权下载（blob 落盘）/ 删除 / 拖拽上传
+ * ═══════════════════════════════════════════════════════════════ */
+
+function fmtSize(bytes) {
+  const n = Number(bytes) || 0;
+  if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+  return n + ' B';
+}
+
+function fmtFileTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ` +
+    `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+function renderFiles() {
+  const ul = $('files-list');
+  $('files-count').textContent = state.files.length;
+  if (!state.files.length) {
+    ul.innerHTML = '<li class="file-empty">暂无文件。上传 docx/xlsx/pdf 等相关项文档后，'
+      + '点「插入 ID」或「HARA 分析」即可测试文档技能；技能产出的 xlsx 也会出现在这里。</li>';
+    return;
+  }
+  ul.innerHTML = state.files.map((f) => {
+    const isArtifact = f.kind === 'artifact';
+    const kindBadge = isArtifact
+      ? '<span class="badge green">交付物</span>'
+      : '<span class="badge blue">上传</span>';
+    const actions = [
+      `<button class="btn ghost tiny" data-action="insert-fid" data-id="${esc(f.file_id)}" title="把 file_id 插入输入框">插入ID</button>`,
+      !isArtifact
+        ? `<button class="btn ghost tiny" data-action="quick-hara" data-id="${esc(f.file_id)}" title="填入 HARA 分析指令">HARA 分析</button>` : '',
+      `<button class="btn ghost tiny" data-action="copy-fid" data-id="${esc(f.file_id)}" title="复制 file_id">复制</button>`,
+      `<button class="btn ghost tiny" data-action="download-file" data-id="${esc(f.file_id)}" title="下载（自动带 API Key）">下载</button>`,
+      `<button class="btn ghost tiny danger-text" data-action="delete-file" data-id="${esc(f.file_id)}" title="删除文件">删除</button>`,
+    ].join('');
+    return `<li class="file-item ${isArtifact ? 'is-artifact' : ''}">
+      <div class="file-line1">${kindBadge}
+        <span class="file-name" title="${esc(f.original_name)}">${esc(f.original_name)}</span>
+      </div>
+      <div class="file-line2">
+        <span class="mono" title="${esc(f.file_id)}">${esc(f.file_id.slice(0, 8))}…</span>
+        <span class="muted">${esc(fmtSize(f.size))} · ${esc(fmtFileTime(f.uploaded_at))}</span>
+        <span class="file-actions">${actions}</span>
+      </div>
+    </li>`;
+  }).join('');
+}
+
+async function loadFiles() {
+  const r = await apiFetch('/api/v1/agent/files');
+  if (r.ok && r.data) {
+    state.files = r.data.files || [];
+    state.filesLimits = r.data.limits || null;
+    const lim = state.filesLimits;
+    $('files-hint').textContent = lim
+      ? `允许 ${(lim.allowed_extensions || []).join(' / ')}，单文件 ≤ ${lim.max_upload_mb}MB` : '';
+    renderFiles();
+  } else {
+    $('files-hint').textContent = r.status === 401 ? '文件列表加载失败：API Key 无效' : '文件列表加载失败';
+  }
+}
+
+function pickFile() {
+  if (!state.apiKey) { alert('请先在顶栏填写 X-API-Key'); return; }
+  $('file-input').click();
+}
+
+async function handleFileUpload(file) {
+  /* 前端预校验（与后端沙箱白名单一致，以后端返回的 limits 为准） */
+  const ext = (file.name.match(/\.[^.]+$/) || [''])[0].toLowerCase();
+  const lim = state.filesLimits;
+  if (lim && lim.allowed_extensions && !lim.allowed_extensions.includes(ext)) {
+    state.messages.push({
+      kind: 'error', code: 'FILE_TYPE_NOT_ALLOWED',
+      message: `不支持的文件类型：${ext || '（无扩展名）'}；允许：${lim.allowed_extensions.join(' / ')}`,
+    });
+    renderMessages();
+    return;
+  }
+  if (lim && file.size > lim.max_upload_mb * 1024 * 1024) {
+    state.messages.push({
+      kind: 'error', code: 'FILE_TOO_LARGE',
+      message: `文件 ${file.name} 大小 ${fmtSize(file.size)} 超过上限 ${lim.max_upload_mb}MB`,
+    });
+    renderMessages();
+    return;
+  }
+
+  const btn = $('btn-upload');
+  btn.disabled = true;
+  btn.textContent = '上传中…';
+  const fd = new FormData();
+  fd.append('file', file);
+  const started = performance.now();
+  try {
+    const resp = await fetch(apiUrl('/api/v1/agent/files/upload'), {
+      method: 'POST',
+      headers: { 'X-API-Key': state.apiKey, 'X-Trace-Id': genTraceId() },
+      body: fd,
+    });
+    const text = await resp.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch { data = text; }
+    showDebug({ upload: file.name, size: file.size }, { ok: resp.ok, status: resp.status, data, elapsed: Math.round(performance.now() - started) });
+    if (resp.ok && data && data.file) {
+      await loadFiles();
+      /* 上传成功后自动把 file_id 放入输入框，便于直接补指令发送 */
+      insertAtCursor($('user-input'), data.file.file_id);
+    } else {
+      const err = (data && data.error) || {};
+      state.messages.push({
+        kind: 'error', code: err.code || ('HTTP_' + resp.status),
+        message: err.message || '上传失败', traceId: err.trace_id || '',
+      });
+      renderMessages();
+    }
+  } catch (e) {
+    state.messages.push({ kind: 'error', code: 'NETWORK_ERROR', message: '上传请求失败：' + String(e) });
+    renderMessages();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⬆ 上传文档';
+  }
+}
+
+function insertAtCursor(el, text) {
+  const start = el.selectionStart ?? el.value.length;
+  const end = el.selectionEnd ?? el.value.length;
+  const before = el.value.slice(0, start);
+  const after = el.value.slice(end);
+  const gap = before && !/\s$/.test(before) ? ' ' : '';
+  el.value = before + gap + text + after;
+  el.focus();
+  const pos = (before + gap + text).length;
+  el.setSelectionRange(pos, pos);
+}
+
+function quickHara(fileId) {
+  $('user-input').value =
+    `请基于我上传的相关项文档（file_id: ${fileId}）完成功能安全危害分析（HARA）：`
+    + `按 ISO 26262 枚举功能、M01-M14 失效过滤、S/E/C 评级并生成 HARA xlsx 工作簿。`;
+  $('user-input').focus();
+}
+
+async function copyText(text, el) {
+  try {
+    if (navigator.clipboard) await navigator.clipboard.writeText(text);
+    if (el) flashCopied(el);
+  } catch { /* 非安全上下文时静默：用户可手动从输入框复制 */ }
+}
+
+/** 下载需携带 X-API-Key，不能用普通 <a href>，走 fetch → blob 保存 */
+async function downloadFile(fileId, triggerEl) {
+  const old = triggerEl ? triggerEl.textContent : '';
+  if (triggerEl) { triggerEl.disabled = true; triggerEl.textContent = '下载中…'; }
+  try {
+    const resp = await fetch(
+      apiUrl(`/api/v1/agent/files/${encodeURIComponent(fileId)}/download`),
+      { headers: { 'X-API-Key': state.apiKey, 'X-Trace-Id': genTraceId() } }
+    );
+    if (!resp.ok) {
+      const text = await resp.text();
+      let msg = `下载失败（HTTP ${resp.status}）`;
+      try { msg = JSON.parse(text).error.message || msg; } catch { /* 保留默认 */ }
+      state.messages.push({ kind: 'error', code: 'DOWNLOAD_FAILED', message: msg });
+      renderMessages();
+      return;
+    }
+    const blob = await resp.blob();
+    const filename = (resp.headers.get('Content-Disposition') || '')
+      .match(/filename\*?=(?:UTF-8'')?["']?([^;"']+)/i)?.[1]
+      || (state.files.find((f) => f.file_id === fileId)?.original_name)
+      || fileId;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = decodeURIComponent(filename);
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  } catch (e) {
+    state.messages.push({ kind: 'error', code: 'NETWORK_ERROR', message: '下载请求失败：' + String(e) });
+    renderMessages();
+  } finally {
+    if (triggerEl) { triggerEl.disabled = false; triggerEl.textContent = old || '下载'; }
+  }
+}
+
+async function deleteFile(fileId) {
+  const f = state.files.find((x) => x.file_id === fileId);
+  if (!confirm(`确认删除文件「${f ? f.original_name : fileId}」？`)) return;
+  const r = await apiFetch('/api/v1/agent/files/' + encodeURIComponent(fileId), { method: 'DELETE' });
+  showDebug({ delete: fileId }, r);
+  if (r.ok) await loadFiles();
+  else pushError(r);
+  renderMessages();
+}
+
+function toggleFiles() {
+  state.filesCollapsed = !state.filesCollapsed;
+  localStorage.setItem('pg_files_collapsed', state.filesCollapsed ? '1' : '0');
+  applyFilesCollapse();
+}
+
+function applyFilesCollapse() {
+  $('files-panel').classList.toggle('hidden', state.filesCollapsed);
+}
+
+/* 拖拽上传：拖入整个对话区时显示提示层，放下即上传 */
+function bindDragUpload() {
+  const panel = $('files-panel');
+  const drop = $('files-drop');
+  let depth = 0;
+
+  const hasFiles = (e) => Array.from(e.dataTransfer?.types || []).includes('Files');
+  const onEnter = (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    depth++;
+    if (state.filesCollapsed) { state.filesCollapsed = false; applyFilesCollapse(); }
+    drop.classList.remove('hidden');
+  };
+  const onOver = (e) => { if (hasFiles(e)) e.preventDefault(); };
+  const onLeave = (e) => {
+    if (!hasFiles(e)) return;
+    depth = Math.max(0, depth - 1);
+    if (depth === 0) drop.classList.add('hidden');
+  };
+  const onDrop = (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    depth = 0;
+    drop.classList.add('hidden');
+    if (!state.apiKey) { alert('请先在顶栏填写 X-API-Key'); return; }
+    for (const file of Array.from(e.dataTransfer.files)) handleFileUpload(file);
+  };
+
+  for (const target of [panel, $('user-input'), $('messages')]) {
+    target.addEventListener('dragenter', onEnter);
+    target.addEventListener('dragover', onOver);
+    target.addEventListener('dragleave', onLeave);
+    target.addEventListener('drop', onDrop);
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -643,14 +1012,24 @@ function bindEvents() {
     state.apiKey = e.target.value.trim();
     localStorage.setItem('pg_api_key', state.apiKey);
     loadCapabilities();
+    loadFiles();
   });
   $('mode-select').addEventListener('change', (e) => {
     state.mode = e.target.value;
     localStorage.setItem('pg_mode', state.mode);
   });
 
+  /* 选择文件后立即上传 */
+  $('file-input').addEventListener('change', (e) => {
+    for (const file of Array.from(e.target.files || [])) handleFileUpload(file);
+    e.target.value = '';   /* 允许再次选择同一文件 */
+  });
+
   /* 事件委托：所有 data-action 按钮 / 可点元素 */
   document.addEventListener('click', (e) => {
+    /* Markdown 输出里的裸 file_id 代码块：点击复制（无 data-action） */
+    const fidEl = e.target.closest('code.fid');
+    if (fidEl) { copyText(fidEl.textContent, fidEl); return; }
     const el = e.target.closest('[data-action]');
     if (!el) return;
     const act = el.dataset.action;
@@ -658,6 +1037,14 @@ function bindEvents() {
     else if (act === 'toggle-inputs') $('inputs-json').classList.toggle('hidden');
     else if (act === 'new-session') newSession();
     else if (act === 'check-ready') checkReady();
+    else if (act === 'pick-file') pickFile();
+    else if (act === 'refresh-files') loadFiles();
+    else if (act === 'toggle-files') toggleFiles();
+    else if (act === 'insert-fid') insertAtCursor($('user-input'), el.dataset.id || '');
+    else if (act === 'quick-hara') quickHara(el.dataset.id || '');
+    else if (act === 'copy-fid') copyText(el.dataset.id || '', el);
+    else if (act === 'download-file') downloadFile(el.dataset.id || '', el);
+    else if (act === 'delete-file') deleteFile(el.dataset.id || '');
     else if (act === 'copy-trace') {
       const val = el.dataset.trace || '';
       if (navigator.clipboard) navigator.clipboard.writeText(val).catch(() => {});
@@ -684,10 +1071,13 @@ function init() {
   $('api-key').value = state.apiKey;
   $('mode-select').value = state.mode;
   bindEvents();
+  bindDragUpload();
+  applyFilesCollapse();
   renderSessions();
   renderMessages();
   checkReady();
   loadCapabilities();
+  loadFiles();
   setInterval(checkReady, 30000);
   /* 恢复最近一次会话 */
   const sessions = loadSessions();
