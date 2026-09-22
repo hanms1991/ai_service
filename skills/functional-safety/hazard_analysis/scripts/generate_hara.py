@@ -983,7 +983,9 @@ def _coerce_inputs(data: Any) -> dict:
 
 
 def generate(input_path: str, output_path: str) -> dict:
-    with open(input_path) as f:
+    # 平台以 UTF-8 写输入 JSON；必须显式指定编码，否则在 Windows GBK(ACP=936)
+    # 且未启用 PYTHONUTF8 的服务进程中会按 GBK 读取中文而 UnicodeDecodeError。
+    with open(input_path, encoding="utf-8") as f:
         data = json.load(f)
     data = _coerce_inputs(data)
 

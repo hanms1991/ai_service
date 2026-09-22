@@ -12,6 +12,9 @@
 """
 from __future__ import annotations
 
+import traceback
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage
@@ -21,6 +24,28 @@ from langgraph.types import interrupt
 from agents.supervisor import constants
 from agents.supervisor.nodes.helpers import _call_worker, _resolve_input, _self_handle
 from agents.supervisor.state import SupervisorState
+
+# 技能执行异常的稳定落盘位置（服务 stdout 在某些部署方式下不可见，
+# 写入 <项目根>/logs/skill_errors.log 保证故障可追溯）
+_SKILL_ERROR_LOG = Path(__file__).resolve().parents[3] / "logs" / "skill_errors.log"
+
+
+def _log_skill_error(agent: str, skill: str, inputs: Any, exc: BaseException) -> None:
+    """把技能执行异常（含完整堆栈）追加写入 logs/skill_errors.log。"""
+    try:
+        _SKILL_ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+        # inputs 中可能含 file_id 等可留痕信息；截断防止超大 body 刷屏
+        inputs_repr = repr(inputs)
+        if len(inputs_repr) > 500:
+            inputs_repr = inputs_repr[:500] + "…(截断)"
+        with open(_SKILL_ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(
+                f"\n[{datetime.now().isoformat(timespec='seconds')}] "
+                f"{agent}/{skill} 失败：{type(exc).__name__}: {exc}\n"
+                f"inputs={inputs_repr}\n{traceback.format_exc()}"
+            )
+    except Exception:  # noqa: BLE001 - 日志失败绝不能影响主流程
+        pass
 
 
 def executor_node(
@@ -145,6 +170,7 @@ def executor_node(
             except SkillInputError as e:
                 # file_id 文档不存在/已过期/无法解析：对话式提示用户重新上传或改用文字描述
                 print(f"[executor] 技能 {skill_name} 输入文档读取失败：{e}")
+                _log_skill_error(tool_name, skill_name, skill_inputs, e)
                 display = skill_name
                 try:
                     skill_cfg = validate_binding(tool_name, skill_name)
@@ -159,9 +185,9 @@ def executor_node(
                 )
                 output = _self_handle(clarify_task, config)
             except Exception as e:  # noqa: BLE001 - 执行链最后防线，避免请求 500
-                import traceback
                 print(f"[executor] 技能 {skill_name} 执行失败：{type(e).__name__}: {e}")
                 traceback.print_exc()
+                _log_skill_error(tool_name, skill_name, skill_inputs, e)
                 display = skill_name
                 try:
                     skill_cfg = validate_binding(tool_name, skill_name)
