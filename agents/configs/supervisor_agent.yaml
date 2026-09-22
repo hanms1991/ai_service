@@ -29,4 +29,4 @@ tools:
   # （agents/configs/<agent>.yaml + skills/<skill>.yaml 为唯一事实来源）
   - agent: product_agent
   - agent: functional_safety_agent
-  # - agent: fallback_agent
+  - agent: requirement_agent

@@ -3,8 +3,9 @@
 解决的问题：
   Planner 无法依赖 worker YAML 里一句手写摘要去推断其真实能力。
   本模块扫描：
-    - agents/configs/*.yaml   （Agent 声明：描述、拥有的技能）
-    - skills/*.yaml           （技能契约：输入 schema、输出形态、prompt 模板）
+    - agents/configs/*.yaml      （Agent 声明：描述、拥有的技能）
+    - skills/**/*.yaml           （技能契约：输入 schema、输出形态、prompt 模板；
+                                  支持按域分子文件夹，如 skills/requirement/uc_analyze.yaml）
   把二者按 Agent.skills 绑定关系组装成注册表，用于：
     1. 动态生成 Planner 的系统提示词（不再手写技能描述）；
     2. Planner 输出计划时直接给出 tool + skill，Executor 一步直达，
@@ -47,6 +48,47 @@ def _read_yaml(path: Path) -> dict:
         return yaml.safe_load(f) or {}
 
 
+def iter_skill_files() -> list[Path]:
+    """递归发现 skills/ 下所有技能 yaml。
+
+    支持按域分子文件夹组织技能，例如：
+        skills/prd_generation.yaml
+        skills/requirement/uc_analyze.yaml
+        skills/functional-safety/hara.yaml
+    以下划线开头的文件夹（如 _template）会被排除。
+    """
+    result: list[Path] = []
+    for path in sorted(SKILLS_DIR.rglob("*.y*ml")):
+        rel_parts = path.relative_to(SKILLS_DIR).parts
+        # rel_parts[:-1] 是所在目录段（文件名本身以 _ 开头不排除）
+        if any(part.startswith("_") for part in rel_parts[:-1]):
+            continue
+        result.append(path)
+    return result
+
+
+def find_skill_path(skill_name: str) -> Path | None:
+    """按技能名（文件 stem）在 skills/ 下递归查找配置文件；重名时报错。"""
+    matches = [p for p in iter_skill_files() if p.stem == skill_name]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        dup = ", ".join(str(p.relative_to(PROJECT_ROOT)) for p in matches)
+        raise ValueError(f"技能名 {skill_name!r} 存在多个同名配置文件：{dup}")
+    return matches[0]
+
+
+def _skill_base_dir(skill_cfg: dict) -> Path:
+    """技能 yaml 所在目录（用于解析 skill.system_prompt 的相对文件引用）。
+
+    子文件夹中的技能可引用同目录下的 prompt 资源，如 {"file": "prompts/xxx.md"}。
+    """
+    source = skill_cfg.get("_source")
+    if source:
+        return (PROJECT_ROOT / source).parent
+    return SKILLS_DIR
+
+
 def _validate_skill(cfg: dict, path: Path) -> None:
     """校验技能 yaml 的必填字段与命名一致性。"""
     required = ["name", "display_name", "description", "inputs", "prompt_template"]
@@ -65,14 +107,15 @@ def _validate_skill(cfg: dict, path: Path) -> None:
 
 
 def load_skill_config(skill_name: str, refresh: bool = False) -> dict:
-    """按名字加载技能配置（skills/<skill_name>.yaml），带缓存。"""
+    """按名字加载技能配置（递归查找 skills/**/<skill_name>.yaml），带缓存。"""
     if not refresh and skill_name in _skill_cfg_cache:
         return _skill_cfg_cache[skill_name]
 
-    path = SKILLS_DIR / f"{skill_name}.yaml"
-    if not path.exists():
+    path = find_skill_path(skill_name)
+    if path is None:
         raise FileNotFoundError(
-            f"技能 {skill_name!r} 的配置不存在：{path}。请在 skills/ 下新增 {skill_name}.yaml"
+            f"技能 {skill_name!r} 的配置不存在：skills/ 目录下未找到 {skill_name}.yaml"
+            f"（支持按域分子文件夹存放，如 skills/requirement/{skill_name}.yaml）"
         )
     cfg = _read_yaml(path)
     _validate_skill(cfg, path)
@@ -161,7 +204,7 @@ def build_capability_registry(
         }
 
     # 孤儿技能检查：存在 yaml 但没有任何 Agent 声明 → 提示（不阻断，便于先写技能后挂接）
-    all_skills = {p.stem for p in SKILLS_DIR.glob("*.y*ml")}
+    all_skills = {p.stem for p in iter_skill_files()}
     registry["_orphan_skills"] = sorted(all_skills - bound)
     return registry
 
@@ -388,7 +431,7 @@ def execute_skill(
     # ── system_prompt 覆盖策略：skill 优先，agent 兜底 ──
     skill_system = skill_cfg.get("system_prompt")
     if skill_system:
-        system_prompt = _resolve_system_prompt(skill_system, SKILLS_DIR)
+        system_prompt = _resolve_system_prompt(skill_system, _skill_base_dir(skill_cfg))
     else:
         system_prompt = _resolve_system_prompt(
             agent_cfg.get("default_system_prompt", ""), CONFIGS_DIR
@@ -584,7 +627,7 @@ def execute_skill_v2(
     # ── system_prompt 覆盖策略：skill 优先，agent 兜底 ──
     skill_system = skill_cfg.get("system_prompt")
     if skill_system:
-        system_prompt = _resolve_system_prompt(skill_system, SKILLS_DIR)
+        system_prompt = _resolve_system_prompt(skill_system, _skill_base_dir(skill_cfg))
     else:
         system_prompt = _resolve_system_prompt(
             agent_cfg.get("default_system_prompt", ""), CONFIGS_DIR
