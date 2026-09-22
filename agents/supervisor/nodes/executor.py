@@ -159,7 +159,9 @@ def executor_node(
                 )
                 output = _self_handle(clarify_task, config)
             except Exception as e:  # noqa: BLE001 - 执行链最后防线，避免请求 500
+                import traceback
                 print(f"[executor] 技能 {skill_name} 执行失败：{type(e).__name__}: {e}")
+                traceback.print_exc()
                 display = skill_name
                 try:
                     skill_cfg = validate_binding(tool_name, skill_name)

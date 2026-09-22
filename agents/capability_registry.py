@@ -775,7 +775,13 @@ def _execute_skill_core(
 
     invoke_model = llm
     if output_format == "json" and output_schema:
-        invoke_model = llm.bind(response_format={"type": "json_object"})
+        # json_mode + 技能级输出上限（HARA 等大 JSON 技能必须高于全局 LLM_MAX_TOKENS，
+        # 否则可见输出在 max_tokens 处被截断，JSON 不闭合 → 解析失败）
+        bind_kwargs: dict[str, Any] = {"response_format": {"type": "json_object"}}
+        skill_max_tokens = output_cfg.get("max_tokens")
+        if isinstance(skill_max_tokens, int) and skill_max_tokens > 0:
+            bind_kwargs["max_tokens"] = skill_max_tokens
+        invoke_model = llm.bind(**bind_kwargs)
 
     invoke_kwargs: dict[str, Any] = {}
     if runnable_config is not None:
@@ -786,6 +792,18 @@ def _execute_skill_core(
         **invoke_kwargs,
     )
     raw_text = response.content if isinstance(response.content, str) else str(response.content)
+
+    # 截断预检：finish_reason=length 时 JSON 必然不完整，直接给出可操作的错误
+    finish_reason = ""
+    resp_meta = getattr(response, "response_metadata", None)
+    if isinstance(resp_meta, dict):
+        finish_reason = str(resp_meta.get("finish_reason") or "").lower()
+    if finish_reason == "length":
+        limit = output_cfg.get("max_tokens") or os.getenv("LLM_MAX_TOKENS", "?")
+        raise ValueError(
+            f"模型输出达到 token 上限（max_tokens={limit}）被截断，JSON 不完整。"
+            f"已生成 {len(raw_text)} 字符；请在技能契约 output.max_tokens 中提高上限后重试。"
+        )
 
     structured = _validate_structured_output(raw_text, output_schema)
     usage = _extract_usage(response)

@@ -71,6 +71,9 @@ reference_files:
 # ────────────────────────────────────────────────────────────────────
 output:
   format: json
+  # HARA JSON 体积大（功能×M01-M14 全量评级 + 长中文理由），可见输出常达 8~16k tokens；
+  # 推理模型的思维链 token 另计，此值只约束可见 JSON，须高于全局 LLM_MAX_TOKENS(8192)。
+  max_tokens: 16384
   example_file: examples/sample_input_esc.json
   schema:
     type: object

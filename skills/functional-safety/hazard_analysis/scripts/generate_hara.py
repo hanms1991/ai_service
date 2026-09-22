@@ -873,14 +873,124 @@ def build_fsc_handoff(wb: Workbook, sgs: list[dict]) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def _coerce_env_items(items: Any, prefix: str, is_location: bool) -> list[dict]:
+    """把 LLM 给出的 locations/weather 规范化为下游要求的 dict 列表。
+
+    - 字符串项（LLM 偶尔输出 ["Parking lot", ...]）→ {"code", "name"} 自动补码
+    - dict 项缺 code/name → 补；速度字段强制为数值
+    """
+    if not isinstance(items, list):
+        return []
+    out: list[dict] = []
+    for i, it in enumerate(items, start=1):
+        code = f"{prefix}{i:02d}"
+        if isinstance(it, str):
+            if not it.strip():
+                continue
+            entry = {"code": code, "name": it.strip()}
+            if is_location:
+                entry.update({"speed_min_kph": 0, "speed_max_kph": 0, "default_e": "E3"})
+            else:
+                entry["default_e"] = "E3"
+            out.append(entry)
+        elif isinstance(it, dict):
+            name = str(it.get("name") or it.get("location") or it.get("weather") or code)
+            entry = dict(it)
+            entry["code"] = str(it.get("code") or code)
+            entry["name"] = name
+            if is_location:
+                try:
+                    entry["speed_min_kph"] = int(float(it.get("speed_min_kph") or 0))
+                except (TypeError, ValueError):
+                    entry["speed_min_kph"] = 0
+                try:
+                    entry["speed_max_kph"] = int(float(it.get("speed_max_kph") or 0))
+                except (TypeError, ValueError):
+                    entry["speed_max_kph"] = 0
+            out.append(entry)
+    return out
+
+
+def _coerce_inputs(data: Any) -> dict:
+    """对 LLM 生成的输入 JSON 做容错规范化（渲染器不得因模型输出的小形态偏差崩溃）。
+
+    - functions：丢弃无 id 的非对象项；补 name；kinetic_authority 归一到枚举
+    - function_malfunction_ratings：只保留 function_id/malfunction_id 齐全的对象
+    - rating_overrides：只保留四键齐全的对象
+    - environments.locations/weather：字符串数组 → 标准对象数组
+    - assumptions/interfaces：过滤非对象并补 id
+    """
+    if not isinstance(data, dict):
+        raise ValueError("Input JSON top-level must be an object.")
+
+    valid_auth = {"high", "medium", "low", "none"}
+    raw_fns = data.get("functions")
+    functions: list[dict] = []
+    if isinstance(raw_fns, list):
+        for f in raw_fns:
+            if not isinstance(f, dict) or not str(f.get("id") or "").strip():
+                continue
+            fn = dict(f)
+            fn["id"] = str(fn["id"]).strip()
+            fn["name"] = str(fn.get("name") or fn["id"])
+            auth = str(fn.get("kinetic_authority") or "medium").strip().lower()
+            fn["kinetic_authority"] = auth if auth in valid_auth else "medium"
+            functions.append(fn)
+    data["functions"] = functions
+
+    raw_ratings = data.get("function_malfunction_ratings")
+    if isinstance(raw_ratings, list):
+        ratings = [
+            r for r in raw_ratings
+            if isinstance(r, dict)
+            and str(r.get("function_id") or "").strip()
+            and str(r.get("malfunction_id") or "").strip()
+        ]
+        data["function_malfunction_ratings"] = ratings
+    else:
+        data["function_malfunction_ratings"] = []
+
+    raw_overrides = data.get("rating_overrides")
+    if isinstance(raw_overrides, list):
+        data["rating_overrides"] = [
+            o for o in raw_overrides
+            if isinstance(o, dict)
+            and all(str(o.get(k) or "").strip() for k in
+                    ("function_id", "malfunction_id", "location_code", "weather_code"))
+        ]
+    else:
+        data["rating_overrides"] = []
+
+    env = data.get("environments")
+    if not isinstance(env, dict):
+        env = {}
+    env["locations"] = _coerce_env_items(env.get("locations"), "LU", True)
+    env["weather"] = _coerce_env_items(env.get("weather"), "WU", False)
+    data["environments"] = env
+
+    for key, id_prefix in (("assumptions", "A"), ("interfaces", "I")):
+        raw = data.get(key)
+        if isinstance(raw, list):
+            items = [x for x in raw if isinstance(x, dict)]
+            for i, x in enumerate(items, start=1):
+                if not str(x.get("id") or "").strip():
+                    x["id"] = f"{id_prefix}{i:02d}"
+            data[key] = items
+        else:
+            data[key] = []
+
+    return data
+
+
 def generate(input_path: str, output_path: str) -> dict:
     with open(input_path) as f:
         data = json.load(f)
+    data = _coerce_inputs(data)
 
     item = data.get("item", {})
     functions = data.get("functions", [])
     if not functions:
-        raise ValueError("Input must include at least one function under 'functions'.")
+        raise ValueError("Input must include at least one valid function (with non-empty 'id') under 'functions'.")
     environments = data.get("environments", {}) or {}
     user_ratings = data.get("function_malfunction_ratings", []) or []
     overrides = data.get("rating_overrides", []) or []
