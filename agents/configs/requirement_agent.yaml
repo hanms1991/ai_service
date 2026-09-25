@@ -27,12 +27,12 @@ model: core.llm:model
 # 声明该 Agent 可用的技能名列表（对应 skills/ 目录下的 <name>.yaml 文件）。
 # 能力注册表据此绑定 Agent↔技能；build_agent 会注入受限版 load_skill 工具。
 skills:
-  - uc_analyze
-  # - requirement_analysis
-  # - requirement_specification
-  # - requirement_traceability
-  # - change_impact_analysis
-  # - vv_planning
+  - uc_generate
+  - uc_diagram_generate
+  - fr_generate
+  - ss_assignment_generate
+  - requirement_diagram_generate
+
 
 # 额外工具（非 load_skill），按 "module.path:attr" 形式声明：
 # read_document：读取用户上传的需求文档/清单（docx/xlsx/pptx/pdf → Markdown）

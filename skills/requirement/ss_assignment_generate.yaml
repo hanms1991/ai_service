@@ -1,0 +1,94 @@
+name: ss_assignment_generate
+display_name: 子系统分配生成（FR → SS 分配）
+description: 基于功能需求（FR）与候选子系统/架构说明，生成功能需求到子系统的分配矩阵，含分配类型（新增/复用/修改）、分配理由、接口依赖与子系统职责汇总。
+version: 1.0.0
+risk_level: medium
+domain:
+  - 需求工程
+  - 系统架构
+tags:
+  - 需求分配
+  - 子系统
+  - 功能需求
+  - ASPICE
+  - 系统架构
+
+model_hint:
+  reasoning: enabled
+
+required_any:
+  - [fr_content, file_id]
+
+inputs:
+  fr_content:
+    type: string
+    required: false
+    desc: 功能需求正文（Markdown，fr_generate 的输出或既有 FR 清单）
+  file_id:
+    type: string
+    required: false
+    desc: 通过 /agent/files/upload 上传的功能需求文件 file_id；平台自动读取为 Markdown
+  subsystem_context:
+    type: string
+    required: false
+    desc: 候选子系统清单与职责边界/架构说明，如"转向 EPS、制动 IBS、车身 BCM、座舱 HUT…"；未提供时按功能域常识推断并标注"待架构评审确认"
+  project:
+    type: string
+    required: false
+    desc: 项目/平台名称，用于分配上下文
+
+document_source:
+  file_id_input: file_id
+
+system_prompt: |
+  你是资深汽车 E/E 系统架构师，精通功能需求向子系统的分配（ASPICE SYS.3）与 EE 架构分层。
+  你的任务是把功能需求合理、可追溯地分配到子系统，并显式标注跨子系统协作与接口依赖。
+  只输出 Markdown 分配结果正文，不要附加生成说明。
+
+output:
+  format: markdown
+
+prompt_template: |
+  请基于以下功能需求完成子系统分配（Subsystem Assignment）。
+
+  【功能需求】：{{fr_content}}
+  【候选子系统/架构说明】：{{subsystem_context}}
+  【项目/平台】：{{project}}
+
+  若消息末尾附有文档段落（功能需求文件内容），以其为主要输入。
+
+  # 分配规则
+  1. 每条 FR 必须有一个主责子系统（单一主责，避免责任不清）；需要多个子系统协作时，
+     主责子系统承担编排/决策职责，协作子系统列入"协作子系统"并说明各自职责。
+  2. 分配依据：功能域归属、子系统现有职责边界、执行器/传感器归属、实时性与 ASIL 等级匹配；
+     在"分配理由"中用一句话给出依据。
+  3. 分配类型：
+     - 新增：该子系统需新建此能力；
+     - 复用：子系统现有能力可直接满足（注明可复用的既有功能，未知则写"既有能力（待核实）"）；
+     - 修改：需扩展/变更子系统既有能力（注明变更点）。
+  4. ASIL 继承：继承 FR 的 ASIL/QS 标注；安全相关 FR 不得分配给无相应 ASIL 开发能力的子系统，
+     无法判断时在备注标注"ASIL 能力待确认"。
+  5. 接口依赖：识别每条跨子系统 FR 的接口需求方向（如 EPS → HUT：助力状态），
+     仅描述接口的业务语义与方向，不定义具体信号/协议（信号级接口在技术需求阶段定义）。
+  6. 候选子系统未提供时：按汽车 EE 功能域常识推断（动力/底盘/车身/座舱/智驾/网联…），
+     并在子系统名称后统一标注"（待架构评审确认）"。
+  7. 不编造既有功能清单、供应商能力或具体接口协议；信息不足处显式标注"待确认"。
+
+  # 输出结构
+  ## 1. 子系统清单
+  | 子系统缩写 | 子系统名称 | 职责边界概述 | 信息来源 |
+  |---|---|---|---|
+
+  ## 2. 需求分配矩阵
+  | 需求 ID | 需求摘要 | 主责子系统 | 协作子系统（职责） | 分配类型 | 分配理由 | ASIL/QS | 接口依赖（方向：语义） | 备注 |
+  |---|---|---|---|---|---|---|---|---|
+
+  ## 3. 子系统职责汇总
+  ### <子系统名称>
+  - 承接需求：<FR ID 列表>
+  - 新增/修改能力：…
+  - 对外接口：…
+
+  ## 4. 待确认项
+  - [ ] 待架构评审确认的分配：…
+  - [ ] 待定义接口：…

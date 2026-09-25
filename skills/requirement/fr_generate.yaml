@@ -1,0 +1,93 @@
+name: fr_generate
+display_name: 功能需求生成（UC → FR）
+description: 基于用例规格提炼功能需求（FR），输出原子、无歧义、可验证、可追溯的功能需求条目，含 ASIL/QS 标注建议、验证方法与验收准则，并保持 UC→FR 追溯。
+version: 1.0.0
+risk_level: medium
+domain:
+  - 需求工程
+  - 汽车电子电气
+tags:
+  - 功能需求
+  - FR
+  - Use Case
+  - ASPICE
+  - ISO 26262
+  - 需求工程
+
+model_hint:
+  reasoning: enabled
+
+required_any:
+  - [uc_content, file_id]
+
+inputs:
+  uc_content:
+    type: string
+    required: false
+    desc: 用例规格正文（Markdown，uc_generate 的输出或既有 UC 文档）
+  file_id:
+    type: string
+    required: false
+    desc: 通过 /agent/files/upload 上传的用例文件 file_id；平台自动读取为 Markdown
+  fr_prefix:
+    type: string
+    required: false
+    desc: 需求 ID 前缀（项目/系统缩写），如 EPS、BCM；未提供时从用例内容推断，无法推断用 FR
+  safety_scope:
+    type: string
+    required: false
+    desc: 功能安全相关说明（相关项 ASIL 等级、已知安全目标）；未提供时按用例内容初步判定并标注"待安全团队确认"
+
+document_source:
+  file_id_input: file_id
+
+system_prompt: |
+  你是资深汽车 E/E 需求工程师，精通 ASPICE SYS.2/SWE.1 与 ISO 26262 需求编写规范。
+  你的任务是把用例规格转化为原子、可验证、可追溯的功能需求（Functional Requirement）。
+  只输出 Markdown 需求正文，不要附加生成说明。
+
+output:
+  format: markdown
+
+prompt_template: |
+  请基于以下用例规格生成功能需求（Functional Requirements）。
+
+  【用例规格】：{{uc_content}}
+  【需求 ID 前缀】：{{fr_prefix}}
+  【安全相关说明】：{{safety_scope}}
+
+  若消息末尾附有文档段落（用例文件内容），以其为主要输入。
+
+  # 需求编写规则
+  1. 原子性：一条需求只陈述一个可验证行为；需要"和/并/同时/以及"连接多个动作时拆成多条。
+  2. 来源映射：
+     - 主事件流每个有独立系统响应的步骤至少提炼一条 FR；
+     - 每条异常流（Fail-Safe 行为）必须提炼独立 FR，不得遗漏；
+     - 业务规则（阈值/时序/状态机）提炼为独立 FR；
+     - 备选流按需提炼 FR。
+  3. 需求句式：使用"系统应（SHALL）…"规范句式；明确主语、触发条件、动作、可观测结果；
+     允许使用条件从句，但禁止"快速/尽量/友好/良好"等不可验证表述。
+  4. 黑盒视角：FR 描述系统外部可观测行为，可提及人机交互与车辆级效果；
+     禁止写 CAN/LIN 信号、ECU 内部诊断、具体硬件选型与软件实现方案（这些留待技术需求阶段）。
+  5. 安全标注：依据异常流影响初判 ASIL 等级（QM/A/B/C/D）；证据不足时填"待安全团队确认"，不得臆断。
+  6. 验证方法：每条需求给出至少一种验证方法（评审 R / 分析 A / 测试 T / 演示 I）与可执行的验收准则。
+  7. 优先级：P0（安全/法规相关或基础必备）/P1/P2。
+  8. ID 规则：<前缀>-FR-<三位序号>（如 EPS-FR-001），按用例顺序连续编号。
+  9. 不编造信号名、接口、数值阈值、法规条款；用例中未给出的量化指标，验收准则写定性判据并在备注标注"指标待定义"。
+
+  # 输出结构
+  ## 1. 功能需求清单
+  | 需求 ID | 需求描述 | 来源用例 | 类型 | 优先级 | ASIL/QS | 验证方法 | 验收准则 | 备注 |
+  |---|---|---|---|---|---|---|---|---|
+  | EPS-FR-001 | 系统应在…时… | UC-01 主步骤 3 | 正常行为 | P0 | QM | T | 在…条件下，系统… | |
+  | EPS-FR-002 | 当无法判断…时，系统应保持… | UC-01 异常流 3a | 安全/Fail-Safe | P0 | 待安全团队确认 | T+A | … | |
+
+  需求类型取值：正常行为 / 安全(Fail-Safe) / 业务规则 / 状态管理 / 提示交互。
+
+  ## 2. 追溯矩阵
+  | 用例 ID | 派生需求 ID |
+  |---|---|
+
+  ## 3. 待确认项
+  - [ ] 待量化指标（阈值/时序/精度）：…
+  - [ ] ASIL 待安全团队确认项：…

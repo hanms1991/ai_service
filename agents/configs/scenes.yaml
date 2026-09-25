@@ -1,48 +1,81 @@
 # 场景码 → (agent, skill) 映射，后端只传 scene，不传 agent/skill 名称
 # 改名/拆分/换 Agent 时只需改本文件，后端零改动
+#
+# 场景码遵循“只增不减”原则：已上线的场景码不得删除或改名；
+# 技能下线时通过 deprecated: true 标记，而非移除。
 scenes:
-  ONE_CLICK_EXPAND:
-    description: 一键扩写功能说明（50~100字）
+  # ══════════════════════════════════════════════════════════════
+  # 产品定义链（product_agent）
+  # ══════════════════════════════════════════════════════════════
+  PROMPT_EXPAND:
+    description: 提示词扩写（将简短提示词扩写至 3 倍字数）
+    agent: product_agent
+    skill: prompt_expand
+    response_format: text
+    timeout_seconds: 60
+
+  FEATURE_DEFINITION:
+    description: 生成功能名称与功能描述（零散功能点 → 50~100字专业功能说明）
     agent: product_agent
     skill: feature_definition
-    response_format: text          # text | json
-    timeout_seconds: 30            # 可覆盖请求级默认超时
+    response_format: text
+    timeout_seconds: 120     # PRD 8 章节长文档，实测 3-5 分钟，给 10 分钟余量
 
-  PRD_GENERATE:
-    description: 生成完整汽车功能 PRD 文档（Markdown）
+  FROM_DEFINITION_CREATE_PRD:
+    description: 基于功能定义生成 PRD（产品链：功能名称/功能描述 → 完整 PRD）
     agent: product_agent
     skill: prd_generation
     response_format: text
-    timeout_seconds: 1200            # PRD 8 章节长文档，实测 3-5 分钟，给 10 分钟余量
+    timeout_seconds: 1200
 
-  # 以下场景码已弃用（对应 skill 已从 product_agent.yaml 的 skills 列表移除）
-  # 如需恢复：先在 product_agent.yaml 取消对应 skill 的注释，再取消下方注释
-  FEATURE_DEFINITION:
-    description: 定义完整功能说明（50~100字）
-    agent: product_agent
-    skill: feature_definition
+  # ══════════════════════════════════════════════════════════════
+  # 需求工程链（requirement_agent）：PRD → UC → 用例图/FR → 子系统分配 → 需求图
+  # ══════════════════════════════════════════════════════════════
+  FROM_PRD_CREATE_UC:
+    description: 基于 PRD 生成结构化用例规格（UC：主事件流/备选流/异常流/前置后置条件 + PRD 追溯）
+    agent: requirement_agent
+    skill: uc_generate
     response_format: text
-    timeout_seconds: 120
-  #
-  # PROMPT_EXPAND:
-  #   description: 提示词扩写
-  #   agent: product_agent
-  #   skill: prompt_expand
-  #   response_format: text
-  #   timeout_seconds: 30
+    timeout_seconds: 600
 
-  # 以下为预留场景码（对应技能尚未创建时，启动校验会报错 → 先注释
-  # 等业务后台真正用到的场景码再启用，避免启动期报错阻塞）
-  # GENERATE_UC:
-  #   description: 生成结构化用例（JSON）
-  #   agent: product_agent
-  #   skill: use_case_generate
+  FROM_UC_CREATE_UC_DIAGRAM:
+    description: 基于用例规格生成 Mermaid 用例图（参与者/系统边界/include/extend 关系）
+    agent: requirement_agent
+    skill: uc_diagram_generate
+    response_format: text
+    timeout_seconds: 300
+
+  FROM_UC_CREATE_FR:
+    description: 基于用例生成功能需求（FR：原子可验证需求 + ASIL 标注 + 验证方法 + UC 追溯）
+    agent: requirement_agent
+    skill: fr_generate
+    response_format: text
+    timeout_seconds: 600
+
+  FROM_FR_CREATE_SS_ASSIGNMENT:
+    description: 功能需求分配到子系统（FR→SS 分配矩阵：主责/协作子系统、分配类型、接口依赖）
+    agent: requirement_agent
+    skill: ss_assignment_generate
+    response_format: text
+    timeout_seconds: 600
+
+  FROM_SS_ASSIGNMENT_CREATE_REQ_DIAGRAM:
+    description: 基于分配结果生成 Mermaid 子系统需求图（FR→子系统分配/协作/接口追溯关系）
+    agent: requirement_agent
+    skill: requirement_diagram_generate
+    response_format: text
+    timeout_seconds: 300
+
+  # ══════════════════════════════════════════════════════════════
+  # 功能安全链（functional_safety_agent）
+  # ══════════════════════════════════════════════════════════════
+  # 注意：hara_generator 技能包当前不在工作区（此前落地的管道技能已被回滚，
+  # 含 functional_safety_agent 绑定、capability_registry context 改动与
+  # requirements.txt 的 python-docx）。恢复技能包后重新启用本场景码：
+  # HARA_GENERATE:
+  #   description: 基于相关项定义 DOCX 生成团队标准 5-Sheet HARA xlsx（6 阶段管道，含 4 次 LLM 受控推理）
+  #   agent: functional_safety_agent
+  #   skill: hara_generator
   #   response_format: json
-  #   timeout_seconds: 60
+  #   timeout_seconds: 900
 
-  # GENERATE_PRD:
-  #   description: 生成完整 PRD 文档（多步链式，走 Planner）
-  #   agent: product_agent
-  #   skill: ""                     # 空 skill = 走 Planner 智能编排
-  #   response_format: text
-  #   timeout_seconds: 600

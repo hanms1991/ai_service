@@ -1,0 +1,88 @@
+name: requirement_diagram_generate
+display_name: 子系统需求图生成（分配结果 → 需求图）
+description: 基于 FR 子系统分配结果生成 Mermaid 子系统需求图，表达功能需求→子系统的分配/追溯关系、子系统协作与接口依赖，并附追溯清单与完整性校验。
+version: 1.0.0
+risk_level: low
+domain:
+  - 需求工程
+  - 系统架构
+tags:
+  - 需求图
+  - 追溯
+  - Mermaid
+  - 子系统
+  - 系统架构
+
+model_hint:
+  reasoning: enabled
+
+required_any:
+  - [assignment_content, file_id]
+
+inputs:
+  assignment_content:
+    type: string
+    required: false
+    desc: 子系统分配矩阵正文（Markdown，ss_assignment_generate 的输出或既有分配文档）
+  file_id:
+    type: string
+    required: false
+    desc: 通过 /agent/files/upload 上传的分配文件 file_id；平台自动读取为 Markdown
+  diagram_level:
+    type: string
+    required: false
+    desc: 图粒度：subsystem（按子系统聚合，默认）/ detail（展开每条 FR 节点）；未提供按 subsystem
+
+document_source:
+  file_id_input: file_id
+
+system_prompt: |
+  你是资深系统架构师，精通需求追溯与架构建模。
+  你的任务是把功能需求—子系统分配结果转化为一张结构正确、可直接渲染的 Mermaid 需求图，
+  直观表达需求分配、子系统协作与接口依赖。只输出 Markdown 正文（含 Mermaid 代码块）。
+
+output:
+  format: markdown
+
+prompt_template: |
+  请基于以下需求分配结果生成子系统需求图。
+
+  【分配矩阵】：{{assignment_content}}
+  【图粒度】：{{diagram_level}}
+
+  若消息末尾附有文档段落（分配文件内容），以其为主要输入。
+
+  # 绘图规则
+  1. 使用 Mermaid **flowchart LR** 语法（确保主流渲染器兼容）。
+  2. 分层约定（从左到右）：
+     - 第一层：功能需求（FR 节点），节点 ID 以 fr_ 开头；
+     - 第二层：子系统（subgraph 或矩形节点），节点 ID 以 ss_ 开头；
+     - 主责分配：实线箭头 `-->`，标签标注"主责"+分配类型（新增/复用/修改）；
+     - 协作关系：虚线箭头 `-.->`，标签标注"协作"；
+     - 接口依赖：粗实线 `==>` 或在标签中注明"接口：<语义>"，方向与分配矩阵一致。
+  3. 粒度策略：
+     - subsystem（默认）：同一子系统承接的 FR 聚合为一个需求集合节点，标签列出 FR ID 范围/数量，
+       保证图面简洁；子系统之间仅画协作/接口边；
+     - detail：每条 FR 一个节点并画到主责子系统的边；FR 超过 20 条时按子系统拆多张图。
+  4. ASIL 标识：安全相关（非 QM）的 FR 或子系统在标签中追加 `[ASIL-x]` 文本标记（不依赖图标）。
+  5. 只绘制分配矩阵中存在的元素与关系；不得臆造子系统或接口。
+  6. Mermaid 节点 ID 使用 ASCII（fr_001、ss_eps），中文放标签；标签中的特殊字符需规避。
+
+  # 输出结构
+  ## 1. 子系统需求图
+  ```mermaid
+  flowchart LR
+      fr_001["EPS-FR-001 [ASIL-B]"]
+      ss_eps(["转向系统 EPS"])
+      fr_001 -->|主责·修改| ss_eps
+  ```
+
+  ## 2. 需求-子系统追溯清单
+  | 需求 ID | 主责子系统 | 协作子系统 | 接口依赖 | 图中表达 |
+  |---|---|---|---|---|
+
+  ## 3. 完整性校验
+  - [ ] 分配矩阵中每条 FR 均在图中出现（共 X 条）
+  - [ ] 每个子系统至少承接一条需求
+  - [ ] 所有协作/接口边均可在分配矩阵中找到依据
+  - [ ] ASIL 标注与分配矩阵一致

@@ -22,6 +22,7 @@ model: core.llm:model
 # 能力注册表据此绑定 Agent↔技能；build_agent 会注入受限版 load_skill 工具。
 # 经 Planner 调度时，Executor 按计划中的 tool+skill 直连执行，无需 worker 再选技能。
 skills:
+  - prompt_expand
   - feature_definition
   - prd_generation
 

@@ -1,0 +1,90 @@
+name: uc_diagram_generate
+display_name: 用例图生成（UC → 用例图）
+description: 基于用例规格生成 Mermaid 用例图，表达参与者、系统边界、用例以及 include/extend/泛化关系，并附关系清单与校验结果。
+version: 1.0.0
+risk_level: low
+domain:
+  - 需求工程
+  - 系统分析
+tags:
+  - 用例图
+  - Mermaid
+  - UML
+  - Use Case
+  - 需求工程
+
+model_hint:
+  reasoning: enabled
+
+required_any:
+  - [uc_content, file_id]
+
+inputs:
+  uc_content:
+    type: string
+    required: false
+    desc: 用例规格正文（Markdown，uc_generate 的输出或既有 UC 文档）
+  file_id:
+    type: string
+    required: false
+    desc: 通过 /agent/files/upload 上传的用例文件 file_id；平台自动读取为 Markdown
+  system_name:
+    type: string
+    required: false
+    desc: 系统边界名称（图中系统框标题），如"底盘域转向系统"；未提供时从用例内容推断
+
+document_source:
+  file_id_input: file_id
+
+system_prompt: |
+  你是资深系统分析工程师，精通 UML 用例图建模。
+  你的任务是把用例规格转化为一张结构正确、可直接渲染的 Mermaid 用例图。
+  只输出 Markdown 正文（含 Mermaid 代码块），不要附加生成说明。
+
+output:
+  format: markdown
+
+prompt_template: |
+  请基于以下用例规格生成用例图（Use Case Diagram）。
+
+  【用例规格】：{{uc_content}}
+  【系统边界名称】：{{system_name}}
+
+  若消息末尾附有文档段落（用例文件内容），以其为主要输入。
+
+  # 绘图规则
+  1. 使用 Mermaid **flowchart LR** 语法绘制（确保主流渲染器兼容；不要使用实验性 usecaseDiagram）。
+  2. 布局约定：
+     - 参与者（Actor）放在系统边界外侧：左侧放主参与者，右侧放次要/外部系统参与者；
+       参与者节点用普通矩形表示，节点 ID 以 actor_ 开头，标签形如 `:驾驶员:` 风格不需要，直接写名称。
+     - 系统边界用 `subgraph SYS["<系统名称>"]` 表达；
+     - 用例节点使用圆角括号形状 `UC01(["用例名称"])`，节点 ID 与用例 ID 对齐。
+  3. 关系表达：
+     - 关联（参与者—用例）：实线无箭头 `---`；
+     - 包含 <<include>>：`-.->|include|`，箭头由基础用例指向被包含用例；
+     - 扩展 <<extend>>：`-.->|extend|`，箭头由扩展用例指向基础用例；
+     - 泛化：`-->` 并在关系标签注明 generalize（谨慎使用，仅在规格明确存在时绘制）。
+  4. 仅绘制规格中真实存在的参与者、用例与关系；不得新增规格之外的用例。
+  5. 若用例数量超过 15 个，按 L2 功能模块拆成多张图（每张图前加三级标题），避免单图不可读。
+  6. Mermaid 节点标签禁止使用未转义的双引号、括号冲突；中文标签直接书写。
+
+  # 输出结构
+  ## 1. 用例图
+  ```mermaid
+  flowchart LR
+      actor_driver[驾驶员]
+      subgraph SYS["<系统名称>"]
+          UC01(["开启自动紧急制动"])
+      end
+      actor_driver --- UC01
+  ```
+
+  ## 2. 关系清单
+  | 关系类型 | 源 | 目标 | 依据（用例 ID/备选流编号） |
+  |---|---|---|---|
+
+  ## 3. 校验清单
+  - [ ] 每个用例至少与一个参与者关联
+  - [ ] include/extend 箭头方向正确
+  - [ ] 系统边界内无参与者、边界外无用例
+  - [ ] 图中元素与用例规格一一对应（数量：参与者 X / 用例 Y）
