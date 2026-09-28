@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import yaml
@@ -29,6 +31,16 @@ logger = logging.getLogger(__name__)
 
 # knowledge.yaml 位置：项目根/agents/configs/knowledge.yaml
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "agents" / "configs" / "knowledge.yaml"
+_PROJECT_ROOT = CONFIG_PATH.parent.parent.parent
+
+# 确保进程加载过项目根 .env（kb_client 可能先于 core.llm 被导入；override=False
+# 不覆盖进程中已显式设置的环境变量）
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(_PROJECT_ROOT / ".env", override=False)
+except Exception:  # noqa: BLE001 —— .env 不存在/未装 python-dotenv 时退回纯环境变量
+    pass
 
 # ── 注入段落大小控制（防止撑爆 LLM 上下文） ──
 MAX_CHUNK_CHARS = 800      # 单块内容最大字符数（超出截断）
@@ -73,20 +85,45 @@ def load_kb_config(refresh: bool = False) -> dict[str, Any]:
     return _config_cache
 
 
+_ENV_REF_PATTERN = re.compile(r"^\s*(?:\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*))\s*$")
+_BARE_ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _resolve_config_value(raw: Any) -> str:
+    """解析 knowledge.yaml 中的环境变量引用。
+
+    支持三种写法：
+      - 字面值：       http://127.0.0.1:8200
+      - 显式引用：     ${KB_BASE_URL} 或 $KB_BASE_URL
+      - 裸环境变量名： KB_BASE_URL（环境中存在该变量时展开，否则按字面值处理）
+    """
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    m = _ENV_REF_PATTERN.match(value)
+    if m:
+        return os.getenv(m.group(1) or m.group(2), "").strip()
+    if _BARE_ENV_NAME_PATTERN.match(value) and os.getenv(value) is not None:
+        return os.getenv(value, "").strip()
+    return value
+
+
 def kb_enabled() -> bool:
-    """知识库功能是否启用（base_url 非空即视为启用）。"""
-    return bool((load_kb_config().get("kb_service") or {}).get("base_url"))
+    """知识库功能是否启用（base_url 解析后为合法 http(s) 地址才视为启用）。"""
+    url = _service_base_url()
+    return bool(url) and urlparse(url).scheme in ("http", "https")
 
 
 def _service_base_url() -> str:
-    return str((load_kb_config().get("kb_service") or {}).get("base_url") or "").rstrip("/")
+    raw = (load_kb_config().get("kb_service") or {}).get("base_url")
+    return _resolve_config_value(raw).rstrip("/")
 
 
 def _auth_headers() -> dict[str, str]:
     """X-API-Key 鉴权头；key 从 knowledge.yaml 指定的环境变量读取（不落代码）。"""
     cfg = load_kb_config().get("kb_service") or {}
     env_name = str(cfg.get("api_key_env") or "KB_API_KEY")
-    key = os.getenv(env_name, "")
+    key = os.getenv(env_name, "").strip()
     return {"X-API-Key": key} if key else {}
 
 
@@ -171,7 +208,18 @@ def retrieve_knowledge(
     响应格式异常）都返回 [] 并记 warning 日志，绝不抛异常阻断技能执行。
     """
     query = (query or "").strip()
-    if not kb_enabled() or not query:
+    if not query:
+        return []
+    raw_base_url = str((load_kb_config().get("kb_service") or {}).get("base_url") or "").strip()
+    base_url = _service_base_url()
+    if raw_base_url and (not base_url or urlparse(base_url).scheme not in ("http", "https")):
+        logger.warning(
+            "[kb_client] kb_service.base_url=%r 解析后不是有效 http(s) 地址"
+            "（检查 knowledge.yaml 拼写与 .env 中对应环境变量是否设置），跳过知识检索",
+            raw_base_url,
+        )
+        return []
+    if not base_url:
         return []
     try:
         kb_ids = resolve_kb_ids(domain)

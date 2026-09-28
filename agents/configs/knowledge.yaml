@@ -13,7 +13,12 @@
 
 kb_service:
   # auto-kb 服务地址（服务器 Docker 容器 auto-kb-api，默认端口 8200）。
+  # 三种写法：
+  #   1. 字面值：       base_url: http://127.0.0.1:8200
+  #   2. 环境变量引用： base_url: ${KB_BASE_URL}（或 $KB_BASE_URL）
+  #   3. 裸环境变量名： base_url: KB_BASE_URL（该环境变量存在时自动展开）
   # 留空 = 知识注入功能整体关闭，所有技能照常执行（安全灰度开关）。
+  # 解析后不是合法 http(s) 地址时也按关闭处理并打印配置告警。
   base_url: KB_BASE_URL
   # 鉴权：X-API-Key 从该环境变量读取（与 auto-kb .env 中 API_KEY 一致），不落代码
   api_key_env: KB_API_KEY

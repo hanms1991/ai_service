@@ -42,6 +42,19 @@ _REGISTRY: dict[str, Any] = {"agents": {}}
 
 logger = logging.getLogger(__name__)
 
+# 技能内部结构化 LLM 调用（json_mode：规划层/评级层/单阶段 JSON 技能）的 tag。
+# 这些调用产出的 JSON 是中间产物（随后走确定性渲染或直接落 structured），
+# 不是面向用户的回复；流式接口（api/services/agent_runner.py）按此 tag 过滤，
+# 避免把内部 JSON token 推给前端。
+SKILL_INTERNAL_LLM_TAG = "skill_internal_llm"
+
+
+def _with_internal_tag(runnable_config: Any) -> dict:
+    """在 invoke config 上叠加「技能内部调用」tag（保留原 config 的 callbacks/tags）。"""
+    base = dict(runnable_config or {})
+    base["tags"] = [*(base.get("tags") or []), SKILL_INTERNAL_LLM_TAG]
+    return base
+
 
 # ════════════════════════════════════════════════════════════════
 # 1. 加载与校验
@@ -847,9 +860,13 @@ def _execute_skill_core(
             bind_kwargs["max_tokens"] = skill_max_tokens
         invoke_model = llm.bind(**bind_kwargs)
 
-    invoke_kwargs: dict[str, Any] = {}
-    if runnable_config is not None:
-        invoke_kwargs["config"] = runnable_config
+    # 内部 JSON 调用打 tag（流式接口据此过滤 token）；纯文本技能不打，其输出即交付文本
+    if output_format == "json" and output_schema:
+        invoke_kwargs: dict[str, Any] = {"config": _with_internal_tag(runnable_config)}
+    else:
+        invoke_kwargs: dict[str, Any] = {}
+        if runnable_config is not None:
+            invoke_kwargs["config"] = runnable_config
 
     response = invoke_model.invoke(
         [SystemMessage(content=system_prompt), HumanMessage(content=user_message)],
@@ -922,9 +939,10 @@ def _invoke_json_stage(
     """
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    invoke_kwargs: dict[str, Any] = {}
-    if runnable_config is not None:
-        invoke_kwargs["config"] = runnable_config
+    # 始终叠加内部调用 tag（评级切片在工作线程内无 runnable_config，tag 也应存在）
+    invoke_kwargs: dict[str, Any] = {
+        "config": _with_internal_tag(runnable_config)
+    }
     response = bound_model.invoke(
         [SystemMessage(content=system_prompt), HumanMessage(content=user_message)],
         **invoke_kwargs,

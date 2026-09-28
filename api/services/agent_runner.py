@@ -261,6 +261,12 @@ async def run_invoke_stream(
     # 最终输出节点：只有这些节点的 LLM 输出才推送给前端
     # chat 节点 → 闲聊回复；executor 节点 → 技能执行 / self_handle / worker 调用
     output_nodes = {"chat", "executor"}
+    # 技能内部结构化调用（规划层/评级层/JSON 技能）也发生在 executor 节点内，
+    # 其 JSON token 是中间产物；capability_registry 用此 tag 标记，必须过滤，
+    # 否则前端会看到大段原始 JSON 而非最终交付摘要
+    from agents.capability_registry import SKILL_INTERNAL_LLM_TAG
+
+    internal_tags = {SKILL_INTERNAL_LLM_TAG}
     full_output: list[str] = []
 
     # 注意：不能 asyncio.wait_for(astream_events(...))，因为 wait_for 返回 coroutine 不是 async iterator。
@@ -288,6 +294,9 @@ async def run_invoke_stream(
             metadata = event.get("metadata", {}) or {}
             node_name = metadata.get("langgraph_node", "")
             if node_name not in output_nodes:
+                continue
+            # 过滤：技能内部结构化调用（规划/评级/JSON 中间产物）不推给前端
+            if internal_tags.intersection(event.get("tags") or []):
                 continue
             chunk = event.get("data", {}).get("chunk")
             if chunk is None:
@@ -324,14 +333,23 @@ async def run_invoke_stream(
         }, ensure_ascii=False) + "\n"
         return
 
-    # 完成：发送 done 事件，附带完整输出和元信息
+    # 完成：输出以 graph 终态 final_output 为准（技能渲染摘要/节点直出结果都写在
+    # final_output 中，且这些路径没有逐 token 流）；token 拼接仅作兜底（如纯对话）
+    final_text = ""
+    try:
+        snapshot = await graph.aget_state(config=runnable_config)
+        final_text = str((snapshot.values or {}).get("final_output") or "")
+    except Exception as e:  # noqa: BLE001 —— 状态读取失败不影响 done 送达
+        logger.warning("[agent_runner] 读取 graph final_output 失败，回退 token 拼接：%s", e)
+    output_text = final_text or "".join(full_output)
+
     yield json.dumps({
         "type": "done",
         "task_id": task_id,
         "thread_id": thread_id,
         "trace_id": trace_id,
         "scene": scene,
-        "output": "".join(full_output),
+        "output": output_text,
     }, ensure_ascii=False) + "\n"
 
 
