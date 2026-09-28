@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -38,6 +39,8 @@ _skill_cfg_cache: dict[str, dict] = {}
 
 # 当前 supervisor 构建出的注册表（供 planner/executor 共享）
 _REGISTRY: dict[str, Any] = {"agents": {}}
+
+logger = logging.getLogger(__name__)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -543,6 +546,46 @@ def _resolve_document_block(skill_cfg: dict, inputs: dict[str, Any]) -> str:
     return "\n\n【相关项文档（Markdown，平台从用户上传文件转换，分析以此为主要事实来源）】\n" + content
 
 
+def _resolve_knowledge_block(skill_cfg: dict, inputs: dict[str, Any]) -> str:
+    """按 knowledge 声明检索 auto-kb 历史项目参考，返回追加到用户消息的只读段落。
+
+    knowledge:
+        domain: 功能安全             # 领域名，对应 agents/configs/knowledge.yaml 的 domains
+        query_from: item_definition  # 用哪个输入参数构造检索 query
+        top_k: 5                     # 可选，默认 5
+        score_threshold: 0.3         # 可选
+        meta_filter: {车型: X}       # 可选，文档级元数据过滤
+
+    软降级承诺：功能未启用 / query 为空 / 服务不可达 / 任何异常 → 返回空串并记日志，
+    绝不阻断技能执行；检索实现在 core/kb_client.py。
+    """
+    kb_cfg = skill_cfg.get("knowledge") or {}
+    if not isinstance(kb_cfg, dict) or not kb_cfg:
+        return ""
+    try:
+        from core.kb_client import format_knowledge_block, retrieve_knowledge
+
+        domain = str(kb_cfg.get("domain") or "").strip()
+        query_from = str(kb_cfg.get("query_from") or "").strip()
+        query = str(inputs.get(query_from) or "").strip() if query_from else ""
+        if not domain or not query:
+            # 未声明 domain/query_from，或核心参数为空（如用户只上传了文档未直述）→ 跳过
+            return ""
+        chunks = retrieve_knowledge(
+            domain,
+            query,
+            top_k=kb_cfg.get("top_k"),
+            score_threshold=kb_cfg.get("score_threshold"),
+            meta_filter=kb_cfg.get("meta_filter") or None,
+        )
+        return format_knowledge_block(chunks, domain)
+    except Exception as exc:  # noqa: BLE001 —— 注入过程任何异常都不阻断技能执行
+        logger.warning(
+            "[capability_registry] 技能 %s 知识注入降级：%s", skill_cfg.get("name"), exc
+        )
+        return ""
+
+
 def _build_schema_example_block(skill_cfg: dict) -> str:
     """把 output.example_file 的样例 JSON 渲染成输出示例段落（无则空串）。"""
     output_cfg = skill_cfg.get("output", {}) or {}
@@ -731,10 +774,11 @@ def _execute_skill_core(
     流程：
       1. 校验绑定、渲染 prompt 模板；
       2. document_source：先读用户上传文档，追加为只读文档段落；
-      3. 组装 system_prompt（skill + reference_files）；
-      4. 结构化技能：json_mode 调用 → schema 轻量校验；
-      5. output.renderer：JSON → 确定性文件渲染 → 落文件沙箱 → 中文摘要；
-      6. 返回 SkillResult（text/structured/usage/artifacts）。
+      3. knowledge：按技能声明检索 auto-kb 历史项目参考，追加为只读参考段落（软降级）；
+      4. 组装 system_prompt（skill + reference_files）；
+      5. 结构化技能：json_mode 调用 → schema 轻量校验；
+      6. output.renderer：JSON → 确定性文件渲染 → 落文件沙箱 → 中文摘要；
+      7. 返回 SkillResult（text/structured/usage/artifacts）。
     """
     from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -752,6 +796,9 @@ def _execute_skill_core(
     # ── 执行链前置：读取上传文档（file_id → Markdown 段落） ──
     doc_block = _resolve_document_block(skill_cfg, inputs or {})
 
+    # ── 知识注入：按 knowledge 声明检索 auto-kb 历史项目参考（软降级，失败即空串） ──
+    kb_block = _resolve_knowledge_block(skill_cfg, inputs or {})
+
     # ── 外部 reference_data 注入（API 后台预取资料） ──
     ref_block = _build_reference_block(reference_data)
 
@@ -763,7 +810,7 @@ def _execute_skill_core(
         _build_schema_example_block(skill_cfg) if output_format == "json" else ""
     )
 
-    user_message = rendered + doc_block + ref_block + schema_example_block
+    user_message = rendered + doc_block + kb_block + ref_block + schema_example_block
 
     # ── model_hint：叠加 skill 的推理开关/档位等 ──
     llm = _build_model_with_hint(
@@ -837,7 +884,8 @@ def execute_skill(
     """直接用某 Agent 的模型执行指定技能（LangGraph Executor 入口）。
 
     支持：system_prompt/reference_files 装配、document_source 先读文档、
-    结构化 JSON 输出、output.renderer 确定性文件渲染（渲染产物时返回中文摘要）。
+    knowledge 历史项目参考注入、结构化 JSON 输出、output.renderer 确定性
+    文件渲染（渲染产物时返回中文摘要）。
     """
     return _execute_skill_core(
         agent_name, skill_name, inputs, runnable_config=runnable_config
@@ -987,7 +1035,8 @@ def execute_skill_v2(
       1. 返回 SkillResult(text, structured, usage, artifacts)；
       2. 支持 output.schema 结构化校验（json_mode + 轻量 schema 校验）；
       3. 支持 reference_data 注入（只读上下文追加到用户消息）；
-      4. 支持 document_source（file_id 先读文档）与 output.renderer（文件交付物）。
+      4. 支持 document_source（file_id 先读文档）、knowledge（auto-kb 历史参考注入）
+         与 output.renderer（文件交付物）。
 
     Raises:
         ValueError: reference_data 超阈值 / 结构化输出未通过校验 / 渲染失败

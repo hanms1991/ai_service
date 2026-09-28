@@ -1,0 +1,244 @@
+"""auto-kb 知识库客户端 —— 技能级知识注入（通道一）的检索封装。
+
+对接独立部署的 auto-kb 服务（FastAPI + pgvector，默认 8200 端口），
+为技能执行提供「历史项目参考」动态检索能力：
+
+  - 配置：agents/configs/knowledge.yaml（服务地址/鉴权/领域→库名映射），模块级缓存
+  - 库名 → kb_id：首次检索时 GET /api/kb 解析并进程内缓存
+  - 检索：POST /api/retrieve，同步 httpx（与 _execute_skill_core 同步链路一致）
+  - 软降级：服务未配置/不可达/解析失败一律返回空结果并记日志，
+    绝不抛异常阻断技能执行——知识库是增强依赖，不是硬依赖
+  - 注入段落格式化：带溯源（文件名/分层/sheet行号/页码/章节）+ 大小上限
+
+使用方（capability_registry._resolve_knowledge_block）只需：
+    chunks = retrieve_knowledge(domain, query, ...)
+    block = format_knowledge_block(chunks, domain)
+"""
+from __future__ import annotations
+
+import logging
+import os
+import threading
+from pathlib import Path
+from typing import Any
+
+import httpx
+import yaml
+
+logger = logging.getLogger(__name__)
+
+# knowledge.yaml 位置：项目根/agents/configs/knowledge.yaml
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "agents" / "configs" / "knowledge.yaml"
+
+# ── 注入段落大小控制（防止撑爆 LLM 上下文） ──
+MAX_CHUNK_CHARS = 800      # 单块内容最大字符数（超出截断）
+MAX_TOTAL_CHARS = 8000     # 注入段落正文总字符上限（超出丢弃后续块）
+DEFAULT_TOP_K = 5
+
+# ── 模块级缓存（与 capability_registry 缓存风格一致） ──
+_cache_lock = threading.Lock()
+_config_cache: dict[str, Any] | None = None
+_kb_name_to_id: dict[str, int] | None = None
+
+
+# ════════════════════════════════════════════════════════════════
+# 配置加载
+# ════════════════════════════════════════════════════════════════
+
+def load_kb_config(refresh: bool = False) -> dict[str, Any]:
+    """加载 knowledge.yaml（模块级缓存）。
+
+    文件缺失或 base_url 留空均视为「功能关闭」，返回的配置让所有调用安全走空路径。
+    """
+    global _config_cache
+    if _config_cache is not None and not refresh:
+        return _config_cache
+    with _cache_lock:
+        if _config_cache is None or refresh:
+            if not CONFIG_PATH.is_file():
+                _config_cache = {}
+            else:
+                data = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+                _config_cache = data if isinstance(data, dict) else {}
+    return _config_cache
+
+
+def kb_enabled() -> bool:
+    """知识库功能是否启用（base_url 非空即视为启用）。"""
+    return bool((load_kb_config().get("kb_service") or {}).get("base_url"))
+
+
+def _service_base_url() -> str:
+    return str((load_kb_config().get("kb_service") or {}).get("base_url") or "").rstrip("/")
+
+
+def _auth_headers() -> dict[str, str]:
+    """X-API-Key 鉴权头；key 从 knowledge.yaml 指定的环境变量读取（不落代码）。"""
+    cfg = load_kb_config().get("kb_service") or {}
+    env_name = str(cfg.get("api_key_env") or "KB_API_KEY")
+    key = os.getenv(env_name, "")
+    return {"X-API-Key": key} if key else {}
+
+
+def _timeout_seconds() -> float:
+    cfg = load_kb_config().get("kb_service") or {}
+    try:
+        return float(cfg.get("timeout_seconds") or 5)
+    except (TypeError, ValueError):
+        return 5.0
+
+
+# ════════════════════════════════════════════════════════════════
+# 库名 → kb_id 解析（带进程内缓存）
+# ════════════════════════════════════════════════════════════════
+
+def _fetch_kb_name_map() -> dict[str, int]:
+    """GET /api/kb → {库名: id}。网络/鉴权失败向上抛 httpx 异常（由调用方降级）。"""
+    resp = httpx.get(
+        f"{_service_base_url()}/api/kb",
+        headers=_auth_headers(),
+        timeout=_timeout_seconds(),
+    )
+    resp.raise_for_status()
+    items = resp.json() or []
+    return {str(item["name"]): int(item["id"]) for item in items}
+
+
+def resolve_kb_ids(domain: str) -> list[int]:
+    """领域名 → kb_id 列表（按 knowledge.yaml domains 中的库名映射）。
+
+    库名解析失败或映射缺失返回 []（调用方据此跳过检索，软降级）。
+    """
+    global _kb_name_to_id
+    domains = load_kb_config().get("domains") or {}
+    names = domains.get(domain) or []
+    if isinstance(names, str):
+        names = [names]
+    if not names:
+        logger.warning("[kb_client] 领域 %r 未在 knowledge.yaml domains 中配置，跳过知识检索", domain)
+        return []
+    with _cache_lock:
+        if _kb_name_to_id is None:
+            try:
+                _kb_name_to_id = _fetch_kb_name_map()
+            except Exception as exc:  # noqa: BLE001 —— 解析失败软降级，下次调用自动重试
+                logger.warning("[kb_client] 获取知识库列表失败：%s", exc)
+                return []
+        name_map = dict(_kb_name_to_id)
+    ids = [name_map[n] for n in names if n in name_map]
+    missing = [n for n in names if n not in name_map]
+    if missing:
+        logger.warning("[kb_client] auto-kb 中不存在库名 %s（领域 %r），已忽略", missing, domain)
+    return ids
+
+
+def refresh_kb_id_cache() -> None:
+    """强制清空库名缓存（auto-kb 侧建库/改库后可调用）。"""
+    global _kb_name_to_id
+    with _cache_lock:
+        _kb_name_to_id = None
+
+
+# ════════════════════════════════════════════════════════════════
+# 检索与注入格式化
+# ════════════════════════════════════════════════════════════════
+
+def retrieve_knowledge(
+    domain: str,
+    query: str,
+    *,
+    top_k: int | None = None,
+    score_threshold: float | None = None,
+    meta_filter: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """检索指定领域的知识库，返回分块列表（content/score/filename/meta）。
+
+    软降级承诺：任何失败（功能未启用、query 为空、库名不可解析、网络异常、
+    响应格式异常）都返回 [] 并记 warning 日志，绝不抛异常阻断技能执行。
+    """
+    query = (query or "").strip()
+    if not kb_enabled() or not query:
+        return []
+    try:
+        kb_ids = resolve_kb_ids(domain)
+        body: dict[str, Any] = {"query": query, "top_k": int(top_k or DEFAULT_TOP_K)}
+        if kb_ids:
+            body["kb_ids"] = kb_ids
+        else:
+            # 库名无法解析时不做全库检索：避免把其他领域知识误注入本技能
+            logger.warning("[kb_client] 领域 %r 无可用知识库，跳过检索（query=%r）", domain, query[:50])
+            return []
+        if score_threshold is not None:
+            body["score_threshold"] = float(score_threshold)
+        if meta_filter:
+            body["meta_filter"] = meta_filter
+
+        resp = httpx.post(
+            f"{_service_base_url()}/api/retrieve",
+            json=body,
+            headers=_auth_headers(),
+            timeout=_timeout_seconds(),
+        )
+        resp.raise_for_status()
+        chunks = resp.json()
+        if not isinstance(chunks, list):
+            logger.warning("[kb_client] /api/retrieve 返回非列表，忽略（domain=%s）", domain)
+            return []
+        logger.info("[kb_client] 知识检索命中 %d 块（domain=%s，query=%r）", len(chunks), domain, query[:50])
+        return chunks
+    except Exception as exc:  # noqa: BLE001 —— 软降级兜底，见 docstring
+        logger.warning("[kb_client] 知识库检索降级（domain=%s）：%s", domain, exc)
+        return []
+
+
+def _format_source(chunk: dict[str, Any]) -> str:
+    """把分块溯源信息格式化为「文件名（分层=xx；Sheet=xx；行=xx…）」。"""
+    filename = str(chunk.get("filename") or "未知文件")
+    meta = chunk.get("meta") or {}
+    parts: list[str] = []
+    for key, label in (
+        ("layer", "分层"), ("sheet", "Sheet"), ("row", "行"),
+        ("page", "页"), ("section", "章节"), ("table_row", "表行"),
+    ):
+        value = meta.get(key)
+        if value not in (None, ""):
+            parts.append(f"{label}={value}")
+    return f"{filename}（{'；'.join(parts)}）" if parts else filename
+
+
+def format_knowledge_block(chunks: list[dict[str, Any]], domain: str) -> str:
+    """检索结果 → 追加到用户消息的只读注入段落；空结果返回空串。
+
+    段落自带使用约束（参考口径、以用户输入为准、引用注明出处），
+    技能 prompt_template 无需为此改动。
+    """
+    if not chunks:
+        return ""
+    lines: list[str] = [
+        f"\n\n【历史项目参考（检索自「{domain}」知识库，只读；用于对齐历史项目的"
+        f"分析口径、命名习惯与产出粒度，禁止照搬历史结论）】"
+    ]
+    total = 0
+    kept = 0
+    for chunk in chunks:
+        content = str(chunk.get("content") or "").strip()
+        if not content:
+            continue
+        content = content[:MAX_CHUNK_CHARS]
+        try:
+            score = float(chunk.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        line = f"[{kept + 1}] 来源：{_format_source(chunk)} ｜ 相似度 {score:.2f}\n{content}"
+        if total + len(line) > MAX_TOTAL_CHARS:
+            break
+        lines.append(line)
+        total += len(line)
+        kept += 1
+    if kept == 0:
+        return ""
+    lines.append(
+        "使用要求：以上为历史项目数据，仅供格式与粒度参考；"
+        "与用户当前输入冲突时一律以用户输入为准；引用历史结论时注明出处文件名。"
+    )
+    return "\n".join(lines)

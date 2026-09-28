@@ -1,0 +1,28 @@
+# auto-kb 知识库接入配置（通道一：技能级知识注入）
+# 生效方式：技能 YAML 中声明 knowledge 块后，capability_registry 执行该技能前
+#           自动检索历史项目参考并注入用户消息（详见 core/kb_client.py）。
+# 降级策略：服务不可达/未配置/库名不匹配一律跳过注入并记日志，不阻断技能执行。
+#
+# 技能侧声明示例（以 hazard_analysis.yaml 为例）：
+#   knowledge:
+#     domain: 功能安全            # 对应下方 domains 的键
+#     query_from: item_definition # 用哪个输入参数构造检索 query
+#     top_k: 5
+#     score_threshold: 0.3
+#     meta_filter: {车型: Model-X}   # 可选，文档级元数据过滤
+
+kb_service:
+  # auto-kb 服务地址（服务器 Docker 容器 auto-kb-api，默认端口 8200）。
+  # 留空 = 知识注入功能整体关闭，所有技能照常执行（安全灰度开关）。
+  base_url: KB_BASE_URL
+  # 鉴权：X-API-Key 从该环境变量读取（与 auto-kb .env 中 API_KEY 一致），不落代码
+  api_key_env: KB_API_KEY
+  timeout_seconds: 5
+
+# 领域 → auto-kb 知识库库名（启动后首次检索时经 GET /api/kb 解析为 kb_id 并缓存）。
+# 库名必须与 auto-kb 中创建的库 name 完全一致；同名多库可列多个。
+# 新增专业领域 = 在此加一行映射 + 对应技能 YAML 声明 knowledge 块，无需改代码。
+domains:
+  功能安全: [功能安全]
+  功能架构: [功能架构库]
+  通信信号: [通信信号库]
