@@ -700,8 +700,8 @@ def _run_renderer(
 def _extract_safety_goals(artifact_path: Path, limit: int = 15) -> list[dict]:
     """从团队标准 HARA 工作簿「整车安全目标」表右区读取合并后的整车安全目标（尽力而为）。
 
-    右区表头在 R4：G 序号 / H 整车安全目标ID / I 安全目标合并 / J ASIL /
-    K Safe State / L FTTI / M 备注；数据从 R5 起。
+    新模板布局：R1 分组表头 / R2 列名，数据从 R3 起。
+    右区 F 整车安全目标ID / G ASIL / H 整车安全目标 / I 安全状态 / J FTTI / K 备注。
     """
     try:
         import openpyxl
@@ -711,14 +711,14 @@ def _extract_safety_goals(artifact_path: Path, limit: int = 15) -> list[dict]:
             return []
         ws = wb["整车安全目标"]
         goals: list[dict] = []
-        for row in ws.iter_rows(min_row=5, values_only=True):
-            vh_id = row[7] if len(row) > 7 else None  # H 列
+        for row in ws.iter_rows(min_row=3, values_only=True):
+            vh_id = row[5] if len(row) > 5 else None  # F 列
             if not vh_id or not str(vh_id).strip():
                 continue
             goals.append({
                 "sg_id": vh_id,
-                "asil": row[9] if len(row) > 9 else "",   # J 列
-                "goal": row[8] if len(row) > 8 else "",   # I 列
+                "asil": row[6] if len(row) > 6 else "",   # G 列
+                "goal": row[7] if len(row) > 7 else "",   # H 列
             })
         wb.close()
         rank = {"D": 4, "C": 3, "B": 2, "A": 1, "QM": 0}

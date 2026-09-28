@@ -190,13 +190,12 @@ def generate(in_path: str, out_path: str) -> dict:
 # ════════════════════════════════════════════════════════════════
 
 def _write_version(wb, item) -> dict:
+    # 新模板仅保留 R1 表头，版本记录从 R2 起逐行写（不触碰表头格式）
     ws = wb["版本管理"]
-    _merge(ws, "B3:F3")
-    _merge(ws, "B4:F4")
     row = ["V1.0", datetime.now().strftime("%Y-%m-%d"), "AI", "全文",
            f"HARA 初版（AI 辅助生成，待评审）；相关项：{item.get('name', '')}"]
-    for c, v in enumerate(row, 2):  # B..F
-        cell = ws.cell(row=7, column=c, value=v)
+    for c, v in enumerate(row, 1):  # A..E
+        cell = ws.cell(row=2, column=c, value=v)
         _style(cell)
     return {}
 
@@ -231,11 +230,19 @@ def _write_functions(wb, pfx, functions, func_info):
 
 def _write_malfunctions(wb, pfx, functions, func_info, matrix):
     ws = wb["失效模式"]
-    ws.cell(row=1, column=15, value="备注")
-    _style(ws.cell(row=1, column=15), center=True, bold=True)
-    ws.column_dimensions["O"].width = 30.0
+    # 新模板表头为两行分组（R1:R2，含合并），数据从 R3 起；不触碰表头。
+    # O 列「备注」由渲染器补齐（模板只到 N=选择理由）：表头样式复制 N1。
+    if ws.max_column < 15:
+        _merge(ws, "O1:O2")
+        hdr = ws.cell(row=1, column=15, value="备注")
+        src_hdr = ws.cell(row=1, column=14)
+        hdr.font = copy(src_hdr.font)
+        hdr.fill = copy(src_hdr.fill)
+        hdr.border = copy(src_hdr.border)
+        hdr.alignment = copy(src_hdr.alignment)
+        ws.column_dimensions["O"].width = 30.0
 
-    r = 2
+    r = 3
     for f in functions:
         fid = f.get("fid")
         m = matrix.get(fid) or {}
@@ -278,10 +285,7 @@ def _write_malfunctions(wb, pfx, functions, func_info, matrix):
 
 def _write_hazop(wb, pfx, functions, func_info, items_by_func, mf_id_of_item, event_records):
     ws = wb["HAZOP 分析"]
-    _merge(ws, "A1:H1")
-    title = ws.cell(row=1, column=1)
-    _style(title, center=True, bold=True)
-    title.font = _FONT_TITLE
+    # 表头/标题（R1 合并标题、R2 列名）模板已自带并格式化，数据从 R3 起，不触碰表头。
 
     # 每个失效单元的事件 ID 区间
     range_of_item: dict[int, str] = {}
@@ -319,12 +323,8 @@ def _write_hazop(wb, pfx, functions, func_info, items_by_func, mf_id_of_item, ev
 
 def _write_hara(wb, pfx, functions, func_info, items_by_func, event_records):
     ws = wb["HARA 分析"]
-    # 重建两级表头合并（模板准备阶段被清空）
-    for rng in ("A1:A2", "B1:B2", "C1:C2", "D1:E1", "F1:G1", "H1:O1", "P1:T1"):
-        _merge(ws, rng)
-    for c in range(1, 21):
-        _style(ws.cell(row=1, column=c), center=True, bold=True)
-        _style(ws.cell(row=2, column=c), center=True, bold=True)
+    # 两级表头（A1:A2/B1:B2/C1:C2/D1:E1/F1:G1/H1:O1/P1:S1/T1:T2）模板已自带并
+    # 格式化，数据从 R3 起；严禁在此重建合并（旧 P1:T1 会与新模板 P1:S1+T1:T2 冲突）。
 
     # 每功能 SG 独立序号
     sg_counter: dict[str, int] = defaultdict(int)
@@ -433,41 +433,34 @@ def _write_hara(wb, pfx, functions, func_info, items_by_func, event_records):
 
 
 def _write_safety_goals(wb, sg_left, vh_goals):
-    """整车安全目标 sheet 整体重建（左区中间目标 + 新增备注列 + 右区合并目标）。"""
-    idx = wb.sheetnames.index("整车安全目标")
-    wb.remove(wb["整车安全目标"])
-    ws = wb.create_sheet("整车安全目标", idx)
+    """整车安全目标：直接在模板 sheet 上填充（保留用户格式化的 R1:R2 表头）。
 
-    widths = {"A": 20.2, "B": 30.0, "C": 8.7, "D": 18.0, "E": 17.3, "F": 26.0,
-              "G": 7.3, "H": 20.0, "I": 30.0, "J": 8.0, "K": 16.0, "L": 16.0, "M": 26.0}
-    for col, w in widths.items():
-        ws.column_dimensions[col].width = w
+    新模板布局（11 列，R1 分组 / R2 列名）：
+      左区「安全目标（整理合并前）」A-E：安全目标ID/ASIL/安全目标/安全状态/FTTI
+      右区「整车安全目标」          F-J：整车安全目标ID/ASIL/整车安全目标/安全状态/FTTI
+      K=备注（服务右区整车目标的来源标注）
+    数据从 R3 起。
+    """
+    ws = wb["整车安全目标"]
 
-    _merge(ws, "A1:M3")
-    t = ws.cell(row=1, column=1, value="危害分析及风险评估")
-    t.font = _FONT_TITLE
-    t.alignment = _WRAP_CENTER
+    # 防御性清空 R3 以下残留（模板本身为空），不触碰 R1:R2 与其合并
+    if ws.max_row >= 3:
+        for row in ws.iter_rows(min_row=3, max_col=11):
+            for cell in row:
+                cell.value = None
 
-    headers_left = ["安全目标ID", "安全目标", "ASIL", "安全状态", "FTTI", "备注"]
-    headers_right = ["序号", "整车安全目标ID", "安全目标合并", "ASIL", "Safe State", "FTTI", "备注"]
-    for c, v in enumerate(headers_left, 1):
-        _style(ws.cell(row=4, column=c, value=v), center=True, bold=True)
-    for c, v in enumerate(headers_right, 7):
-        _style(ws.cell(row=4, column=c, value=v), center=True, bold=True)
-
-    r = 5
+    r = 3
     for row in sg_left:
-        vals = [row["sg_id"], row["text"], row["asil"], row["safe_state"], row["ftti"],
-                _source_remark(row.get("source"))]
+        vals = [row["sg_id"], row["asil"], row["text"], row["safe_state"], row["ftti"]]
         for c, v in enumerate(vals, 1):
-            _style(ws.cell(row=r, column=c, value=v), center=(c in (1, 3, 5)))
+            _style(ws.cell(row=r, column=c, value=v), center=(c in (1, 2, 5)))
         r += 1
 
-    r = 5
-    for i, g in enumerate(vh_goals, 1):
-        vals = [i, g["vh_id"], g["text"], g["asil"], g["safe_state"], g["ftti"], g["remark"]]
-        for c, v in enumerate(vals, 7):
-            _style(ws.cell(row=r, column=c, value=v), center=(c in (7, 8, 10, 12)))
+    r = 3
+    for g in vh_goals:
+        vals = [g["vh_id"], g["asil"], g["text"], g["safe_state"], g["ftti"], g["remark"]]
+        for c, v in enumerate(vals, 6):  # F..K
+            _style(ws.cell(row=r, column=c, value=v), center=(c in (6, 7, 10)))
         r += 1
 
 
