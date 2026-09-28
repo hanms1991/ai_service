@@ -685,29 +685,32 @@ def _run_renderer(
 
 
 def _extract_safety_goals(artifact_path: Path, limit: int = 15) -> list[dict]:
-    """从生成的 HARA 工作簿 13_Safety_Goals 表读取安全目标摘要（尽力而为）。"""
+    """从团队标准 HARA 工作簿「整车安全目标」表右区读取合并后的整车安全目标（尽力而为）。
+
+    右区表头在 R4：G 序号 / H 整车安全目标ID / I 安全目标合并 / J ASIL /
+    K Safe State / L FTTI / M 备注；数据从 R5 起。
+    """
     try:
         import openpyxl
 
         wb = openpyxl.load_workbook(artifact_path, read_only=True, data_only=False)
-        if "13_Safety_Goals" not in wb.sheetnames:
+        if "整车安全目标" not in wb.sheetnames:
             return []
-        ws = wb["13_Safety_Goals"]
+        ws = wb["整车安全目标"]
         goals: list[dict] = []
         for row in ws.iter_rows(min_row=5, values_only=True):
-            sg_id = row[0] if len(row) > 0 else None
-            if not sg_id or not str(sg_id).startswith("SG-"):
-                break
+            vh_id = row[7] if len(row) > 7 else None  # H 列
+            if not vh_id or not str(vh_id).strip():
+                continue
             goals.append({
-                "sg_id": sg_id,
-                "function": row[1] if len(row) > 1 else "",
-                "asil": row[3] if len(row) > 3 else "",
-                "goal": row[5] if len(row) > 5 else "",
+                "sg_id": vh_id,
+                "asil": row[9] if len(row) > 9 else "",   # J 列
+                "goal": row[8] if len(row) > 8 else "",   # I 列
             })
-            if len(goals) >= limit:
-                break
         wb.close()
-        return goals
+        rank = {"D": 4, "C": 3, "B": 2, "A": 1, "QM": 0}
+        goals.sort(key=lambda g: rank.get(str(g["asil"]).strip(), -1), reverse=True)
+        return goals[:limit]
     except Exception:
         return []
 
@@ -727,12 +730,15 @@ def _format_artifact_summary(
     ]
     if stats:
         stat_labels = {
-            "functions": "功能数",
-            "function_malfunction_pairs": "功能×失效组合",
-            "safety_critical_pairs": "安全关键（SC）组合",
-            "hara_rows": "HARA 工况行（笛卡尔展开）",
-            "significant_rows": "ASIL≥A 显著行",
-            "safety_goals": "安全目标数",
+            "functions": "整车功能数",
+            "sc_malfunctions": "安全关键失效条目",
+            "hara_events": "HARA 危害事件数",
+            "events_qm": "QM 事件",
+            "events_asil": "ASIL≥A 显著事件",
+            "safety_goals_vh": "整车安全目标数（合并后）",
+            "reused": "沿用历史条目",
+            "adapted": "改编历史条目",
+            "new": "新增条目",
         }
         lines.append("**工作簿统计**：")
         for key, label in stat_labels.items():
@@ -743,20 +749,21 @@ def _format_artifact_summary(
     if skill_cfg.get("name") == "hazard_analysis" and artifact_path is not None:
         goals = _extract_safety_goals(artifact_path)
         if goals:
-            lines.append(f"**安全目标清单（按最高 ASIL 排序，前 {len(goals)} 条，全量见工作簿）**：")
+            lines.append(f"**整车安全目标清单（按最高 ASIL 排序，前 {len(goals)} 条，全量见工作簿）**：")
             lines.append("")
-            lines.append("| SG ID | ASIL | 功能 | 安全目标 |")
-            lines.append("|---|---|---|---|")
+            lines.append("| 整车安全目标 ID | ASIL | 安全目标 |")
+            lines.append("|---|---|---|")
             for g in goals:
                 goal_text = str(g["goal"]).replace("|", "／").replace("\n", " ")
-                lines.append(f"| {g['sg_id']} | {g['asil']} | {g['function']} | {goal_text} |")
+                lines.append(f"| {g['sg_id']} | {g['asil']} | {goal_text} |")
             lines.append("")
 
     lines.append(
-        "> 工作簿含封面、假设、架构边界、功能清单、M01–M14 失效词、S/E/C 参考表、"
-        "ASIL 矩阵、功能×失效过滤表（全量保留可审计）、笛卡尔 HARA 工作表"
-        "（ASIL 为活公式，修改 S/E/C 后自动重算）、安全目标与 FSC 交接表。"
-        "自动 S/E/C 评级均为建议值，请逐条复核理由列后由责任人签署确认。"
+        "> 工作簿为团队标准 11-Sheet 模板：版本管理、命名规则、相关项功能清单、"
+        "失效模式（11 个标准失效词）、HAZOP 分析、HARA 分析（逐场景 S/E/C 评级，"
+        "ASIL 按 ISO 26262 矩阵确定性反算）、整车安全目标（同文本目标自动合并取最高 ASIL）、"
+        "参考场景与 S/E/C/ASIL 评定参考。历史沿用情况见各 sheet 备注列；"
+        "所有 S/E/C 评级均为建议值，请逐条复核理由列后由责任人签署确认。"
     )
     return "\n".join(lines)
 
@@ -786,6 +793,16 @@ def _execute_skill_core(
 
     skill_cfg = validate_binding(agent_name, skill_name)
     agent_cfg = load_agent_config(agent_name)
+
+    # ── 两阶段 map_reduce 技能（规划层 1 次 + 切片并发评级 N 次 → 合并 → 渲染） ──
+    if (skill_cfg.get("execution") or {}).get("mode") == "map_reduce":
+        return _execute_staged_skill(
+            skill_cfg,
+            agent_cfg,
+            inputs or {},
+            reference_data=reference_data,
+            runnable_config=runnable_config,
+        )
 
     rendered = render_prompt_template(
         skill_cfg["prompt_template"],
@@ -873,6 +890,345 @@ def _execute_skill_core(
             result.text = _format_artifact_summary(skill_cfg, meta, stats, artifact_path)
 
     return result
+
+
+# ════════════════════════════════════════════════════════════════
+# 5A2. 两阶段 map_reduce 执行（规划层 + 切片并发评级，供长输出技能使用）
+# ════════════════════════════════════════════════════════════════
+
+def _build_stage_system_prompt(skill_cfg: dict, stage_spec: Any) -> str:
+    """组装分阶段技能某一阶段的 system prompt（阶段提示 + 技能 reference_files）。"""
+    from agents.generate_agent import _resolve_system_prompt
+
+    return (
+        _resolve_system_prompt(stage_spec, _skill_base_dir(skill_cfg))
+        + _load_reference_texts(skill_cfg)
+    )
+
+
+def _invoke_json_stage(
+    bound_model: Any,
+    system_prompt: str,
+    user_message: str,
+    *,
+    stage_name: str,
+    max_tokens: Any,
+    runnable_config: Any = None,
+) -> tuple[dict, Any]:
+    """单阶段 json_mode 调用 → (parsed dict, response)。
+
+    finish_reason=length 时抛可操作错误；JSON 解析失败抛 ValueError（map 阶段
+    调用方据此重试）。
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    invoke_kwargs: dict[str, Any] = {}
+    if runnable_config is not None:
+        invoke_kwargs["config"] = runnable_config
+    response = bound_model.invoke(
+        [SystemMessage(content=system_prompt), HumanMessage(content=user_message)],
+        **invoke_kwargs,
+    )
+    raw_text = response.content if isinstance(response.content, str) else str(response.content)
+
+    finish_reason = ""
+    resp_meta = getattr(response, "response_metadata", None)
+    if isinstance(resp_meta, dict):
+        finish_reason = str(resp_meta.get("finish_reason") or "").lower()
+    if finish_reason == "length":
+        raise ValueError(
+            f"{stage_name}输出达到 token 上限（max_tokens={max_tokens}）被截断，JSON 不完整。"
+            f"已生成 {len(raw_text)} 字符；请提高该阶段 max_tokens 或缩小一次分析的功能范围。"
+        )
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"{stage_name}输出无法解析为 JSON：{e}；原始文本前 200 字符：{raw_text[:200]!r}"
+        ) from e
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{stage_name}输出 JSON 顶层必须是对象，实际为 {type(parsed).__name__}")
+    return parsed, response
+
+
+def _execute_staged_skill(
+    skill_cfg: dict,
+    agent_cfg: dict,
+    inputs: dict[str, Any],
+    *,
+    reference_data: dict[str, Any] | None = None,
+    runnable_config: Any = None,
+) -> SkillResult:
+    """map_reduce 两阶段执行内核。
+
+    契约（技能 YAML）：
+        execution:
+          mode: map_reduce
+          plan: {system_prompt: {file: ...}, max_tokens: 32768}
+          map:
+            system_prompt: {file: ...}
+            slice_path: hazop_items   # 规划输出中待切片的列表键
+            events_key: events        # 每个切片评级结果挂回切片的键
+            max_workers: 3
+            max_tokens: 16384
+        knowledge:
+          ...
+          plan_top_k: 40
+          layers: [function_list, failure_mode, hara_event, safety_goal]
+          map_layer: hara_event
+          map_top_k: 8
+
+    流程：
+      1. 规划层（1 次调用）：item/功能/失效矩阵/HAZOP 条目（含充分场景清单）；
+         知识注入为四层分组大召回；
+      2. 评级层（按 slice_path 切片，ThreadPoolExecutor 并发）：每切片独立
+         小召回历史 hara_event → 逐条事件 S/E/C 评级；单片失败自动重试 1 次；
+      3. 评级事件挂回对应切片 → 合并为完整 JSON → schema 校验 → 渲染器出文件。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from agents.generate_agent import _resolve_model
+
+    exec_cfg = skill_cfg.get("execution") or {}
+    plan_cfg = exec_cfg.get("plan") or {}
+    map_cfg = exec_cfg.get("map") or {}
+    slice_path = str(map_cfg.get("slice_path") or "").strip()
+    events_key = str(map_cfg.get("events_key") or "events").strip()
+    max_workers = int(map_cfg.get("max_workers") or 3)
+    if not slice_path:
+        raise ValueError(
+            f"技能 {skill_cfg.get('name')} 的 execution.map 缺少 slice_path 配置"
+        )
+
+    output_cfg = skill_cfg.get("output", {}) or {}
+    output_schema = output_cfg.get("schema")
+
+    # ── 共享的用户消息前置块（与单阶段内核保持一致的注入顺序） ──
+    rendered = render_prompt_template(
+        skill_cfg["prompt_template"], inputs, skill_cfg.get("inputs", {})
+    )
+    doc_block = _resolve_document_block(skill_cfg, inputs)
+    ref_block = _build_reference_block(reference_data)
+    schema_example_block = (
+        _build_schema_example_block(skill_cfg) if output_cfg.get("format") == "json" else ""
+    )
+
+    # ── 规划层知识注入：四层分组大召回（软降级） ──
+    plan_kb_block = _resolve_layered_knowledge_block(skill_cfg, inputs)
+
+    base_llm = _build_model_with_hint(
+        _resolve_model(agent_cfg.get("model")), skill_cfg.get("model_hint")
+    )
+
+    def _bind_json_model(max_tokens: Any) -> Any:
+        bind_kwargs: dict[str, Any] = {"response_format": {"type": "json_object"}}
+        if isinstance(max_tokens, int) and max_tokens > 0:
+            bind_kwargs["max_tokens"] = max_tokens
+        return base_llm.bind(**bind_kwargs)
+
+    # ── 阶段 1：规划 ──
+    plan_user_message = (
+        rendered + doc_block + plan_kb_block + ref_block + schema_example_block
+    )
+    plan_system_prompt = _build_stage_system_prompt(
+        skill_cfg, plan_cfg.get("system_prompt")
+    )
+    plan_parsed, plan_response = _invoke_json_stage(
+        _bind_json_model(plan_cfg.get("max_tokens")),
+        plan_system_prompt,
+        plan_user_message,
+        stage_name="规划层",
+        max_tokens=plan_cfg.get("max_tokens"),
+        runnable_config=runnable_config,
+    )
+
+    slices = plan_parsed.get(slice_path)
+    if not isinstance(slices, list) or not slices:
+        raise ValueError(
+            f"规划层输出缺少非空列表 {slice_path!r}，无法进入评级阶段；"
+            "请检查相关项描述是否包含可分析的整车功能与安全关键失效。"
+        )
+
+    # ── 阶段 2：逐切片并发评级（单片失败重试 1 次） ──
+    map_system_prompt = _build_stage_system_prompt(
+        skill_cfg, map_cfg.get("system_prompt")
+    )
+    map_max_tokens = map_cfg.get("max_tokens")
+    item_brief = plan_parsed.get("item") or {}
+    item_header = (
+        f"相关项名称：{item_brief.get('name', '')}；"
+        f"缩写/域前缀：{item_brief.get('abbr', '')} / {item_brief.get('domain_prefix', '')}"
+    )
+    kb_cfg = skill_cfg.get("knowledge") or {}
+    domain = str(kb_cfg.get("domain") or "").strip()
+    map_layer = str(kb_cfg.get("map_layer") or "").strip() or None
+    map_top_k = kb_cfg.get("map_top_k")
+
+    def _rate_one(index: int, unit: Any) -> tuple[int, list, dict]:
+        if not isinstance(unit, dict):
+            raise ValueError(f"第 {index + 1} 个评级切片不是 JSON 对象")
+        unit_json = json.dumps(unit, ensure_ascii=False, indent=2)
+
+        def _attempt() -> tuple[list, dict]:
+            # 每切片按其危害关键词小召回历史 HARA 事件（软降级，失败为空）
+            map_kb_block = ""
+            if domain:
+                try:
+                    from core.kb_client import format_knowledge_block, retrieve_knowledge
+
+                    query = " ".join(
+                        str(unit.get(k) or "")
+                        for k in ("word", "malfunction_behavior", "vehicle_hazard")
+                    ).strip()
+                    chunks = retrieve_knowledge(
+                        domain,
+                        query,
+                        top_k=map_top_k,
+                        score_threshold=kb_cfg.get("score_threshold"),
+                        layer=map_layer,
+                    )
+                    map_kb_block = format_knowledge_block(chunks, domain)
+                except Exception as exc:  # noqa: BLE001 —— 知识注入永不阻断
+                    logger.warning(
+                        "[capability_registry] 评级切片知识注入降级：%s", exc
+                    )
+            user_message = (
+                f"{item_header}\n\n"
+                "以下是一个「功能失效单元」，其中 scenarios 已给出该失效需要分析的"
+                "【完整场景清单】。请对清单中每一个场景输出一条 HARA 事件，"
+                "禁止遗漏、禁止自行增删场景；只输出 JSON 对象。\n\n"
+                f"```json\n{unit_json}\n```\n"
+                + map_kb_block
+                + schema_example_block
+            )
+            parsed, map_response = _invoke_json_stage(
+                _bind_json_model(map_max_tokens),
+                map_system_prompt,
+                user_message,
+                stage_name=f"评级层(切片{index + 1})",
+                max_tokens=map_max_tokens,
+                # 线程池内不传 runnable_config：避免日志回调跨线程并发写同一文件
+            )
+            events = parsed.get(events_key)
+            if not isinstance(events, list):
+                raise ValueError(
+                    f"评级层(切片{index + 1})输出缺少列表字段 {events_key!r}"
+                )
+            return events, _extract_usage(map_response)
+
+        try:
+            events, usage = _attempt()
+            return index, events, usage
+        except Exception as first_exc:  # noqa: BLE001 —— 单片统一重试 1 次
+            logger.warning(
+                "[capability_registry] 评级切片 %s 首次失败，重试一次：%s",
+                index + 1, first_exc,
+            )
+            try:
+                events, usage = _attempt()
+                return index, events, usage
+            except Exception as second_exc:
+                raise ValueError(
+                    f"评级切片 {index + 1}（{unit.get('fid', '')}/"
+                    f"{unit.get('word', '')}）重试后仍失败：{second_exc}。"
+                    "请缩小一次分析的功能/场景范围后重试。"
+                ) from second_exc
+
+    map_usage_sum = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(_rate_one, i, unit): i
+            for i, unit in enumerate(slices)
+        }
+        errors: list[BaseException] = []
+        for future in as_completed(futures):
+            try:
+                idx, events, map_usage = future.result()
+                slices[idx][events_key] = events
+                for k in map_usage_sum:
+                    map_usage_sum[k] += int(map_usage.get(k, 0) or 0)
+            except BaseException as exc:  # noqa: BLE001 —— 收集后统一抛出
+                errors.append(exc)
+    if errors:
+        raise errors[0]
+
+    # ── 合并 + schema 校验（切片即规划输出中的 hazop_items，事件已挂回） ──
+    merged = plan_parsed
+    raw_merged = json.dumps(merged, ensure_ascii=False)
+    structured = _validate_structured_output(raw_merged, output_schema)
+
+    plan_usage = _extract_usage(plan_response)
+    total_usage = {
+        "prompt_tokens": plan_usage.get("prompt_tokens", 0) + map_usage_sum["prompt_tokens"],
+        "completion_tokens": plan_usage.get("completion_tokens", 0) + map_usage_sum["completion_tokens"],
+        "total_tokens": plan_usage.get("total_tokens", 0) + map_usage_sum["total_tokens"],
+        "stage_plan_calls": 1,
+        "stage_map_calls": len(slices),
+    }
+
+    result = SkillResult(text=raw_merged, structured=structured, usage=total_usage)
+
+    # ── 确定性渲染：JSON → 文件交付物（与单阶段内核一致） ──
+    if output_cfg.get("format") == "json" and structured is not None:
+        artifact_meta, stats = _run_renderer(skill_cfg, structured)
+        if artifact_meta is not None:
+            from core.file_sandbox import resolve_stored_path
+
+            artifact_path = resolve_stored_path(artifact_meta.file_id)
+            result.artifacts = [{
+                "file_id": artifact_meta.file_id,
+                "filename": artifact_meta.original_name,
+                "format": artifact_meta.ext.lstrip("."),
+                "size": artifact_meta.size,
+            }]
+            result.text = _format_artifact_summary(
+                skill_cfg, artifact_meta, stats, artifact_path
+            )
+    return result
+
+
+def _resolve_layered_knowledge_block(skill_cfg: dict, inputs: dict[str, Any]) -> str:
+    """map_reduce 规划层的知识注入：一次大召回 + 按 meta.layer 分组注入（软降级）。
+
+    knowledge 扩展字段：
+        plan_top_k: 40                         # 规划层大召回量
+        layers: [function_list, ...]           # 分层分段顺序
+    未声明 plan_top_k/layers 时回退普通单层注入。
+    """
+    kb_cfg = skill_cfg.get("knowledge") or {}
+    if not isinstance(kb_cfg, dict) or not kb_cfg:
+        return ""
+    try:
+        from core.kb_client import (
+            format_knowledge_block,
+            format_knowledge_layered_block,
+            retrieve_knowledge,
+        )
+
+        domain = str(kb_cfg.get("domain") or "").strip()
+        query_from = str(kb_cfg.get("query_from") or "").strip()
+        query = str(inputs.get(query_from) or "").strip() if query_from else ""
+        if not domain or not query:
+            return ""
+        layers = kb_cfg.get("layers") or []
+        plan_top_k = kb_cfg.get("plan_top_k")
+        chunks = retrieve_knowledge(
+            domain,
+            query,
+            top_k=plan_top_k if plan_top_k else kb_cfg.get("top_k"),
+            score_threshold=kb_cfg.get("score_threshold"),
+            meta_filter=kb_cfg.get("meta_filter") or None,
+        )
+        if layers:
+            layers = [str(x) for x in layers]
+            return format_knowledge_layered_block(chunks, layers, domain)
+        return format_knowledge_block(chunks, domain)
+    except Exception as exc:  # noqa: BLE001 —— 注入过程任何异常都不阻断
+        logger.warning(
+            "[capability_registry] 技能 %s 分层知识注入降级：%s",
+            skill_cfg.get("name"), exc,
+        )
+        return ""
 
 
 def execute_skill(

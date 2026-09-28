@@ -69,13 +69,10 @@ scenes:
   # ══════════════════════════════════════════════════════════════
   # 功能安全链（functional_safety_agent）
   # ══════════════════════════════════════════════════════════════
-  # 注意：hara_generator 技能包当前不在工作区（此前落地的管道技能已被回滚，
-  # 含 functional_safety_agent 绑定、capability_registry context 改动与
-  # requirements.txt 的 python-docx）。恢复技能包后重新启用本场景码：
-  # HARA_GENERATE:
-  #   description: 基于相关项定义 DOCX 生成团队标准 5-Sheet HARA xlsx（6 阶段管道，含 4 次 LLM 受控推理）
-  #   agent: functional_safety_agent
-  #   skill: hara_generator
-  #   response_format: json
-  #   timeout_seconds: 900
+  HARA_GENERATE:
+    description: 基于相关项定义生成团队标准 HARA 工作簿（map_reduce 两阶段：规划功能/失效/充分场景 + 逐失效并发 S/E/C 评级，历史项目优先沿用）
+    agent: functional_safety_agent
+    skill: hazard_analysis
+    response_format: json
+    timeout_seconds: 1800
 

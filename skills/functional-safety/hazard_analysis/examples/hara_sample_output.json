@@ -1,0 +1,134 @@
+{
+  "item": {
+    "name": "电动助力转向系统（EPS）",
+    "abbr": "EPS",
+    "domain_prefix": "CS",
+    "doc_ref": "EPS_Item_Definition.docx"
+  },
+  "functions": [
+    {
+      "fid": "F01",
+      "vehicle_function": "转向助力功能",
+      "doc_ref": "EPS_Item_Definition.docx",
+      "source": {"type": "reused", "project": "EPS_HARA_2024.xlsx", "ref_id": "CS_func_0001"},
+      "features": [
+        {
+          "feature_list_id": "S-101-01",
+          "description": "依据驾驶员转向盘力矩提供转向助力",
+          "do_hara": "是",
+          "doc_ref": "EPS_Item_Definition.docx#3.2"
+        },
+        {
+          "feature_list_id": "S-101-02",
+          "description": "原地转向助力（泊车）",
+          "do_hara": "是",
+          "doc_ref": "EPS_Item_Definition.docx#3.2"
+        }
+      ]
+    }
+  ],
+  "malfunction_matrix": [
+    {
+      "fid": "F01",
+      "selections": {
+        "丢失": true,
+        "非预期": true,
+        "间歇": false,
+        "过多": true,
+        "过少": false,
+        "过早": false,
+        "反向": true,
+        "振荡": false,
+        "部分": false,
+        "过晚": false,
+        "卡滞": true
+      },
+      "rationale": "选「丢失/非预期/过多/反向/卡滞」为安全相关失效；「间歇/过少/部分/过晚」极端情形可被「丢失」覆盖，「过早」可被「非预期」覆盖，「振荡」可被「过多/过少」覆盖，按覆盖关系不单独分析。",
+      "source": {"type": "adapted", "project": "EPS_HARA_2024.xlsx", "ref_id": "CS_MF_0001"}
+    }
+  ],
+  "hazop_items": [
+    {
+      "fid": "F01",
+      "word": "丢失",
+      "malfunction_behavior": "行驶中转向助力突然消失，转向盘显著变沉",
+      "vehicle_hazard": "转向能力下降：驾驶员需用更大力矩转向，车辆可能偏离预期行驶轨迹并与相邻车辆/障碍物碰撞",
+      "source": {"type": "reused", "project": "EPS_HARA_2024.xlsx", "ref_id": "CS_MF_0001_01"},
+      "scenarios": [
+        {
+          "scene_text": "车辆处于静止状态（点火上电但车速为 0，原地停车）",
+          "scene_refs": ["CUSTOM"]
+        },
+        {
+          "scene_text": "高速公路直行，普通路面，相邻车道有正常行驶车辆",
+          "scene_refs": ["SL36", "SE12", "SP04"]
+        }
+      ],
+      "events": [
+        {
+          "scenario_text": "车辆处于静止状态（点火上电但车速为 0，原地停车）",
+          "scene_refs": ["CUSTOM"],
+          "event_description": "车辆原地静止、无相对运动，助力消失仅使原地打方向变沉，不产生车辆运动与碰撞伤害。",
+          "S": 0,
+          "s_reason": "S0:车辆静止无碰撞可能，无人员伤害//",
+          "E": 4,
+          "e_reason": "E4:静止/泊车工况常见//",
+          "C": 0,
+          "c_basis": "项目经验",
+          "c_reason": "无需规避动作，不存在车辆控制丧失//C0:静止工况可控性不受限",
+          "sg_text": "",
+          "safe_state": "",
+          "ftti": "",
+          "source": {"type": "new", "project": "", "ref_id": ""}
+        },
+        {
+          "scenario_text": "高速公路直行，普通路面，相邻车道有正常行驶车辆",
+          "scene_refs": ["SL36", "SE12", "SP04"],
+          "event_description": "高速行驶中助力突然消失，驾驶员瞬间转向力度不足导致车辆向相邻车道偏移，可能与相邻车道车辆发生侧面/追尾碰撞，ΔV 可达 30~60km/h，存在致命伤害风险。",
+          "S": 2,
+          "s_reason": "S2:车车碰撞 ΔV 约 30~60km/h，危及生命//",
+          "E": 4,
+          "e_reason": "E4:高速公路(SL36)//E4:普通路面驾驶(SE12)，综合取最高 E4//",
+          "C": 2,
+          "c_basis": "ISO 26262 参考",
+          "c_reason": "驾驶员可通过加大握力与修正转向盘进行补偿，但高速下反应窗口短、修正余量小//C2:通常可控制（90% 以上驾驶员可规避）",
+          "sg_text": "防止行驶中转向助力异常导致车辆非预期偏航",
+          "safe_state": "关闭助力输出并点亮故障警告，保持机械转向连接",
+          "ftti": "200ms(TBD)",
+          "source": {"type": "reused", "project": "EPS_HARA_2024.xlsx", "ref_id": "CS_hzrd_01007"}
+        }
+      ]
+    },
+    {
+      "fid": "F01",
+      "word": "非预期",
+      "malfunction_behavior": "驾驶员未转动转向盘时，系统非预期输出转向助力力矩",
+      "vehicle_hazard": "非预期偏航：车辆自行转向偏离车道，可能与相邻车辆/护栏碰撞",
+      "source": {"type": "adapted", "project": "EPS_HARA_2024.xlsx", "ref_id": "CS_MF_0001_02"},
+      "scenarios": [
+        {
+          "scene_text": "高速公路直行，普通路面，相邻车道有正常行驶车辆",
+          "scene_refs": ["SL36", "SE12", "SP04"]
+        }
+      ],
+      "events": [
+        {
+          "scenario_text": "高速公路直行，普通路面，相邻车道有正常行驶车辆",
+          "scene_refs": ["SL36", "SE12", "SP04"],
+          "event_description": "车辆在驾驶员无转向输入时自行向相邻车道偏转，驾驶员虽可反向修正，但非预期力矩出现突然，高速下可能与相邻车道车辆碰撞，ΔV 可达 60km/h 以上，存在致命伤害风险。",
+          "S": 3,
+          "s_reason": "S3:高速车车碰撞 ΔV>60km/h，致死风险高//",
+          "E": 4,
+          "e_reason": "E4:高速公路(SL36)//E4:普通路面驾驶(SE12)，综合取最高 E4//",
+          "C": 3,
+          "c_basis": "J2980 参考",
+          "c_reason": "非预期力矩方向与驾驶员预期相反，高速下驾驶员难以在碰撞前完成修正//C3:难以控制（不足 90% 驾驶员可规避）",
+          "sg_text": "防止行驶中转向助力异常导致车辆非预期偏航",
+          "safe_state": "立即切断非预期助力输出并点亮故障警告",
+          "ftti": "120ms(TBD)",
+          "source": {"type": "adapted", "project": "EPS_HARA_2024.xlsx", "ref_id": "CS_hzrd_01012"}
+        }
+      ]
+    }
+  ]
+}

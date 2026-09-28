@@ -1,40 +1,39 @@
-# Malfunction Guide Words (M01–M14)
+# 功能失效模式词表（团队标准 11 词）
 
-Each item function MUST be evaluated against all 14 malfunction guide words. For each pair (function × malfunction), the analyst classifies the combination as:
+对每个整车功能，在「失效模式」sheet 中从以下 11 个标准失效词中选择适用项打 √，
+并在「选择理由」中说明选择/排除依据；随后对每个被选中的安全关键（SC）失效词
+在 HAZOP 中给出「功能异常表现」与「整车危害」。
 
-- **Safety Critical (SC)** — A failure of this type on this function could lead to a hazardous event.
-- **Not Safety Critical (NSC)** — A failure of this type on this function does not lead to a hazardous event.
-- **Not Applicable (NA)** — The malfunction guide word does not physically/logically apply to this function.
+| 序号 | 失效词 | 含义（判断要点） |
+|---|---|---|
+| 1 | 丢失 | 功能彻底无法提供（含运行中功能消失） |
+| 2 | 非预期 | 功能在驾驶员未请求/不需要时自行激活或输出 |
+| 3 | 间歇 | 一段时间内功能正常与无法使用交替出现 |
+| 4 | 过多 | 功能输出量/强度大于驾驶员预期 |
+| 5 | 过少 | 功能输出量/强度小于驾驶员预期 |
+| 6 | 过早 | 功能比预期出现时间更早激活 |
+| 7 | 反向 | 功能输出方向与预期相反 |
+| 8 | 振荡 | 功能输出在过多与过少之间反复波动 |
+| 9 | 部分 | 仅有部分子功能实现/部分通道生效 |
+| 10 | 过晚 | 功能比预期出现时间更晚激活，或需要时一直未激活 |
+| 11 | 卡滞 | 功能输出固定在某一值/状态，不随输入变化 |
 
-When two malfunctions produce an identical system response (e.g., M02 *Stops Functioning* on a momentary actuator behaves identically to M01 *No Function*), one may be evaluated *through* the other. The skill should record this collapse explicitly in the `Subsumed_By` column rather than silently dropping the row.
+## 失效词覆盖关系（选择排除依据，原模板注释）
 
-## The 14 Guide Words
+1.「间歇」意味着功能在一段时间内正常使用与无法使用交替进行，在极端情况下是在一段时间内功能彻底无法使用，**可以被「丢失」覆盖**；
+2.「过少」意味比驾驶员预期的要少，在极端情况下是在一段时间内功能彻底无法使用，**可以被「丢失」覆盖**；
+3.「过早」意味着比驾驶员预期的出现时间要早，在极端情况下是在驾驶员不需要激活的情况下激活，**可以被「非预期」覆盖**；
+4.「振荡」意味着功能在一段时间内可能执行的过多、在另一段时间内执行过少，**可以被「过多」和「过少」覆盖**；
+5.「部分」意味着仅有部分功能实现，在极端情况下是功能几乎完全未激活，**可以被「丢失」覆盖**；
+6.「过晚」意味着比驾驶员预期的出现时间要晚，在极端情况下是在驾驶员需要的情况下一直未激活，**可以被「丢失」覆盖**。
 
-| ID  | Name                       | Definition                                                                                              | Typical example                                       |
-|-----|----------------------------|---------------------------------------------------------------------------------------------------------|-------------------------------------------------------|
-| M01 | No Function                | Function never executes when commanded.                                                                 | Brake assist commanded, no output.                    |
-| M02 | Stops Functioning          | Function executes initially, then stops while still commanded.                                          | LKAS torque cuts out mid-curve.                       |
-| M03 | Unrequested Function       | Function executes without being commanded.                                                              | Spontaneous brake apply at cruise.                    |
-| M04 | Function Stuck             | Function holds last commanded value, ignores new commands.                                              | Throttle stuck at 30%.                                |
-| M05 | Excessive Function         | Function output magnitude exceeds command.                                                              | Steering torque 2× requested.                         |
-| M06 | Partial Function           | Function output magnitude is less than command, but non-zero.                                           | ABS modulates only one wheel.                         |
-| M07 | Functions Early            | Function executes before the trigger condition is met.                                                  | Airbag fires before crash threshold.                  |
-| M08 | Functions Late             | Function executes after the trigger condition has passed.                                               | Pre-charge applies after collision.                   |
-| M09 | Function Applies Too Short | Output duration shorter than commanded.                                                                 | Brake hold releases prematurely.                      |
-| M10 | Function Applies Too Long  | Output duration longer than commanded.                                                                  | EPB drag continues after release request.             |
-| M11 | Function is Delayed        | Function eventually executes correctly but with latency beyond spec.                                    | Cruise resume responds 800 ms late.                   |
-| M12 | Inverse Function           | Function executes in the opposite direction of the command.                                             | Steering assist torque opposite to driver input.      |
-| M13 | Erratic or Intermittent    | Function output oscillates or chatters around the command.                                              | Throttle position bouncing.                           |
-| M14 | Function is Uneven         | Function output has non-monotonic / asymmetric profile (e.g., one wheel braked harder than the other).  | Asymmetric brake torque causing pull.                 |
+> 被覆盖的失效词可以不打 √，但必须在「选择理由」中写明被哪个词覆盖。
 
-## Rating heuristics for the SC / NSC / NA filter
+## HAZOP 展开要求
 
-When auto-suggesting the SC / NSC / NA classification for a (function × malfunction) pair, use these heuristics — but the analyst must always confirm:
-
-- **Defaults to SC**: actuators that move the vehicle (longitudinal, lateral, vertical control), display of safety-critical information, energy storage release.
-- **Defaults to NSC**: HMI cosmetic features, infotainment, comfort actuators with no kinetic authority.
-- **Defaults to NA**: malfunction guide words that cannot physically occur for the function (e.g., M07 *Functions Early* on a continuously-active function with no discrete trigger).
-
-## Output requirement
-
-When generating the HARA worksheet, every (function × M01..M14) pair MUST appear as a row in the **Function × Malfunction filter** tab, even rows classified NSC or NA, so that the analysis is auditable. Only SC pairs expand into the full Cartesian against operating environment.
+- 仅对**安全关键（SC）**失效词（即其整车危害可能导致伤害事件）建立 HAZOP 条目；
+  明显无安全后果的失效（如舒适性功能轻微偏差）可不展开，但应在选择理由中说明。
+- 每条 HAZOP 必须给出：功能异常表现（具体到驾驶员可感知的现象）、整车危害
+  （相关项级危害，描述车辆运动/碰撞趋势，不写内部故障原因）。
+- 整车危害描述建议结构：「<危害类别>：<车辆级现象与后果>」，
+  例如「非预期的横向运动：非预期的车辆横向运动、偏航，车辆没有遵循期望的方向」。

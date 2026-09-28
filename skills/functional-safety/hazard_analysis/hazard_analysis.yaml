@@ -1,7 +1,7 @@
 name: hazard_analysis
 display_name: 功能安全危害分析（HARA）
-description: 基于相关项定义文档或功能/系统描述，按 ISO 26262 完成功能枚举、M01-M14 失效过滤、S/E/C 评级与 ASIL 矩阵，产出审计级多 Tab HARA 工作簿（xlsx）与安全目标清单。
-version: 2.0.0
+description: 基于相关项定义文档或功能/系统描述，按 ISO 26262 与团队标准模板完成整车功能枚举、11 个失效词过滤、充分场景 HAZOP 展开与逐场景 S/E/C 评级，产出 11-Sheet 团队标准 HARA 工作簿（xlsx），历史项目条目优先沿用并在备注列标注来源。
+version: 3.0.0
 risk_level: medium
 domain:
   - 功能安全
@@ -34,11 +34,11 @@ inputs:
   operational_scenarios:
     type: string
     required: false
-    desc: 运行场景、边界条件、环境与人员状态，例如高速跟车、雨天、驾驶员分心
+    desc: 用户特别关注的运行场景/边界条件（可选补充，场景分析以平台场景库四维穷举为准）
   known_hazards:
     type: string
     required: false
-    desc: 已知危害/关注点/失效模式，多个可用顿号或分号分隔
+    desc: 已知危害/关注点（可选补充），多个可用顿号或分号分隔
   standard:
     type: string
     required: false
@@ -53,42 +53,63 @@ document_source:
   file_id_input: file_id
 
 # ────────────────────────────────────────────────────────────────────
-# 知识库注入（通道一）：执行前用 item_definition 检索 auto-kb 历史项目参考
-# （HARA 案例/危害事件/安全目标），作为只读段落追加到用户消息。
-# 服务地址见 agents/configs/knowledge.yaml（base_url 留空则自动跳过，不阻断执行）。
+# 执行模式：map_reduce 两阶段
+#   plan（1 次）：相关项/功能/失效矩阵/HAZOP 条目（含充分场景清单）
+#   map （N 次并发）：逐失效单元对完整场景清单做 S/E/C 评级，事件挂回切片
+# 切片即规划输出的 hazop_items；合并后经 schema 校验 → 确定性渲染器出 xlsx。
+# ────────────────────────────────────────────────────────────────────
+execution:
+  mode: map_reduce
+  plan:
+    system_prompt:
+      file: stage_plan.md
+    max_tokens: 32768
+  map:
+    system_prompt:
+      file: stage_rate.md
+    slice_path: hazop_items
+    events_key: events
+    max_workers: 3
+    max_tokens: 16384
+
+# ────────────────────────────────────────────────────────────────────
+# 知识库注入（auto-kb 历史项目参考，服务地址见 agents/configs/knowledge.yaml；
+# base_url 留空或服务不可达时自动跳过，不阻断执行）：
+#   规划层：一次大召回（plan_top_k），按 meta.layer 四层分组注入；
+#   评级层：每切片按失效词/异常表现/整车危害小召回 hara_event 层（map_top_k）。
+# 历史 HARA xlsx 导入 auto-kb 时须按这四层标注 meta.layer。
 # ────────────────────────────────────────────────────────────────────
 knowledge:
   domain: 功能安全
   query_from: item_definition
   top_k: 5
   score_threshold: 0.3
+  plan_top_k: 40
+  layers: [function_list, failure_mode, hara_event, safety_goal]
+  map_layer: hara_event
+  map_top_k: 8
 
 # ────────────────────────────────────────────────────────────────────
-# 系统提示与方法论参考（reference_files 由平台拼接在 system_prompt 之后）
+# 方法论参考（reference_files 由平台拼接在各阶段 system_prompt 之后）
 # ────────────────────────────────────────────────────────────────────
-system_prompt:
-  file: system_prompt.md
 reference_files:
   - references/malfunctions.md
-  - references/severity_ais.md
-  - references/exposure.md
-  - references/controllability.md
-  - references/asil_matrix.md
-  - references/operating_environments.md
-  - references/fsc_handoff.md
+  - references/scene_library.md
+  - references/sec_rating_rules.md
+  - references/domain_prefixes.md
 
 # ────────────────────────────────────────────────────────────────────
-# 输出：结构化 JSON（轻量 schema 校验）→ 确定性渲染器生成 xlsx 交付物
+# 输出：两阶段合并 JSON（轻量 schema 校验）→ 确定性渲染器生成 xlsx 交付物
 # ────────────────────────────────────────────────────────────────────
 output:
   format: json
-  # HARA JSON 体积大（功能×M01-M14 全量评级 + 长中文理由），可见输出常达 8~16k tokens；
-  # 推理模型的思维链 token 另计，此值只约束可见 JSON，须高于全局 LLM_MAX_TOKENS(8192)。
-  max_tokens: 16384
-  example_file: examples/sample_input_esc.json
+  # 各阶段 token 上限在 execution.plan/map.max_tokens 单独配置；
+  # 此处保留 output.max_tokens 仅作契约元数据（实际不读取）。
+  max_tokens: 32768
+  example_file: examples/hara_sample_output.json
   schema:
     type: object
-    required: [item, functions]
+    required: [item, functions, malfunction_matrix, hazop_items]
     properties:
       item:
         type: object
@@ -96,25 +117,81 @@ output:
         properties:
           name: {type: string}
           abbr: {type: string}
-      scope_description: {type: string}
-      boundary_diagram_notes: {type: string}
-      assumptions:
-        type: array
-        items: {type: object}
-      interfaces:
-        type: array
-        items: {type: object}
+          domain_prefix: {type: string}
+          doc_ref: {type: string}
       functions:
         type: array
         items:
           type: object
-          required: [id, name]
-      function_malfunction_ratings:
+          required: [fid, vehicle_function]
+          properties:
+            fid: {type: string}
+            vehicle_function: {type: string}
+            doc_ref: {type: string}
+            source: {type: object}
+            features:
+              type: array
+              items:
+                type: object
+                properties:
+                  feature_list_id: {type: string}
+                  description: {type: string}
+                  do_hara: {type: string}
+                  doc_ref: {type: string}
+      malfunction_matrix:
         type: array
-        items: {type: object}
-      rating_overrides:
+        items:
+          type: object
+          required: [fid, selections]
+          properties:
+            fid: {type: string}
+            selections: {type: object}
+            rationale: {type: string}
+            source: {type: object}
+      hazop_items:
         type: array
-        items: {type: object}
+        items:
+          type: object
+          required: [fid, word, malfunction_behavior, vehicle_hazard, scenarios]
+          properties:
+            fid: {type: string}
+            word: {type: string}
+            malfunction_behavior: {type: string}
+            vehicle_hazard: {type: string}
+            source: {type: object}
+            scenarios:
+              type: array
+              items:
+                type: object
+                required: [scene_text]
+                properties:
+                  scene_text: {type: string}
+                  scene_refs:
+                    type: array
+                    items: {type: string}
+            # events 由评级层（map）回填；规划层输出不含此字段
+            events:
+              type: array
+              items:
+                type: object
+                required: [scenario_text, S, E, C, source]
+                properties:
+                  scenario_text: {type: string}
+                  scene_refs:
+                    type: array
+                    items: {type: string}
+                  event_description: {type: string}
+                  S: {type: integer}
+                  s_reason: {type: string}
+                  E: {type: integer}
+                  e_reason: {type: string}
+                  C: {type: integer}
+                  c_basis: {type: string}
+                  c_reason: {type: string}
+                  sg_text: {type: string}
+                  safe_state: {type: string}
+                  ftti: {type: string}
+                  source: {type: object}
   # 渲染器：输入 JSON 写临时文件 → 调用脚本 entrypoint(input_path, output_path)
   # → xlsx 存入文件沙箱，经 /agent/files/{file_id}/download 下载
   renderer:
@@ -125,15 +202,17 @@ output:
     filename_template: "HARA_{abbr}_{date}.xlsx"
 
 prompt_template: |
-  请完成功能安全危害分析（HARA），并按系统提示词要求只输出工作簿输入 JSON。
+  请完成功能安全危害分析（HARA）。分析分两个阶段由系统自动完成：
+  先规划整车功能、11 个失效词过滤与每个安全关键失效的完整运行场景清单，
+  再逐场景完成 S/E/C 评级与安全目标挂接，最终只输出团队标准工作簿。
 
   【分析对象/功能描述】：{{item_definition}}
-  【运行场景/边界条件】：{{operational_scenarios}}
+  【特别关注的运行场景】：{{operational_scenarios}}
   【已知危害/关注点】：{{known_hazards}}
   【适用标准】：{{standard}}
 
   要点：
-  1. 若下方提供了【相关项文档】，以文档为主要事实来源提取相关项、接口、假设与功能；
-  2. 每个功能必须评估全部 14 个失效指导词（M01-M14），NSC/NA 也要保留并给理由；
-  3. S/E/C 与 ASIL 由工作簿自动计算，你只输出功能、失效过滤分类、危害描述与必要的 overrides；
-  4. 只输出一个 JSON 对象，不要 Markdown 代码围栏或任何解释文字。
+  1. 若下方提供了【相关项文档】，以文档为主要事实来源提取相关项与整车功能；
+  2. 场景分析以平台《运行场景库》四个维度穷举为准，用户补充场景只作增量提示；
+  3. 历史项目参考优先沿用，每条目必须按要求标注 source（reused/adapted/new）；
+  4. 各阶段只输出约定 JSON，不要 Markdown 代码围栏或任何解释文字。

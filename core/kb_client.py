@@ -35,6 +35,16 @@ MAX_CHUNK_CHARS = 800      # 单块内容最大字符数（超出截断）
 MAX_TOTAL_CHARS = 8000     # 注入段落正文总字符上限（超出丢弃后续块）
 DEFAULT_TOP_K = 5
 
+# 分层注入（map_reduce 规划阶段）：一次大召回后按 meta.layer 客户端分组
+LAYER_LABELS = {
+    "function_list": "功能清单层",
+    "failure_mode": "失效模式层",
+    "hara_event": "HARA 危害事件层",
+    "safety_goal": "安全目标层",
+}
+MAX_LAYER_CHUNK_CHARS = 1200   # 分层段落单块上限
+MAX_LAYER_TOTAL_CHARS = 20000  # 分层段落总上限
+
 # ── 模块级缓存（与 capability_registry 缓存风格一致） ──
 _cache_lock = threading.Lock()
 _config_cache: dict[str, Any] | None = None
@@ -150,8 +160,12 @@ def retrieve_knowledge(
     top_k: int | None = None,
     score_threshold: float | None = None,
     meta_filter: dict[str, Any] | None = None,
+    layer: str | None = None,
 ) -> list[dict[str, Any]]:
     """检索指定领域的知识库，返回分块列表（content/score/filename/meta）。
+
+    layer：可选的分块级分层过滤（meta.layer）。auto-kb 的 meta_filter 只过滤
+    文档级元数据，分块级 layer 由本函数在客户端过滤（不增加服务端改动）。
 
     软降级承诺：任何失败（功能未启用、query 为空、库名不可解析、网络异常、
     响应格式异常）都返回 [] 并记 warning 日志，绝不抛异常阻断技能执行。
@@ -184,7 +198,16 @@ def retrieve_knowledge(
         if not isinstance(chunks, list):
             logger.warning("[kb_client] /api/retrieve 返回非列表，忽略（domain=%s）", domain)
             return []
-        logger.info("[kb_client] 知识检索命中 %d 块（domain=%s，query=%r）", len(chunks), domain, query[:50])
+        if layer:
+            # 分块级 layer 客户端过滤（auto-kb 的 meta_filter 仅过滤文档级元数据）
+            chunks = [
+                c for c in chunks
+                if str((c.get("meta") or {}).get("layer") or "") == layer
+            ]
+        logger.info(
+            "[kb_client] 知识检索命中 %d 块（domain=%s，layer=%s，query=%r）",
+            len(chunks), domain, layer or "-", query[:50],
+        )
         return chunks
     except Exception as exc:  # noqa: BLE001 —— 软降级兜底，见 docstring
         logger.warning("[kb_client] 知识库检索降级（domain=%s）：%s", domain, exc)
@@ -240,5 +263,72 @@ def format_knowledge_block(chunks: list[dict[str, Any]], domain: str) -> str:
     lines.append(
         "使用要求：以上为历史项目数据，仅供格式与粒度参考；"
         "与用户当前输入冲突时一律以用户输入为准；引用历史结论时注明出处文件名。"
+    )
+    return "\n".join(lines)
+
+
+def format_knowledge_layered_block(
+    chunks: list[dict[str, Any]],
+    layers: list[str],
+    domain: str,
+) -> str:
+    """分层注入：大召回结果按 meta.layer 分段组织（供 map_reduce 规划阶段使用）。
+
+    layers 给定分段顺序（如 function_list/failure_mode/hara_event/safety_goal）；
+    不属于任何声明层的块归入「其他」段（若有的话，放在最后）。
+    每段独立编号，便于 LLM 在条目 source 中引用「文件 + 分层 + 序号」。
+    """
+    if not chunks:
+        return ""
+    grouped: dict[str, list[dict[str, Any]]] = {layer: [] for layer in layers}
+    extras: list[dict[str, Any]] = []
+    for chunk in chunks:
+        layer = str((chunk.get("meta") or {}).get("layer") or "")
+        if layer in grouped:
+            grouped[layer].append(chunk)
+        else:
+            extras.append(chunk)
+    if extras:
+        grouped["__other__"] = extras
+
+    lines: list[str] = [
+        f"\n\n【历史项目参考（检索自「{domain}」知识库，按数据层分组，只读）】"
+    ]
+    total = 0
+    kept_any = False
+    for layer, layer_chunks in grouped.items():
+        if not layer_chunks:
+            continue
+        label = LAYER_LABELS.get(layer, layer)
+        lines.append(f"\n── {label} ──")
+        kept = 0
+        for chunk in layer_chunks:
+            content = str(chunk.get("content") or "").strip()
+            if not content:
+                continue
+            content = content[:MAX_LAYER_CHUNK_CHARS]
+            try:
+                score = float(chunk.get("score") or 0)
+            except (TypeError, ValueError):
+                score = 0.0
+            line = (
+                f"[{layer}#{kept + 1}] 来源：{_format_source(chunk)} ｜ 相似度 {score:.2f}\n"
+                + content
+            )
+            if total + len(line) > MAX_LAYER_TOTAL_CHARS:
+                lines.append("（本层剩余历史条目因篇幅省略）")
+                break
+            lines.append(line)
+            total += len(line)
+            kept += 1
+        if kept:
+            kept_any = True
+    if not kept_any:
+        return ""
+    lines.append(
+        "\n使用要求：①以上为历史项目真实条目，本次分析应优先沿用/改编其中与当前相关项"
+        "匹配的功能、失效模式、危害事件、S/E/C 评级与安全目标，沿用条目必须在 source 中"
+        "注明来源文件与历史标识；②历史不足或不适用处才允许新增，新增条目标 source.type=new；"
+        "③即使沿用历史 ASIL，也必须完整输出 S/E/C 取值与理由以便审计。"
     )
     return "\n".join(lines)
