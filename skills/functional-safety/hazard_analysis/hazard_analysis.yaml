@@ -54,23 +54,27 @@ document_source:
 
 # ────────────────────────────────────────────────────────────────────
 # 执行模式：map_reduce 三阶段
-#   identify（1 次，小调用）：识别相关项与整车功能清单 → 按功能精准检索历史知识库
+#   prepare（技能脚本 hara_prepare.py）：识别相关项与整车功能清单 → 按功能精准检索
 #   plan（1 次）：相关项/功能/失效矩阵/HAZOP 条目（含充分场景清单）
 #   map （N 次并发）：逐失效单元对完整场景清单做 S/E/C 评级，事件挂回切片
 # 切片即规划输出的 hazop_items；合并后经 schema 校验 → 确定性渲染器出 xlsx。
 # ────────────────────────────────────────────────────────────────────
 execution:
   mode: map_reduce
-  # Stage 0 识别层：先从文档识别相关项 + 整车功能名称，再按功能精准检索历史库；
-  # 识别失败/零命中时自动回退 item_definition 或文档头部粗召回，不阻断执行。
-  identify:
-    enabled: true
-    system_prompt:
-      file: stage_identify.md
-    # 识别阶段只需域前缀映射，不加载场景库/评级规则等方法论
-    references:
-      - references/domain_prefixes.md
-    max_tokens: 4096
+  # 技能侧前置钩子（识别整车功能 → 功能级精准检索历史库）：
+  # 引擎只加载 script/entrypoint；prepare 段内其余配置由 hara_prepare.py 自行解释。
+  # 钩子失败/零命中时引擎自动回退 item_definition 或文档头部粗召回，不阻断执行。
+  prepare:
+    script: scripts/hara_prepare.py
+    entrypoint: prepare
+    identify:
+      enabled: true
+      system_prompt:
+        file: stage_identify.md
+      # 识别阶段只需域前缀映射，不加载场景库/评级规则等方法论
+      references:
+        - references/domain_prefixes.md
+      max_tokens: 4096
   plan:
     system_prompt:
       file: stage_plan.md
@@ -86,7 +90,7 @@ execution:
 # ────────────────────────────────────────────────────────────────────
 # 知识库注入（auto-kb 历史项目参考，服务地址见 agents/configs/knowledge.yaml；
 # base_url 留空或服务不可达时自动跳过，不阻断执行）：
-#   识别层（默认）：按识别出的每个整车功能做 2 轮检索——
+#   prepare 钩子（hara_prepare.py）：按识别出的每个整车功能做 2 轮检索——
 #     q1「相关项名+功能名」综合召回 identify_func_top_k；
 #     q2「功能名 失效模式」专项召回 failure_mode 层 identify_fm_top_k；
 #   回退粗召回：一次大召回（plan_top_k），按 meta.layer 四层分组注入；
@@ -213,12 +217,32 @@ output:
                   source: {type: object}
   # 渲染器：输入 JSON 写临时文件 → 调用脚本 entrypoint(input_path, output_path)
   # → xlsx 存入文件沙箱，经 /agent/files/{file_id}/download 下载
+  # stat_labels：交付摘要中工作簿统计的中文标签（按声明顺序，只列 stats 中存在的键）；
+  # summary_entrypoint：可选附加摘要入口 summarize(in_json, artifact_path)->markdown
   renderer:
     type: python_script
     script: scripts/generate_hara.py
     entrypoint: generate
     format: xlsx
     filename_template: "HARA_{abbr}_{date}.xlsx"
+    summary_entrypoint: summarize
+    stat_labels:
+      functions: 整车功能数
+      sc_malfunctions: 安全关键失效条目
+      hara_events: HARA 危害事件数
+      events_qm: QM 事件
+      events_asil: ASIL≥A 显著事件
+      safety_goals_vh: 整车安全目标数（合并后）
+      reused: 沿用历史条目
+      adapted: 改编历史条目
+      new: 新增条目
+  # 交付摘要尾注（业务说明放技能契约，引擎不内置业务文案）
+  summary_footer: >-
+    工作簿为团队标准 11-Sheet 模板：版本管理、命名规则、相关项功能清单、
+    失效模式（11 个标准失效词）、HAZOP 分析、HARA 分析（逐场景 S/E/C 评级，
+    ASIL 按 ISO 26262 矩阵确定性反算）、整车安全目标（同文本目标自动合并取最高 ASIL）、
+    参考场景与 S/E/C/ASIL 评定参考。历史沿用情况见各 sheet 备注列；
+    所有 S/E/C 评级均为建议值，请逐条复核理由列后由责任人签署确认。
 
 prompt_template: |
   请完成功能安全危害分析（HARA）。分析分两个阶段由系统自动完成：

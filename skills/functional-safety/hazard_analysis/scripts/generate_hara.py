@@ -463,6 +463,57 @@ def _write_safety_goals(wb, sg_left, vh_goals):
         r += 1
 
 
+# ════════════════════════════════════════════════════════════════
+# 交付摘要（引擎可选入口 summarize；HARA 专属展示逻辑随渲染器放在技能侧）
+# ════════════════════════════════════════════════════════════════
+
+def _extract_vehicle_goals(artifact_path: str, limit: int = 15) -> list[dict]:
+    """读取成品工作簿「整车安全目标」表右区合并后的整车安全目标（尽力而为）。
+
+    模板布局：R1 分组表头 / R2 列名，数据从 R3 起。
+    右区 F 整车安全目标ID / G ASIL / H 整车安全目标 / I 安全状态 / J FTTI / K 备注。
+    """
+    try:
+        wb = load_workbook(artifact_path, read_only=True, data_only=False)
+        if "整车安全目标" not in wb.sheetnames:
+            return []
+        ws = wb["整车安全目标"]
+        goals: list[dict] = []
+        for row in ws.iter_rows(min_row=3, values_only=True):
+            vh_id = row[5] if len(row) > 5 else None  # F 列
+            if not vh_id or not str(vh_id).strip():
+                continue
+            goals.append({
+                "sg_id": vh_id,
+                "asil": row[6] if len(row) > 6 else "",   # G 列
+                "goal": row[7] if len(row) > 7 else "",   # H 列
+            })
+        wb.close()
+        goals.sort(
+            key=lambda g: _ASIL_RANK.get(str(g["asil"]).strip(), -1), reverse=True
+        )
+        return goals[:limit]
+    except Exception:
+        return []
+
+
+def summarize(in_json_path: str, artifact_path: str) -> str:
+    """引擎 output.renderer.summary_entrypoint：返回附加 markdown 段落。"""
+    goals = _extract_vehicle_goals(artifact_path)
+    if not goals:
+        return ""
+    lines = [
+        f"**整车安全目标清单（按最高 ASIL 排序，前 {len(goals)} 条，全量见工作簿）**：",
+        "",
+        "| 整车安全目标 ID | ASIL | 安全目标 |",
+        "|---|---|---|",
+    ]
+    for g in goals:
+        goal_text = str(g["goal"]).replace("|", "／").replace("\n", " ")
+        lines.append(f"| {g['sg_id']} | {g['asil']} | {goal_text} |")
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     import sys
 

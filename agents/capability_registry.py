@@ -735,41 +735,146 @@ def _run_renderer(
                 pass
 
 
-def _extract_safety_goals(artifact_path: Path, limit: int = 15) -> list[dict]:
-    """从团队标准 HARA 工作簿「整车安全目标」表右区读取合并后的整车安全目标（尽力而为）。
+def _run_renderer_summary(
+    skill_cfg: dict, structured: dict, artifact_path: Path
+) -> str:
+    """调用渲染器可选的 summary_entrypoint，返回技能自定义的附加 markdown 段落。
 
-    新模板布局：R1 分组表头 / R2 列名，数据从 R3 起。
-    右区 F 整车安全目标ID / G ASIL / H 整车安全目标 / I 安全状态 / J FTTI / K 备注。
+    入口签名 summarize(in_json_path, artifact_path) -> str；未声明/失败均返回 ""。
+    业务专属摘要（如安全目标清单）由此落在技能脚本里，引擎不内置任何业务格式。
     """
-    try:
-        import openpyxl
+    renderer_cfg = (skill_cfg.get("output") or {}).get("renderer") or {}
+    entrypoint = renderer_cfg.get("summary_entrypoint")
+    if not entrypoint or not isinstance(structured, dict):
+        return ""
+    script_rel = renderer_cfg.get("script")
+    if not script_rel:
+        return ""
 
-        wb = openpyxl.load_workbook(artifact_path, read_only=True, data_only=False)
-        if "整车安全目标" not in wb.sheetnames:
-            return []
-        ws = wb["整车安全目标"]
-        goals: list[dict] = []
-        for row in ws.iter_rows(min_row=3, values_only=True):
-            vh_id = row[5] if len(row) > 5 else None  # F 列
-            if not vh_id or not str(vh_id).strip():
-                continue
-            goals.append({
-                "sg_id": vh_id,
-                "asil": row[6] if len(row) > 6 else "",   # G 列
-                "goal": row[7] if len(row) > 7 else "",   # H 列
-            })
-        wb.close()
-        rank = {"D": 4, "C": 3, "B": 2, "A": 1, "QM": 0}
-        goals.sort(key=lambda g: rank.get(str(g["asil"]).strip(), -1), reverse=True)
-        return goals[:limit]
-    except Exception:
-        return []
+    import tempfile
+
+    base = _skill_base_dir(skill_cfg)
+    script_path = (base / str(script_rel)).resolve()
+    module = _renderer_cache.get(str(script_path))
+    if module is None:  # 理论上 generate 刚加载过，防御性补加载
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            f"skill_renderer_{skill_cfg.get('name')}_{script_path.stem}", script_path
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _renderer_cache[str(script_path)] = module
+    fn = getattr(module, entrypoint, None)
+    if not callable(fn):
+        logger.warning(
+            "[capability_registry] 渲染器 %s 不存在摘要入口 %r，跳过附加摘要",
+            script_path, entrypoint,
+        )
+        return ""
+
+    tmp_in = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        ) as f:
+            json.dump(structured, f, ensure_ascii=False, indent=2)
+            tmp_in = f.name
+        md = fn(tmp_in, str(artifact_path))
+        return str(md or "").strip()
+    except Exception as exc:  # noqa: BLE001 —— 摘要失败不影响交付
+        logger.warning("[capability_registry] 渲染器摘要生成失败：%s", exc)
+        return ""
+    finally:
+        if tmp_in:
+            try:
+                Path(tmp_in).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+# ════════════════════════════════════════════════════════════════
+# 技能前置钩子（execution.prepare）：与 output.renderer 对称的技能侧插件
+# 技能自定义的识别/检索/前置加工放在技能目录 scripts/ 下，引擎不内置业务逻辑。
+# ════════════════════════════════════════════════════════════════
+
+@dataclass
+class PrepareContext:
+    """prepare 钩子运行上下文（稳定契约：只增字段、不改既有字段语义）。
+
+    数据：skill_cfg/inputs/rendered/doc_raw/doc_block/runnable_config；
+    能力：模型构造、阶段提示装配、json 阶段调用、token 计量、知识库检索/格式化。
+    """
+
+    skill_cfg: dict
+    inputs: dict[str, Any]
+    rendered: str
+    doc_raw: str
+    doc_block: str
+    runnable_config: Any
+    logger: logging.Logger
+    bind_json_model: Callable[[Any], Any]
+    build_stage_prompt: Callable[[Any], str]
+    invoke_json_stage: Callable[..., Any]
+    extract_usage: Callable[[Any], dict]
+    retrieve_knowledge: Callable[..., list]
+    format_knowledge_layered_block: Callable[..., str]
+
+
+_prepare_cache: dict[str, Any] = {}
+
+
+def _run_prepare_hook(ctx: PrepareContext) -> dict | None:
+    """加载并执行技能声明的 execution.prepare 脚本；未声明返回 None。
+
+    约定入口 prepare(ctx) -> dict，引擎只解释约定键 kb_block/usage，
+    其余键透传忽略；异常由调用方捕获软降级。
+    """
+    prepare_cfg = (ctx.skill_cfg.get("execution") or {}).get("prepare") or {}
+    script_rel = prepare_cfg.get("script")
+    if not script_rel:
+        return None
+
+    import importlib.util
+
+    base = _skill_base_dir(ctx.skill_cfg)
+    script_path = (base / str(script_rel)).resolve()
+    if not script_path.is_file():
+        raise FileNotFoundError(f"prepare 脚本不存在：{script_path}")
+    entrypoint = prepare_cfg.get("entrypoint", "prepare")
+
+    module = _prepare_cache.get(str(script_path))
+    if module is None:
+        spec = importlib.util.spec_from_file_location(
+            f"skill_prepare_{ctx.skill_cfg.get('name')}_{script_path.stem}", script_path
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _prepare_cache[str(script_path)] = module
+    fn = getattr(module, entrypoint, None)
+    if not callable(fn):
+        raise AttributeError(f"prepare 脚本 {script_path} 不存在入口 {entrypoint!r}")
+
+    result = fn(ctx)
+    return result if isinstance(result, dict) else {}
 
 
 def _format_artifact_summary(
-    skill_cfg: dict, meta: Any, stats: dict, artifact_path: Path | None
+    skill_cfg: dict,
+    meta: Any,
+    stats: dict,
+    artifact_path: Path | None,
+    structured: dict | list | None = None,
 ) -> str:
-    """把渲染产物组织成面向用户的中文摘要（替代裸 JSON 输出）。"""
+    """把渲染产物组织成面向用户的中文摘要（替代裸 JSON 输出）。
+
+    完全由技能契约驱动，不含任何业务专属格式：
+      - 统计标签：output.renderer.stat_labels（{stats 键: 中文标签}，按声明顺序）；
+      - 附加段落：渲染器 output.renderer.summary_entrypoint（技能脚本生成）；
+      - 尾注：output.summary_footer。
+    """
+    output_cfg = skill_cfg.get("output", {}) or {}
+    renderer_cfg = output_cfg.get("renderer") or {}
     name = skill_cfg.get("display_name") or skill_cfg.get("name")
     lines = [
         f"## {name}已完成",
@@ -779,43 +884,23 @@ def _format_artifact_summary(
         f"下载方式：`GET /api/v1/agent/files/{meta.file_id}/download`（需携带 API Key）",
         "",
     ]
-    if stats:
-        stat_labels = {
-            "functions": "整车功能数",
-            "sc_malfunctions": "安全关键失效条目",
-            "hara_events": "HARA 危害事件数",
-            "events_qm": "QM 事件",
-            "events_asil": "ASIL≥A 显著事件",
-            "safety_goals_vh": "整车安全目标数（合并后）",
-            "reused": "沿用历史条目",
-            "adapted": "改编历史条目",
-            "new": "新增条目",
-        }
+    stat_labels = renderer_cfg.get("stat_labels") or {}
+    if stats and isinstance(stat_labels, dict):
         lines.append("**工作簿统计**：")
         for key, label in stat_labels.items():
             if key in stats:
                 lines.append(f"- {label}：{stats[key]}")
         lines.append("")
 
-    if skill_cfg.get("name") == "hazard_analysis" and artifact_path is not None:
-        goals = _extract_safety_goals(artifact_path)
-        if goals:
-            lines.append(f"**整车安全目标清单（按最高 ASIL 排序，前 {len(goals)} 条，全量见工作簿）**：")
-            lines.append("")
-            lines.append("| 整车安全目标 ID | ASIL | 安全目标 |")
-            lines.append("|---|---|---|")
-            for g in goals:
-                goal_text = str(g["goal"]).replace("|", "／").replace("\n", " ")
-                lines.append(f"| {g['sg_id']} | {g['asil']} | {goal_text} |")
+    if artifact_path is not None and isinstance(structured, dict):
+        extra = _run_renderer_summary(skill_cfg, structured, artifact_path)
+        if extra:
+            lines.append(extra)
             lines.append("")
 
-    lines.append(
-        "> 工作簿为团队标准 11-Sheet 模板：版本管理、命名规则、相关项功能清单、"
-        "失效模式（11 个标准失效词）、HAZOP 分析、HARA 分析（逐场景 S/E/C 评级，"
-        "ASIL 按 ISO 26262 矩阵确定性反算）、整车安全目标（同文本目标自动合并取最高 ASIL）、"
-        "参考场景与 S/E/C/ASIL 评定参考。历史沿用情况见各 sheet 备注列；"
-        "所有 S/E/C 评级均为建议值，请逐条复核理由列后由责任人签署确认。"
-    )
+    footer = str(output_cfg.get("summary_footer") or "").strip()
+    if footer:
+        lines.append(footer)
     return "\n".join(lines)
 
 
@@ -949,13 +1034,15 @@ def _execute_skill_core(
                 "format": meta.ext.lstrip("."),
                 "size": meta.size,
             }]
-            result.text = _format_artifact_summary(skill_cfg, meta, stats, artifact_path)
+            result.text = _format_artifact_summary(
+                skill_cfg, meta, stats, artifact_path, structured
+            )
 
     return result
 
 
 # ════════════════════════════════════════════════════════════════
-# 5A2. map_reduce 执行（识别层 + 规划层 + 切片并发评级，供长输出技能使用）
+# 5A2. map_reduce 执行（可选 prepare 钩子 + 规划层 + 切片并发评级，供长输出技能使用）
 # ════════════════════════════════════════════════════════════════
 
 def _build_stage_system_prompt(skill_cfg: dict, stage_cfg: Any) -> str:
@@ -967,7 +1054,7 @@ def _build_stage_system_prompt(skill_cfg: dict, stage_cfg: Any) -> str:
 
     references 可覆盖本阶段加载的参考文档：
       - 未声明：加载技能全部 reference_files（默认，plan/map 用）；
-      - 声明为列表：只加载列出的文件（identify 阶段只需域前缀表）；
+      - 声明为列表：只加载列出的文件（前置阶段只需部分参考文档时）；
       - 空列表：不加载参考文档。
     """
     from agents.generate_agent import _resolve_system_prompt
@@ -1046,133 +1133,6 @@ def _invoke_json_stage(
     return parsed, response
 
 
-# ── Stage 0（identify）：先识别整车功能，再按功能精准检索历史知识库 ──
-
-_IDENTIFY_MAX_FUNCTIONS = 10
-
-
-def _run_identify_stage(
-    skill_cfg: dict,
-    identify_cfg: dict,
-    bind_json_model: Callable[[Any], Any],
-    *,
-    rendered: str,
-    doc_block: str,
-    runnable_config: Any,
-) -> tuple[dict[str, Any], Any]:
-    """识别层：只从相关项信息中识别 item 基本信息与整车功能名称清单。
-
-    本阶段不注入知识库、不做安全分析，输出用于驱动功能级精准检索。
-    返回 (identify_info, raw_response)；functions 为空时抛异常由调用方降级。
-    """
-    system_prompt = _build_stage_system_prompt(skill_cfg, identify_cfg)
-    user_message = (
-        rendered
-        + doc_block
-        + "\n\n本阶段只做识别：列出相关项基本信息与【整车层级功能】名称清单，"
-        "不做失效/危害/评级分析；严格只输出约定的紧凑 JSON 对象，不要输出解释。"
-    )
-    max_tokens = identify_cfg.get("max_tokens")
-    parsed, response = _invoke_json_stage(
-        bind_json_model(max_tokens),
-        system_prompt,
-        user_message,
-        stage_name="识别层",
-        max_tokens=max_tokens,
-        runnable_config=runnable_config,
-    )
-    item = parsed.get("item")
-    item = item if isinstance(item, dict) else {}
-    functions: list[str] = []
-    for fn in parsed.get("functions") or []:
-        if isinstance(fn, str):
-            name = fn.strip()
-        elif isinstance(fn, dict):
-            name = str(fn.get("vehicle_function") or fn.get("name") or "").strip()
-        else:
-            name = ""
-        if name and name not in functions:
-            functions.append(name)
-    if not functions:
-        raise ValueError("识别层输出 functions 为空，无法做功能级检索")
-    info = {
-        "item_name": str(item.get("name") or "").strip(),
-        "abbr": str(item.get("abbr") or "").strip(),
-        "domain_prefix": str(item.get("domain_prefix") or "").strip(),
-        "functions": functions[:_IDENTIFY_MAX_FUNCTIONS],
-    }
-    logger.info(
-        "[capability_registry] 识别层结果：item=%s（%s/%s），整车功能 %d 个：%s",
-        info["item_name"], info["abbr"], info["domain_prefix"],
-        len(info["functions"]), info["functions"],
-    )
-    return info, response
-
-
-def _targeted_layered_retrieval(
-    skill_cfg: dict, identify_info: dict[str, Any]
-) -> str:
-    """按识别出的每个整车功能做两轮精准检索，合并去重后四层分组。
-
-    每功能：
-      q1 = "<相关项名> <整车功能名>"  综合召回（功能清单/HARA事件/安全目标）
-      q2 = "<整车功能名> 失效模式"    专项召回 failure_mode 层
-    """
-    from core.kb_client import format_knowledge_layered_block, retrieve_knowledge
-
-    kb_cfg = skill_cfg.get("knowledge") or {}
-    domain = str(kb_cfg.get("domain") or "").strip()
-    if not domain:
-        return ""
-    default_layers = ["function_list", "failure_mode", "hara_event", "safety_goal"]
-    layers = [str(x) for x in (kb_cfg.get("layers") or default_layers)]
-    func_top_k = int(kb_cfg.get("identify_func_top_k", 10) or 10)
-    fm_top_k = int(kb_cfg.get("identify_fm_top_k", 8) or 8)
-    threshold = kb_cfg.get("score_threshold")
-    item_name = identify_info.get("item_name") or ""
-
-    seen: set[str] = set()
-    merged: list[dict[str, Any]] = []
-
-    def _ingest(chunks: Any) -> None:
-        if not isinstance(chunks, list):
-            return
-        for c in chunks:
-            if not isinstance(c, dict):
-                continue
-            content = str(c.get("content") or "")
-            key = str(c.get("id") or c.get("chunk_id") or "").strip() or (
-                content[:120] + f"#{len(content)}"
-            )
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(c)
-
-    for fname in identify_info["functions"]:
-        base_query = f"{item_name} {fname}".strip()
-        _ingest(retrieve_knowledge(
-            domain, base_query,
-            top_k=func_top_k, score_threshold=threshold,
-        ))
-        _ingest(retrieve_knowledge(
-            domain, f"{fname} 失效模式",
-            top_k=fm_top_k, score_threshold=threshold, layer="failure_mode",
-        ))
-
-    layer_counts: dict[str, int] = {}
-    for c in merged:
-        ln = str((c.get("meta") or {}).get("layer") or "未标注")
-        layer_counts[ln] = layer_counts.get(ln, 0) + 1
-    logger.info(
-        "[capability_registry] 功能级精准检索：%d 个功能 ×2 轮，去重后 %d 块，层分布=%s",
-        len(identify_info["functions"]), len(merged), layer_counts,
-    )
-    if not merged:
-        return ""
-    return format_knowledge_layered_block(merged, layers, domain)
-
-
 def _execute_staged_skill(
     skill_cfg: dict,
     agent_cfg: dict,
@@ -1181,16 +1141,15 @@ def _execute_staged_skill(
     reference_data: dict[str, Any] | None = None,
     runnable_config: Any = None,
 ) -> SkillResult:
-    """map_reduce 执行内核（identify 识别 → plan 规划 → map 并发评级）。
+    """map_reduce 执行内核（可选 prepare 钩子 → plan 规划 → map 并发评级）。
 
     契约（技能 YAML）：
         execution:
           mode: map_reduce
-          identify:                      # 可选 Stage 0：识别整车功能→精准检索
-            enabled: true
-            system_prompt: {file: ...}
-            references: [...]           # 阶段级参考文档覆盖
-            max_tokens: 4096
+          prepare:                      # 可选技能侧前置钩子（识别/自定义检索等）
+            script: scripts/xxx.py
+            entrypoint: prepare
+            # 其余键由钩子脚本自行解释（如 identify 提示词/top_k），引擎不读取
           plan: {system_prompt: {file: ...}, max_tokens: 32768}
           map:
             system_prompt: {file: ...}
@@ -1206,8 +1165,9 @@ def _execute_staged_skill(
           map_top_k: 8
 
     流程：
+      0. prepare 钩子（可选，技能脚本）：技能自定义识别/检索，返回规划层知识块；
+         钩子缺失/异常/空结果时软降级为四层分组大召回；
       1. 规划层（1 次调用）：item/功能/失效矩阵/HAZOP 条目（含充分场景清单）；
-         知识注入为四层分组大召回；
       2. 评级层（按 slice_path 切片，ThreadPoolExecutor 并发）：每切片独立
          小召回历史 hara_event → 逐条事件 S/E/C 评级；单片失败自动重试 1 次；
       3. 评级事件挂回对应切片 → 合并为完整 JSON → schema 校验 → 渲染器出文件。
@@ -1256,39 +1216,53 @@ def _execute_staged_skill(
             bind_kwargs["max_tokens"] = max_tokens
         return base_llm.bind(**bind_kwargs)
 
-    # ── 阶段 0（可选）：识别相关项与整车功能 → 按功能精准检索历史知识库 ──
-    identify_cfg = exec_cfg.get("identify") or {}
+    # ── Stage 0（可选）：技能侧 prepare 钩子（识别/自定义检索等业务逻辑） ──
+    prepare_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    prepare_invoked = False
     plan_kb_block = ""
-    identify_info: dict[str, Any] | None = None
-    identify_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-    if identify_cfg.get("enabled"):
+    prepare_ctx: PrepareContext | None = None
+    if (exec_cfg.get("prepare") or {}).get("script"):
+        from core.kb_client import format_knowledge_layered_block, retrieve_knowledge
+
+        prepare_ctx = PrepareContext(
+            skill_cfg=skill_cfg,
+            inputs=inputs,
+            rendered=rendered,
+            doc_raw=doc_raw,
+            doc_block=doc_block,
+            runnable_config=runnable_config,
+            logger=logger,
+            bind_json_model=_bind_json_model,
+            build_stage_prompt=lambda stage_cfg: _build_stage_system_prompt(skill_cfg, stage_cfg),
+            invoke_json_stage=_invoke_json_stage,
+            extract_usage=_extract_usage,
+            retrieve_knowledge=retrieve_knowledge,
+            format_knowledge_layered_block=format_knowledge_layered_block,
+        )
         try:
-            identify_info, identify_response = _run_identify_stage(
-                skill_cfg,
-                identify_cfg,
-                _bind_json_model,
-                rendered=rendered,
-                doc_block=doc_block,
-                runnable_config=runnable_config,
-            )
-            identify_usage = _extract_usage(identify_response)
-            plan_kb_block = _targeted_layered_retrieval(skill_cfg, identify_info)
+            hook_result = _run_prepare_hook(prepare_ctx) or {}
+            prepare_invoked = True
+            plan_kb_block = str(hook_result.get("kb_block") or "")
+            hook_usage = hook_result.get("usage") or {}
+            if isinstance(hook_usage, dict):
+                for k in prepare_usage:
+                    prepare_usage[k] = int(hook_usage.get(k, 0) or 0)
             logger.info(
-                "[capability_registry] 识别层精准检索注入：%d 字符；识别功能=%s",
-                len(plan_kb_block), identify_info.get("functions"),
+                "[capability_registry] prepare 钩子知识注入：%d 字符", len(plan_kb_block),
             )
-        except Exception as exc:  # noqa: BLE001 —— 识别层失败必须软降级，不阻断主流程
+        except Exception as exc:  # noqa: BLE001 —— 前置钩子失败必须软降级，不阻断主流程
             logger.warning(
-                "[capability_registry] 识别层/精准检索失败，回退粗召回：%s", exc
+                "[capability_registry] prepare 钩子失败，回退粗召回：%s", exc
             )
 
-    # 回退：未启用识别层 / 识别失败 / 精准检索零命中 → item_definition 或文档头部粗召回
+    # 回退：无钩子 / 钩子异常 / 零命中 → item_definition 或文档头部粗召回
     if not plan_kb_block:
         plan_kb_block = _resolve_layered_knowledge_block(
             skill_cfg, inputs, fallback_query=doc_query
         )
         logger.info(
-            "[capability_registry] 规划层知识注入（粗召回回退）：%d 字符",
+            "[capability_registry] 规划层知识注入（粗召回%s）：%d 字符",
+            "回退" if prepare_invoked else "",
             len(plan_kb_block),
         )
 
@@ -1309,14 +1283,15 @@ def _execute_staged_skill(
     slices = plan_parsed.get(slice_path)
     if not isinstance(slices, list) or not slices:
         raise ValueError(
-            f"规划层输出缺少非空列表 {slice_path!r}，无法进入评级阶段；"
-            "请检查相关项描述是否包含可分析的整车功能与安全关键失效。"
+            f"规划层输出缺少非空列表 {slice_path!r}，无法进入并发处理阶段；"
+            "请检查输入描述是否包含可分析的功能单元与充分的切片内容。"
         )
     funcs = plan_parsed.get("functions") or []
     matrix = plan_parsed.get("malfunction_matrix") or []
     logger.info(
-        "[capability_registry] 规划层结果：%d 功能 / %d 失效矩阵行 / %d HAZOP 条目",
-        len(funcs), len(matrix), len(slices),
+        "[capability_registry] 规划层结果：%d 个待处理切片（%s）；"
+        "functions=%d，malfunction_matrix=%d",
+        len(slices), slice_path, len(funcs), len(matrix),
     )
 
     # ── 阶段 2：逐切片并发评级（单片失败重试 1 次） ──
@@ -1435,13 +1410,13 @@ def _execute_staged_skill(
 
     plan_usage = _extract_usage(plan_response)
     total_usage = {
-        "prompt_tokens": identify_usage.get("prompt_tokens", 0)
+        "prompt_tokens": prepare_usage.get("prompt_tokens", 0)
         + plan_usage.get("prompt_tokens", 0) + map_usage_sum["prompt_tokens"],
-        "completion_tokens": identify_usage.get("completion_tokens", 0)
+        "completion_tokens": prepare_usage.get("completion_tokens", 0)
         + plan_usage.get("completion_tokens", 0) + map_usage_sum["completion_tokens"],
-        "total_tokens": identify_usage.get("total_tokens", 0)
+        "total_tokens": prepare_usage.get("total_tokens", 0)
         + plan_usage.get("total_tokens", 0) + map_usage_sum["total_tokens"],
-        "stage_identify_calls": 1 if identify_info is not None else 0,
+        "stage_prepare_calls": 1 if prepare_invoked else 0,
         "stage_plan_calls": 1,
         "stage_map_calls": len(slices),
     }
@@ -1462,7 +1437,7 @@ def _execute_staged_skill(
                 "size": artifact_meta.size,
             }]
             result.text = _format_artifact_summary(
-                skill_cfg, artifact_meta, stats, artifact_path
+                skill_cfg, artifact_meta, stats, artifact_path, structured
             )
     return result
 
