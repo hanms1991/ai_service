@@ -86,15 +86,30 @@ execution:
     events_key: events
     max_workers: 3
     max_tokens: 16384
+    # 每切片历史事件检索钩子（复用 prepare.script 同模块，默认入口 retrieve_map）：
+    # 按「整车功能+失效词」锚定多路并集召回该失效全部历史 HARA 事件；
+    # 钩子异常/未声明时引擎回退通用单路检索（knowledge.map_layer/map_top_k）。
+    retrieve_entrypoint: retrieve_map
+    query_fields: [word, malfunction_behavior, vehicle_hazard]
+    user_instruction: >-
+      以下是一个「功能失效单元」，其中 scenarios 给出该失效需要分析的场景清单。
+      请按系统提示词的「场景并集」规则处理：先对清单中每个场景输出一条 HARA 事件，
+      再把历史参考中同功能同失效、清单缺失的历史事件补录为 reused 事件，
+      实质相同场景去重；只输出 JSON 对象。
 
 # ────────────────────────────────────────────────────────────────────
 # 知识库注入（auto-kb 历史项目参考，服务地址见 agents/configs/knowledge.yaml；
 # base_url 留空或服务不可达时自动跳过，不阻断执行）：
-#   prepare 钩子（hara_prepare.py）：按识别出的每个整车功能做 2 轮检索——
+#   prepare 钩子（hara_prepare.py）：按识别出的每个整车功能——
 #     q1「相关项名+功能名」综合召回 identify_func_top_k；
 #     q2「功能名 失效模式」专项召回 failure_mode 层 identify_fm_top_k；
+#     q3+ 以 q2 命中的每个历史失效为单位，按 map_event_facets 多路并集召回
+#         其全部历史 HARA 事件（prepare_event_recall=false 可关闭），
+#         供规划层以历史场景为骨架枚举，保证场景逐条对齐；
 #   回退粗召回：一次大召回（plan_top_k），按 meta.layer 四层分组注入；
-#   评级层：每切片按失效词/异常表现/整车危害小召回 hara_event 层（map_top_k）。
+#   评级层：retrieve_map 钩子对每切片按「功能+失效词」锚定多路并集召回
+#     hara_event 层（服务端单次硬上限 20 块，故多路；每路 map_event_top_k，
+#     去重后封顶 map_event_cap）；钩子未启用时退化为单路 map_top_k。
 # 历史 HARA xlsx 导入 auto-kb 时须按这四层标注 meta.layer。
 # ────────────────────────────────────────────────────────────────────
 knowledge:
@@ -103,11 +118,28 @@ knowledge:
   top_k: 5
   score_threshold: 0.3
   identify_func_top_k: 10
-  identify_fm_top_k: 8
+  identify_fm_top_k: 10
+  prepare_event_recall: true
   plan_top_k: 40
   layers: [function_list, failure_mode, hara_event, safety_goal]
   map_layer: hara_event
   map_top_k: 8
+  map_event_top_k: 20
+  map_event_cap: 45
+  retrieve_workers: 8
+  # 规划层分层注入篇幅上限（kb_client 默认仅 2 万字，装不下全量历史事件；
+  # 约 6 万字≈3 万 token，为多功能全量事件+文档+输出预留 128k 上下文）
+  layered_block_max_chars: 120000
+  layered_chunk_max_chars: 1200
+  # 场景面：每切片在锚定/长描述两路之外，按这些场景切面补召回（覆盖面用）
+  map_event_facets:
+    - "高速 直行 道路 行驶"
+    - "低速 转弯 泊车 停车位"
+    - "弯道 变道 超车"
+    - "湿滑 路面 附着"
+    - "行人 车辆 碰撞 追尾"
+    - "静止 停车 无事故 原地"
+    - "颠簸 减速带 紧急避让"
 
 # ────────────────────────────────────────────────────────────────────
 # 方法论参考（reference_files 由平台拼接在各阶段 system_prompt 之后）
@@ -206,9 +238,10 @@ output:
                   event_description: {type: string}
                   S: {type: integer}
                   s_reason: {type: string}
-                  E: {type: integer}
+                  # 经验做法：S=0 时 E/C 不评估输出 null；S>0 且 E=0 时 C 输出 null
+                  E: {type: [integer, "null"]}
                   e_reason: {type: string}
-                  C: {type: integer}
+                  C: {type: [integer, "null"]}
                   c_basis: {type: string}
                   c_reason: {type: string}
                   sg_text: {type: string}

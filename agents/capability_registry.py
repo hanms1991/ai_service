@@ -824,6 +824,27 @@ class PrepareContext:
 _prepare_cache: dict[str, Any] = {}
 
 
+def _load_skill_script_module(skill_cfg: dict, script_rel: str,
+                              cache: dict[str, Any], prefix: str):
+    """importlib 按技能目录动态加载脚本（带缓存）；脚本不存在抛异常。"""
+    import importlib.util
+
+    base = _skill_base_dir(skill_cfg)
+    script_path = (base / str(script_rel)).resolve()
+    if not script_path.is_file():
+        raise FileNotFoundError(f"技能脚本不存在：{script_path}")
+
+    module = cache.get(str(script_path))
+    if module is None:
+        spec = importlib.util.spec_from_file_location(
+            f"{prefix}_{skill_cfg.get('name')}_{script_path.stem}", script_path
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        cache[str(script_path)] = module
+    return module
+
+
 def _run_prepare_hook(ctx: PrepareContext) -> dict | None:
     """加载并执行技能声明的 execution.prepare 脚本；未声明返回 None。
 
@@ -835,28 +856,63 @@ def _run_prepare_hook(ctx: PrepareContext) -> dict | None:
     if not script_rel:
         return None
 
-    import importlib.util
-
-    base = _skill_base_dir(ctx.skill_cfg)
-    script_path = (base / str(script_rel)).resolve()
-    if not script_path.is_file():
-        raise FileNotFoundError(f"prepare 脚本不存在：{script_path}")
+    module = _load_skill_script_module(
+        ctx.skill_cfg, script_rel, _prepare_cache, "skill_prepare"
+    )
     entrypoint = prepare_cfg.get("entrypoint", "prepare")
-
-    module = _prepare_cache.get(str(script_path))
-    if module is None:
-        spec = importlib.util.spec_from_file_location(
-            f"skill_prepare_{ctx.skill_cfg.get('name')}_{script_path.stem}", script_path
-        )
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        _prepare_cache[str(script_path)] = module
     fn = getattr(module, entrypoint, None)
     if not callable(fn):
-        raise AttributeError(f"prepare 脚本 {script_path} 不存在入口 {entrypoint!r}")
+        raise AttributeError(f"prepare 脚本 {script_rel} 不存在入口 {entrypoint!r}")
 
     result = fn(ctx)
     return result if isinstance(result, dict) else {}
+
+
+@dataclass
+class MapSliceContext:
+    """map_reduce 每切片检索钩子上下文（稳定契约：只增字段）。
+
+    数据：skill_cfg/index（0 基切片序号）/unit（当前切片 dict）/plan_parsed/
+          inputs/runnable_config；
+    能力：retrieve_knowledge（domain, query, top_k, score_threshold, layer）。
+    钩子 retrieve_entrypoint(ctx) -> list[分块]；空列表表示零命中；
+    抛异常时引擎软降级为通用单路检索。
+    """
+
+    skill_cfg: dict
+    index: int
+    unit: dict
+    plan_parsed: dict
+    inputs: dict[str, Any]
+    runnable_config: Any
+    logger: logging.Logger
+    retrieve_knowledge: Callable[..., list]
+
+
+def _run_map_retrieve_hook(ctx: MapSliceContext) -> list | None:
+    """加载执行 execution.map 声明的每切片检索钩子；未声明返回 None。
+
+    脚本默认复用 execution.prepare.script，可用 map.retrieve_script 覆盖；
+    入口由 map.retrieve_entrypoint 指定（默认 retrieve_map）。
+    """
+    exec_cfg = ctx.skill_cfg.get("execution") or {}
+    map_cfg = exec_cfg.get("map") or {}
+    entrypoint = str(map_cfg.get("retrieve_entrypoint") or "").strip()
+    script_rel = map_cfg.get("retrieve_script") or (
+        (exec_cfg.get("prepare") or {}).get("script")
+    )
+    if not entrypoint or not script_rel:
+        return None
+
+    module = _load_skill_script_module(
+        ctx.skill_cfg, script_rel, _prepare_cache, "skill_prepare"
+    )
+    fn = getattr(module, entrypoint, None)
+    if not callable(fn):
+        raise AttributeError(f"map 检索脚本 {script_rel} 不存在入口 {entrypoint!r}")
+    result = fn(ctx)
+    return result if isinstance(result, list) else []
+
 
 
 def _format_artifact_summary(
@@ -1306,48 +1362,82 @@ def _execute_staged_skill(
     domain = str(kb_cfg.get("domain") or "").strip()
     map_layer = str(kb_cfg.get("map_layer") or "").strip() or None
     map_top_k = kb_cfg.get("map_top_k")
+    query_fields = tuple(
+        map_cfg.get("query_fields")
+        or ("word", "malfunction_behavior", "vehicle_hazard")
+    )
+    user_instruction = str(map_cfg.get("user_instruction") or "").strip() or (
+        "请按系统提示词要求处理以下切片中每一个待分析项，结果项数量与输入清单一致；"
+        "只输出 JSON 对象。"
+    )
+
+    def _retrieve_slice_chunks(index: int, unit: dict) -> list:
+        """每切片历史知识召回：优先技能侧钩子；未声明/异常时回退通用单路检索。"""
+        from core.kb_client import retrieve_knowledge
+
+        hook_ctx = MapSliceContext(
+            skill_cfg=skill_cfg,
+            index=index,
+            unit=unit,
+            plan_parsed=plan_parsed,
+            inputs=inputs,
+            runnable_config=runnable_config,
+            logger=logger,
+            retrieve_knowledge=retrieve_knowledge,
+        )
+        try:
+            hook_chunks = _run_map_retrieve_hook(hook_ctx)
+        except Exception as exc:  # noqa: BLE001 —— 钩子失败软降级到通用检索
+            logger.warning(
+                "[capability_registry] 评级切片 %d 检索钩子降级为通用检索：%s",
+                index + 1, exc,
+            )
+            hook_chunks = None
+        if hook_chunks is not None:
+            return hook_chunks
+        query = " ".join(
+            str(unit.get(k) or "") for k in query_fields
+        ).strip()
+        return retrieve_knowledge(
+            domain,
+            query,
+            top_k=map_top_k,
+            score_threshold=kb_cfg.get("score_threshold"),
+            layer=map_layer,
+        )
 
     def _rate_one(index: int, unit: Any) -> tuple[int, list, dict]:
         if not isinstance(unit, dict):
             raise ValueError(f"第 {index + 1} 个评级切片不是 JSON 对象")
         unit_json = json.dumps(unit, ensure_ascii=False, indent=2)
 
-        def _attempt() -> tuple[list, dict]:
-            # 每切片按其危害关键词小召回历史 HARA 事件（软降级，失败为空）
-            map_kb_block = ""
-            if domain:
-                try:
-                    from core.kb_client import format_knowledge_block, retrieve_knowledge
+        # 历史知识每切片只召回一次，重试复用同一批分块
+        map_chunks: list = []
+        if domain:
+            try:
+                map_chunks = _retrieve_slice_chunks(index, unit)
+            except Exception as exc:  # noqa: BLE001 —— 知识注入永不阻断
+                logger.warning(
+                    "[capability_registry] 评级切片知识注入降级：%s", exc
+                )
 
-                    query = " ".join(
-                        str(unit.get(k) or "")
-                        for k in ("word", "malfunction_behavior", "vehicle_hazard")
-                    ).strip()
-                    chunks = retrieve_knowledge(
-                        domain,
-                        query,
-                        top_k=map_top_k,
-                        score_threshold=kb_cfg.get("score_threshold"),
-                        layer=map_layer,
-                    )
-                    map_kb_block = format_knowledge_block(chunks, domain)
-                    logger.info(
-                        "[capability_registry] 评级切片 %d（%s/%s）知识库命中 %d 块，注入 %d 字符",
-                        index + 1,
-                        unit.get("fid", ""),
-                        unit.get("word", ""),
-                        len(chunks),
-                        len(map_kb_block),
-                    )
-                except Exception as exc:  # noqa: BLE001 —— 知识注入永不阻断
-                    logger.warning(
-                        "[capability_registry] 评级切片知识注入降级：%s", exc
-                    )
+        def _attempt() -> tuple[list, dict]:
+            map_kb_block = ""
+            if map_chunks:
+                from core.kb_client import format_knowledge_block
+
+                map_kb_block = format_knowledge_block(map_chunks, domain)
+            logger.info(
+                "[capability_registry] 评级切片 %d（%s/%s）知识库命中 %d 块，注入 %d 字符",
+                index + 1,
+                unit.get("fid", ""),
+                unit.get("word", ""),
+                len(map_chunks),
+                len(map_kb_block),
+            )
             user_message = (
                 f"{item_header}\n\n"
-                "以下是一个「功能失效单元」，其中 scenarios 已给出该失效需要分析的"
-                "【完整场景清单】。请对清单中每一个场景输出一条 HARA 事件，"
-                "禁止遗漏、禁止自行增删场景；只输出 JSON 对象。\n\n"
+                f"{user_instruction}\n\n"
                 f"```json\n{unit_json}\n```\n"
                 + map_kb_block
                 + schema_example_block
@@ -1386,6 +1476,9 @@ def _execute_staged_skill(
                 ) from second_exc
 
     map_usage_sum = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    # 跨切片去重：同一历史事件（非空 ref_id）只允许被沿用一次，
+    # 防止规划层把一个失效拆成多片时重复沿用同一条历史事件
+    consumed_ref_ids: set[str] = set()
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
             pool.submit(_rate_one, i, unit): i
@@ -1395,7 +1488,27 @@ def _execute_staged_skill(
         for future in as_completed(futures):
             try:
                 idx, events, map_usage = future.result()
-                slices[idx][events_key] = events
+                deduped: list = []
+                dropped = 0
+                for ev in events:
+                    ref_id = ""
+                    if isinstance(ev, dict):
+                        src = ev.get("source")
+                        if isinstance(src, dict):
+                            ref_id = str(src.get("ref_id") or "").strip()
+                    if ref_id:
+                        if ref_id in consumed_ref_ids:
+                            dropped += 1
+                            continue
+                        consumed_ref_ids.add(ref_id)
+                    deduped.append(ev)
+                if dropped:
+                    logger.warning(
+                        "[capability_registry] 评级切片 %d 有 %d 条事件因历史 ref_id "
+                        "已被其他切片沿用而丢弃（疑似规划层重复切片）",
+                        idx + 1, dropped,
+                    )
+                slices[idx][events_key] = deduped
                 for k in map_usage_sum:
                     map_usage_sum[k] += int(map_usage.get(k, 0) or 0)
             except BaseException as exc:  # noqa: BLE001 —— 收集后统一抛出
@@ -1627,17 +1740,22 @@ def _lightweight_schema_check(instance: Any, schema: dict, path: str = "$") -> N
     if not isinstance(schema, dict):
         return
 
-    # type 校验
+    # type 校验（支持单类型字符串或类型数组，如 ["integer", "null"]）
     expected_type = schema.get("type")
     if expected_type:
         type_map = {
             "object": dict, "array": list, "string": str,
             "number": (int, float), "integer": int, "boolean": bool,
+            "null": type(None),
         }
-        py_type = type_map.get(expected_type)
-        if py_type and not isinstance(instance, py_type):
+        expected_types = expected_type if isinstance(expected_type, list) else [expected_type]
+        py_types = tuple(
+            t for pt in expected_types if (t := type_map.get(pt)) is not None
+        )
+        if py_types and not isinstance(instance, py_types):
             raise ValueError(
-                f"{path} 类型应为 {expected_type}，实际为 {type(instance).__name__}"
+                f"{path} 类型应为 {'/'.join(map(str, expected_types))}，"
+                f"实际为 {type(instance).__name__}"
             )
 
     # object：required + properties 递归

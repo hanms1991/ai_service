@@ -346,7 +346,14 @@ def _write_hara(wb, pfx, functions, func_info, items_by_func, event_records):
             s = _to_int(ev.get("S"))
             e = _to_int(ev.get("E"))
             c = _to_int(ev.get("C"))
-            asil = _asil_of(s, e, c) if s is not None and e is not None and c is not None else None
+            # 经验做法：S=0（无伤害可能）时 E/C 不评估；S>0 且 E=0 时 C 不评估，
+            # 两者均直接 QM（E/C 为空白不算缺项）；其余情况 S/E/C 必须齐全
+            if s == 0 or (s is not None and e == 0):
+                asil = "QM"
+            elif s is not None and e is not None and c is not None:
+                asil = _asil_of(s, e, c)
+            else:
+                asil = None
             rec["asil"] = asil or "QM"
             warnings = []
             if asil is None:

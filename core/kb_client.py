@@ -384,13 +384,19 @@ def format_knowledge_layered_block(
     chunks: list[dict[str, Any]],
     layers: list[str],
     domain: str,
+    *,
+    max_chunk_chars: int | None = None,
+    max_total_chars: int | None = None,
 ) -> str:
     """分层注入：大召回结果按 meta.layer 分段组织（供 map_reduce 规划阶段使用）。
 
     layers 给定分段顺序（如 function_list/failure_mode/hara_event/safety_goal）；
     不属于任何声明层的块归入「其他」段（若有的话，放在最后）。
     每段独立编号，便于 LLM 在条目 source 中引用「文件 + 分层 + 序号」。
+    篇幅上限可由调用方覆盖（默认 MAX_LAYER_CHUNK_CHARS / MAX_LAYER_TOTAL_CHARS）。
     """
+    chunk_cap = int(max_chunk_chars or MAX_LAYER_CHUNK_CHARS)
+    total_cap = int(max_total_chars or MAX_LAYER_TOTAL_CHARS)
     if not chunks:
         return ""
     grouped: dict[str, list[dict[str, Any]]] = {layer: [] for layer in layers}
@@ -419,7 +425,7 @@ def format_knowledge_layered_block(
             content = str(chunk.get("content") or "").strip()
             if not content:
                 continue
-            content = content[:MAX_LAYER_CHUNK_CHARS]
+            content = content[:chunk_cap]
             try:
                 score = float(chunk.get("score") or 0)
             except (TypeError, ValueError):
@@ -428,7 +434,7 @@ def format_knowledge_layered_block(
                 f"[{layer}#{kept + 1}] 来源：{_format_source(chunk)} ｜ 相似度 {score:.2f}\n"
                 + content
             )
-            if total + len(line) > MAX_LAYER_TOTAL_CHARS:
+            if total + len(line) > total_cap:
                 lines.append("（本层剩余历史条目因篇幅省略）")
                 break
             lines.append(line)
