@@ -914,6 +914,55 @@ def _run_map_retrieve_hook(ctx: MapSliceContext) -> list | None:
     return result if isinstance(result, list) else []
 
 
+@dataclass
+class MapReviewContext:
+    """map_reduce 每切片结果评审钩子上下文（稳定契约：只增字段）。
+
+    数据：skill_cfg/index（0 基切片序号）/unit（当前切片 dict）/plan_parsed/
+          events（评级层原始输出事件列表）/chunks（本切片召回的历史知识分块）/logger；
+    能力：bind_json_model / build_stage_prompt（传完整阶段配置）/
+          invoke_json_stage / extract_usage（复核 LLM 调用与 token 计量）。
+    钩子 review_entrypoint(ctx) -> {"events": [...], "usage": {...}}（list 视为仅
+    events，usage 记空）；异常由引擎捕获软降级保留原评级结果。
+    """
+
+    skill_cfg: dict
+    index: int
+    unit: dict
+    plan_parsed: dict
+    events: list
+    chunks: list
+    logger: logging.Logger
+    bind_json_model: Callable[[Any], Any]
+    build_stage_prompt: Callable[[Any], str]
+    invoke_json_stage: Callable[..., Any]
+    extract_usage: Callable[[Any], dict]
+
+
+def _run_map_review_hook(ctx: MapReviewContext) -> dict | list | None:
+    """加载执行 execution.map 声明的每切片评审钩子；未声明返回 None。
+
+    脚本默认复用 execution.prepare.script，可用 map.review_script 覆盖；
+    入口由 map.review_entrypoint 指定。
+    """
+    exec_cfg = ctx.skill_cfg.get("execution") or {}
+    map_cfg = exec_cfg.get("map") or {}
+    entrypoint = str(map_cfg.get("review_entrypoint") or "").strip()
+    script_rel = map_cfg.get("review_script") or (
+        (exec_cfg.get("prepare") or {}).get("script")
+    )
+    if not entrypoint or not script_rel:
+        return None
+
+    module = _load_skill_script_module(
+        ctx.skill_cfg, script_rel, _prepare_cache, "skill_prepare"
+    )
+    fn = getattr(module, entrypoint, None)
+    if not callable(fn):
+        raise AttributeError(f"map 评审脚本 {script_rel} 不存在入口 {entrypoint!r}")
+    return fn(ctx)
+
+
 
 def _format_artifact_summary(
     skill_cfg: dict,
@@ -1455,7 +1504,48 @@ def _execute_staged_skill(
                 raise ValueError(
                     f"评级层(切片{index + 1})输出缺少列表字段 {events_key!r}"
                 )
-            return events, _extract_usage(map_response)
+
+            # 评审钩子（技能侧复核 source 标注，疑似项回炉 LLM 二次校验）：
+            # 异常软降级保留原结果；usage 并入本切片计量
+            review_usage: dict = {}
+            if map_chunks:
+                try:
+                    review_result = _run_map_review_hook(MapReviewContext(
+                        skill_cfg=skill_cfg,
+                        index=index,
+                        unit=unit,
+                        plan_parsed=plan_parsed,
+                        events=events,
+                        chunks=map_chunks,
+                        logger=logger,
+                        bind_json_model=_bind_json_model,
+                        build_stage_prompt=lambda cfg: _build_stage_system_prompt(
+                            skill_cfg, cfg
+                        ),
+                        invoke_json_stage=_invoke_json_stage,
+                        extract_usage=_extract_usage,
+                    ))
+                except Exception as exc:  # noqa: BLE001 —— 评审失败不阻断出表
+                    logger.warning(
+                        "[capability_registry] 评级切片 %d 评审钩子降级（保留原结果）：%s",
+                        index + 1, exc,
+                    )
+                else:
+                    if isinstance(review_result, dict):
+                        if isinstance(review_result.get("events"), list):
+                            events = review_result["events"]
+                        ru = review_result.get("usage")
+                        if isinstance(ru, dict):
+                            review_usage = ru
+                    elif isinstance(review_result, list):
+                        events = review_result
+
+            usage = _extract_usage(map_response)
+            for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                usage[k] = int(usage.get(k, 0) or 0) + int(
+                    review_usage.get(k, 0) or 0
+                )
+            return events, usage
 
         try:
             events, usage = _attempt()

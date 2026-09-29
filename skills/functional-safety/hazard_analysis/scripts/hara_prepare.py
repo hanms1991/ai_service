@@ -14,10 +14,15 @@ execution.prepare.script 由引擎动态加载调用。
 2. retrieve_map(ctx) -> list[dict]   # 评级切片历史 HARA 事件多路召回（原始分块列表）
    每切片按「整车功能+失效词」锚定多路并集，尽量穷尽该失效下全部历史事件；
    引擎在未声明钩子时回退通用单路检索。
+3. review_events(ctx) -> {"events": [...], "usage": {...}}
+   # 评级结果评审钩子：代码比对全部事件 source 标注与本次召回的历史候选，
+   # 疑似项（漏标沿用/虚引历史 ID/评级与所引不一致等）回炉 LLM 二次校验后回填
 钩子内任何异常由引擎捕获并软降级，不阻断技能执行。
 """
 from __future__ import annotations
 
+import difflib
+import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -332,3 +337,224 @@ def retrieve_map(ctx) -> list[dict]:
         fid or "?", word, len(chunks),
     )
     return chunks
+
+
+# ── 评级结果评审钩子：全量复核 source 标注，疑似项回炉 LLM 二次校验 ──
+
+_REVIEW_SCENE_SIM_DEFAULT = 0.70   # 漏标沿用判定：场景相似度阈值
+_REVIEW_REF_SCENE_SIM = 0.50       # 已引用场景过低的提示阈值
+
+
+def _sec_norm(value) -> int | None:
+    """S/E/C 归一为 int|None：历史留白（空串）与输出 null 视为等价"未评估"。"""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _scene_norm(text: str) -> str:
+    return re.sub(
+        r"[\s，。、；：,.;:!？?()（）\"'“”‘’\-—]+", "", str(text or "")
+    ).lower()
+
+
+def _scene_sim(a, b) -> float:
+    na, nb = _scene_norm(a), _scene_norm(b)
+    if not na or not nb:
+        return 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def _cand_summary(meta: dict, sim: float | None = None) -> dict:
+    info = {
+        "ref_id": str(meta.get("hzrd_id") or ""),
+        "scene": str(meta.get("scene") or ""),
+        "S": _sec_norm(meta.get("S")),
+        "E": _sec_norm(meta.get("E")),
+        "C": _sec_norm(meta.get("C")),
+        "asil": str(meta.get("asil") or ""),
+    }
+    if sim is not None:
+        info["similarity"] = round(sim, 2)
+    return info
+
+
+def _review_one(ev: dict, candidates: dict[str, dict],
+                threshold: float) -> tuple[list[str], dict | None]:
+    """单事件比对：返回（疑点列表, 命中的候选历史事件摘要或 None）。"""
+    src = ev.get("source")
+    if not isinstance(src, dict):
+        return ["事件缺少 source 字段"], None
+    stype = str(src.get("type") or "").strip().lower()
+    ref = str(src.get("ref_id") or "").strip()
+
+    if stype == "new":
+        ev_s = _sec_norm(ev.get("S"))
+        if ev_s is None:
+            return [], None
+        ev_e, ev_c = _sec_norm(ev.get("E")), _sec_norm(ev.get("C"))
+        best_id, best_meta, best_sim = "", None, 0.0
+        for hid, meta in candidates.items():
+            if _sec_norm(meta.get("S")) != ev_s:
+                continue
+            if _sec_norm(meta.get("E")) != ev_e or _sec_norm(meta.get("C")) != ev_c:
+                continue
+            sim = _scene_sim(meta.get("scene"), ev.get("scenario_text"))
+            if sim > best_sim:
+                best_id, best_meta, best_sim = hid, meta, sim
+        if best_meta is not None and best_sim >= threshold:
+            his_s = _sec_norm(best_meta.get("S"))
+            his_e = _sec_norm(best_meta.get("E"))
+            his_c = _sec_norm(best_meta.get("C"))
+            issue = (
+                f"疑似漏标沿用：与历史事件 {best_id} 实质一致（场景相似度 "
+                f"{best_sim:.2f}，S/E/C 一致，历史 S{his_s}/E{his_e}/C{his_c}）。"
+                f"应改为 reused 并抄录 ref_id={best_id}；除非你能指出实质性场景差异"
+                "（碰撞对象/速度区间/附着条件等），此时应为 adapted 并在理由中说明"
+            )
+            return [issue], _cand_summary(best_meta, best_sim)
+        return [], None
+
+    if stype in ("reused", "adapted"):
+        if not ref:
+            return [
+                f"source.type={stype} 但 ref_id 为空：应补历史事件 ID；"
+                "确无匹配应改判 new"
+            ], None
+        meta = candidates.get(ref)
+        if meta is None:
+            return [
+                f"ref_id={ref} 不在本次召回的历史事件中：请核实该 ID 是否真实存在；"
+                "不存在应改用正确 ID 或改判 new（禁止编造来源）"
+            ], None
+        issues: list[str] = []
+        his_s = _sec_norm(meta.get("S"))
+        his_e = _sec_norm(meta.get("E"))
+        his_c = _sec_norm(meta.get("C"))
+        diff = [
+            label for label, his, mine in
+            (("S", his_s, _sec_norm(ev.get("S"))),
+             ("E", his_e, _sec_norm(ev.get("E"))),
+             ("C", his_c, _sec_norm(ev.get("C"))))
+            if his != mine
+        ]
+        if diff:
+            issues.append(
+                f"所引历史 {ref} 的 {'/'.join(diff)} 与你的输出不一致"
+                f"（历史 S{his_s}/E{his_e}/C{his_c}）：无实质场景差异应改回历史"
+                "评级并保持 reused；有实质差异应为 adapted 并在理由中说明"
+            )
+        sim = _scene_sim(meta.get("scene"), ev.get("scenario_text"))
+        if sim < _REVIEW_REF_SCENE_SIM:
+            scene_head = str(meta.get("scene") or "")[:40]
+            issues.append(
+                f"场景与所引历史 {ref}（「{scene_head}」）相似度仅 {sim:.2f}，"
+                "请核实引用是否正确"
+            )
+        return issues, (_cand_summary(meta, sim) if issues else None)
+
+    return [f"未知 source.type={stype!r}"], None
+
+
+def review_events(ctx) -> dict:
+    """评审钩子：代码复核本切片全部事件的 source 标注，疑似项回炉 LLM 二次校验。
+
+    代码只负责"找疑点"（漏标沿用/虚引 ID/评级与所引不一致/场景与所引不符），
+    改不改、怎么改由复核 LLM 决定；复核失败软降级保留原结果。
+    """
+    events = ctx.events if isinstance(ctx.events, list) else []
+    if not events:
+        return {"events": events, "usage": {}}
+
+    unit = ctx.unit if isinstance(ctx.unit, dict) else {}
+    fid = str(unit.get("fid") or "").strip()
+    func_name = ""
+    for fn in (ctx.plan_parsed or {}).get("functions") or []:
+        if isinstance(fn, dict) and str(fn.get("fid") or "").strip() == fid:
+            func_name = str(fn.get("vehicle_function") or "").strip()
+            break
+    word = str(unit.get("word") or "").strip()
+
+    candidates: dict[str, dict] = {}
+    for c in ctx.chunks or []:
+        if not isinstance(c, dict):
+            continue
+        meta = c.get("meta") or {}
+        hid = str(meta.get("hzrd_id") or "").strip()
+        if not hid:
+            continue
+        if func_name and str(meta.get("func") or "").strip() != func_name:
+            continue
+        if word and str(meta.get("failure_type") or "").strip() != word:
+            continue
+        candidates[hid] = meta
+    if not candidates:
+        return {"events": events, "usage": {}}
+
+    map_cfg = (ctx.skill_cfg.get("execution") or {}).get("map") or {}
+    review_cfg = map_cfg.get("review") or {}
+    threshold = float(
+        review_cfg.get("scene_sim_threshold") or _REVIEW_SCENE_SIM_DEFAULT
+    )
+
+    suspects: list[dict] = []
+    for i, ev in enumerate(events):
+        if not isinstance(ev, dict):
+            continue
+        issues, matched = _review_one(ev, candidates, threshold)
+        if issues:
+            suspects.append(
+                {"index": i, "issues": issues, "matched_history": matched}
+            )
+    ctx.logger.info(
+        "[hara_prepare] 评级评审（%s/%s）：%d 条事件，疑似标注问题 %d 条",
+        fid or "?", word, len(events), len(suspects),
+    )
+    if not suspects:
+        return {"events": events, "usage": {}}
+
+    system_prompt = ctx.build_stage_prompt(review_cfg)
+    payload = {
+        "suspects": suspects,
+        "current_events": [events[s["index"]] for s in suspects],
+    }
+    user_message = (
+        "以下事件的 source 标注经系统比对存在疑点，请按系统提示词逐条复核，"
+        "输出修正后的完整事件（index 必须与 suspects 一致）。\n"
+        + json.dumps(payload, ensure_ascii=False, indent=1)
+    )
+    max_tokens = review_cfg.get("max_tokens")
+    parsed, response = ctx.invoke_json_stage(
+        ctx.bind_json_model(max_tokens),
+        system_prompt,
+        user_message,
+        stage_name=f"评级复核(切片{ctx.index + 1})",
+        max_tokens=max_tokens,
+    )
+    usage = ctx.extract_usage(response)
+
+    fixed = parsed.get("events")
+    applied = 0
+    if isinstance(fixed, list):
+        by_index: dict[int, dict] = {}
+        for fe in fixed:
+            if isinstance(fe, dict) and isinstance(fe.get("index"), int):
+                by_index[fe["index"]] = fe
+        for s in suspects:
+            i = s["index"]
+            fe = by_index.get(i)
+            if isinstance(fe, dict):
+                merged = dict(events[i])          # 原事件兜底，防复核输出缺字段
+                for k, v in fe.items():
+                    if k != "index":
+                        merged[k] = v
+                events[i] = merged
+                applied += 1
+    ctx.logger.info(
+        "[hara_prepare] 评级复核（%s/%s）：疑似 %d 条，模型修正回填 %d 条",
+        fid or "?", word, len(suspects), applied,
+    )
+    return {"events": events, "usage": usage}
