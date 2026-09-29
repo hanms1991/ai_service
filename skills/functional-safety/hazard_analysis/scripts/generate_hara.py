@@ -53,7 +53,6 @@ _THIN = Side(style="thin", color="999999")
 _BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
 _WRAP = Alignment(horizontal="left", vertical="center", wrap_text=True)
 _WRAP_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
-_FILL_BANNER = PatternFill("solid", fgColor="D9E1F2")
 _FILL_WARN = PatternFill("solid", fgColor="FFF2CC")
 
 
@@ -262,17 +261,20 @@ def _write_malfunctions(wb, pfx, functions, func_info, matrix):
         r += 1
 
     # 词表注释已取消（覆盖关系由模型在选择理由中自行分析，不写编号注释行）。
-    # 图片统一放在数据内容下方一行，并保持原始尺寸（OneCellAnchor 必须显式给
-    # ext，否则图片会显示为极小尺寸）。
+    # 图片统一放在数据内容下方一行，显式 OneCellAnchor ext，并按原始尺寸的 70%
+    # 缩放（不显式给 ext 时图片会显示为极小尺寸）。
     img_row = r  # r 已是最后一条数据的下一行
     try:
         from openpyxl.drawing.spreadsheet_drawing import OneCellAnchor, AnchorMarker
         from openpyxl.drawing.xdr import XDRPositiveSize2D
         from openpyxl.utils.units import pixels_to_EMU
 
+        _IMG_SCALE = 0.70
         for img in getattr(ws, "_images", []):
-            cx = pixels_to_EMU(int(getattr(img, "width", 0) or 640))
-            cy = pixels_to_EMU(int(getattr(img, "height", 0) or 360))
+            w = int(getattr(img, "width", 0) or 640)
+            h = int(getattr(img, "height", 0) or 360)
+            cx = pixels_to_EMU(max(1, int(round(w * _IMG_SCALE))))
+            cy = pixels_to_EMU(max(1, int(round(h * _IMG_SCALE))))
             img.anchor = OneCellAnchor(
                 _from=AnchorMarker(col=0, colOff=0, row=img_row - 1, rowOff=0),
                 ext=XDRPositiveSize2D(cx, cy),
@@ -336,11 +338,8 @@ def _write_hara(wb, pfx, functions, func_info, items_by_func, event_records):
         func_records = [x for x in event_records if x["fid"] == fid]
         if not func_records:
             continue
-        # 功能横幅
-        ws.cell(row=r, column=1, value=f"{pfx}_func_{fseq:04d}: {fname}")
-        _merge(ws, f"A{r}:T{r}")
-        _style(ws.cell(row=r, column=1), bold=True, fill=_FILL_BANNER)
-        r += 1
+        # 不再写功能横幅合并行：连续数据行（功能名在 B 列、失效 ID 在 C 列），
+        # 以保证 Excel 自动筛选可用。
 
         for rec in func_records:
             ev = rec["event"]

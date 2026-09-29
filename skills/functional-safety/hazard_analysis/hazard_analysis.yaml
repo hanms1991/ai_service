@@ -53,13 +53,24 @@ document_source:
   file_id_input: file_id
 
 # ────────────────────────────────────────────────────────────────────
-# 执行模式：map_reduce 两阶段
+# 执行模式：map_reduce 三阶段
+#   identify（1 次，小调用）：识别相关项与整车功能清单 → 按功能精准检索历史知识库
 #   plan（1 次）：相关项/功能/失效矩阵/HAZOP 条目（含充分场景清单）
 #   map （N 次并发）：逐失效单元对完整场景清单做 S/E/C 评级，事件挂回切片
 # 切片即规划输出的 hazop_items；合并后经 schema 校验 → 确定性渲染器出 xlsx。
 # ────────────────────────────────────────────────────────────────────
 execution:
   mode: map_reduce
+  # Stage 0 识别层：先从文档识别相关项 + 整车功能名称，再按功能精准检索历史库；
+  # 识别失败/零命中时自动回退 item_definition 或文档头部粗召回，不阻断执行。
+  identify:
+    enabled: true
+    system_prompt:
+      file: stage_identify.md
+    # 识别阶段只需域前缀映射，不加载场景库/评级规则等方法论
+    references:
+      - references/domain_prefixes.md
+    max_tokens: 4096
   plan:
     system_prompt:
       file: stage_plan.md
@@ -75,7 +86,10 @@ execution:
 # ────────────────────────────────────────────────────────────────────
 # 知识库注入（auto-kb 历史项目参考，服务地址见 agents/configs/knowledge.yaml；
 # base_url 留空或服务不可达时自动跳过，不阻断执行）：
-#   规划层：一次大召回（plan_top_k），按 meta.layer 四层分组注入；
+#   识别层（默认）：按识别出的每个整车功能做 2 轮检索——
+#     q1「相关项名+功能名」综合召回 identify_func_top_k；
+#     q2「功能名 失效模式」专项召回 failure_mode 层 identify_fm_top_k；
+#   回退粗召回：一次大召回（plan_top_k），按 meta.layer 四层分组注入；
 #   评级层：每切片按失效词/异常表现/整车危害小召回 hara_event 层（map_top_k）。
 # 历史 HARA xlsx 导入 auto-kb 时须按这四层标注 meta.layer。
 # ────────────────────────────────────────────────────────────────────
@@ -84,6 +98,8 @@ knowledge:
   query_from: item_definition
   top_k: 5
   score_threshold: 0.3
+  identify_func_top_k: 10
+  identify_fm_top_k: 8
   plan_top_k: 40
   layers: [function_list, failure_mode, hara_event, safety_goal]
   map_layer: hara_event

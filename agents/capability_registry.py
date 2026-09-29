@@ -25,7 +25,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -533,12 +533,10 @@ def _build_skill_system_prompt(skill_cfg: dict, agent_cfg: dict) -> str:
     return prompt + _load_reference_texts(skill_cfg)
 
 
-def _resolve_document_block(skill_cfg: dict, inputs: dict[str, Any]) -> str:
-    """按 document_source 声明读取用户上传文档，返回追加到用户消息的只读段落。
+def _read_uploaded_document(skill_cfg: dict, inputs: dict[str, Any]) -> str:
+    """按 document_source 声明读取上传文档，返回 read_document 的原始文本。
 
-    document_source:
-        file_id_input: file_id   # inputs 中承载 file_id 的字段名
-    读取失败（文件过期/损坏）抛 SkillInputError，由 Executor 转为对话式提示。
+    无 document_source / 无 file_id 时返回空串；文件损坏/过期抛 SkillInputError。
     """
     source_cfg = skill_cfg.get("document_source") or {}
     file_id_input = source_cfg.get("file_id_input")
@@ -550,17 +548,48 @@ def _resolve_document_block(skill_cfg: dict, inputs: dict[str, Any]) -> str:
 
     from tools.read_document import read_document
 
-    content = read_document.invoke({"file_id": file_id})
+    # 内部确定性读取：禁用回调，避免在 llm_trace.log 中以 TOOL_START/END 形式
+    # 再回显一遍整份文档（该工具调用不是 LLM 决策，产物随后会注入用户消息）
+    content = read_document.invoke(
+        {"file_id": file_id}, config={"callbacks": []}
+    )
     if not isinstance(content, str) or content.startswith("[读取失败]") or content.startswith("[读取成功但内容为空]"):
         raise SkillInputError(
             f"无法读取 file_id={file_id} 对应的文档：{content[:200]}。"
             "请提示用户重新上传文档（docx/xlsx/pptx/pdf 等），或直接用文字描述相关项信息。"
         )
-    # content 已自带文件名/长度头，整体作为只读文档段落
-    return "\n\n【相关项文档（Markdown，平台从用户上传文件转换，分析以此为主要事实来源）】\n" + content
+    return content
 
 
-def _resolve_knowledge_block(skill_cfg: dict, inputs: dict[str, Any]) -> str:
+def _document_query_text(raw_content: str, limit: int = 500) -> str:
+    """从 read_document 原始文本提取用于知识库检索的查询片段。
+
+    read_document 内容首行是 "# 文档内容：<文件名>（file_id=…，提取字符数=…）"，
+    随后是分隔线与正文。检索 query 取正文（跳过头部元信息行）前 limit 字符。
+    """
+    body = raw_content
+    if body.startswith("# 文档内容"):
+        # 跳过 read_document 头部：第 1 行"# 文档内容：<文件名>"、
+        # 第 2 行"（file_id=…，类型=…，大小=…，提取字符数=…）"与分隔线
+        lines = body.split("\n")
+        kept: list[str] = []
+        for line in lines[1:]:
+            s = line.strip()
+            if not kept and (not s or s == "---" or s.startswith("（file_id=")):
+                continue
+            kept.append(line)
+        body = "\n".join(kept)
+    # 折叠连续空白与 Markdown 标记噪声
+    body = re.sub(r"\s+", " ", body).strip()
+    return body[:limit]
+
+
+def _resolve_knowledge_block(
+    skill_cfg: dict,
+    inputs: dict[str, Any],
+    *,
+    fallback_query: str = "",
+) -> str:
     """按 knowledge 声明检索 auto-kb 历史项目参考，返回追加到用户消息的只读段落。
 
     knowledge:
@@ -570,6 +599,7 @@ def _resolve_knowledge_block(skill_cfg: dict, inputs: dict[str, Any]) -> str:
         score_threshold: 0.3         # 可选
         meta_filter: {车型: X}       # 可选，文档级元数据过滤
 
+    query 解析顺序：inputs[query_from] → fallback_query（file_id-only 时的文档正文头部）。
     软降级承诺：功能未启用 / query 为空 / 服务不可达 / 任何异常 → 返回空串并记日志，
     绝不阻断技能执行；检索实现在 core/kb_client.py。
     """
@@ -581,9 +611,12 @@ def _resolve_knowledge_block(skill_cfg: dict, inputs: dict[str, Any]) -> str:
 
         domain = str(kb_cfg.get("domain") or "").strip()
         query_from = str(kb_cfg.get("query_from") or "").strip()
-        query = str(inputs.get(query_from) or "").strip() if query_from else ""
+        raw_query = str(inputs.get(query_from) or "").strip() if query_from else ""
+        if not raw_query:
+            raw_query = str(fallback_query or "").strip()
+        query = raw_query[:500] if len(raw_query) > 500 else raw_query
         if not domain or not query:
-            # 未声明 domain/query_from，或核心参数为空（如用户只上传了文档未直述）→ 跳过
+            # 未声明 domain/query_from，或核心参数与文档均为空 → 跳过
             return ""
         chunks = retrieve_knowledge(
             domain,
@@ -591,6 +624,10 @@ def _resolve_knowledge_block(skill_cfg: dict, inputs: dict[str, Any]) -> str:
             top_k=kb_cfg.get("top_k"),
             score_threshold=kb_cfg.get("score_threshold"),
             meta_filter=kb_cfg.get("meta_filter") or None,
+        )
+        logger.info(
+            "[capability_registry] 技能 %s 知识检索命中 %d 块，注入 %d 字符",
+            skill_cfg.get("name"), len(chunks),
         )
         return format_knowledge_block(chunks, domain)
     except Exception as exc:  # noqa: BLE001 —— 注入过程任何异常都不阻断技能执行
@@ -808,7 +845,7 @@ def _execute_skill_core(
     skill_cfg = validate_binding(agent_name, skill_name)
     agent_cfg = load_agent_config(agent_name)
 
-    # ── 两阶段 map_reduce 技能（规划层 1 次 + 切片并发评级 N 次 → 合并 → 渲染） ──
+    # ── map_reduce 技能（识别层 1 次 + 规划层 1 次 + 切片并发评级 N 次 → 合并 → 渲染） ──
     if (skill_cfg.get("execution") or {}).get("mode") == "map_reduce":
         return _execute_staged_skill(
             skill_cfg,
@@ -824,11 +861,18 @@ def _execute_skill_core(
         skill_cfg.get("inputs", {}),
     )
 
-    # ── 执行链前置：读取上传文档（file_id → Markdown 段落） ──
-    doc_block = _resolve_document_block(skill_cfg, inputs or {})
+    # ── 执行链前置：读取上传文档（file_id → Markdown 段落），只读一次 ──
+    doc_raw = _read_uploaded_document(skill_cfg, inputs or {})
+    doc_block = (
+        "\n\n【相关项文档（Markdown，平台从用户上传文件转换，分析以此为主要事实来源）】\n"
+        + doc_raw
+    ) if doc_raw else ""
+    doc_query = _document_query_text(doc_raw)
 
     # ── 知识注入：按 knowledge 声明检索 auto-kb 历史项目参考（软降级，失败即空串） ──
-    kb_block = _resolve_knowledge_block(skill_cfg, inputs or {})
+    kb_block = _resolve_knowledge_block(
+        skill_cfg, inputs or {}, fallback_query=doc_query
+    )
 
     # ── 外部 reference_data 注入（API 后台预取资料） ──
     ref_block = _build_reference_block(reference_data)
@@ -911,17 +955,45 @@ def _execute_skill_core(
 
 
 # ════════════════════════════════════════════════════════════════
-# 5A2. 两阶段 map_reduce 执行（规划层 + 切片并发评级，供长输出技能使用）
+# 5A2. map_reduce 执行（识别层 + 规划层 + 切片并发评级，供长输出技能使用）
 # ════════════════════════════════════════════════════════════════
 
-def _build_stage_system_prompt(skill_cfg: dict, stage_spec: Any) -> str:
-    """组装分阶段技能某一阶段的 system prompt（阶段提示 + 技能 reference_files）。"""
+def _build_stage_system_prompt(skill_cfg: dict, stage_cfg: Any) -> str:
+    """组装分阶段技能某一阶段的 system prompt（阶段提示 + 参考文档）。
+
+    入参支持两种形态：
+      - 完整阶段配置 {system_prompt: {file: ...}, references: [...]}（推荐）
+      - 裸 system_prompt 规格 {file: ...}（向后兼容）
+
+    references 可覆盖本阶段加载的参考文档：
+      - 未声明：加载技能全部 reference_files（默认，plan/map 用）；
+      - 声明为列表：只加载列出的文件（identify 阶段只需域前缀表）；
+      - 空列表：不加载参考文档。
+    """
     from agents.generate_agent import _resolve_system_prompt
 
-    return (
-        _resolve_system_prompt(stage_spec, _skill_base_dir(skill_cfg))
-        + _load_reference_texts(skill_cfg)
-    )
+    if isinstance(stage_cfg, dict) and "system_prompt" in stage_cfg:
+        prompt_spec: Any = stage_cfg.get("system_prompt")
+        refs_override: Any = stage_cfg.get("references") if "references" in stage_cfg else None
+    else:
+        prompt_spec = stage_cfg
+        refs_override = None
+
+    base_dir = _skill_base_dir(skill_cfg)
+    base_prompt = _resolve_system_prompt(prompt_spec, base_dir)
+    if refs_override is None:
+        ref_text = _load_reference_texts(skill_cfg)
+    else:
+        parts: list[str] = []
+        for rel in refs_override:
+            path = base_dir / str(rel)
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"技能 {skill_cfg.get('name')} 的阶段参考文档不存在：{path}"
+                )
+            parts.append(f"\n\n# ══ 参考文档：{path.name} ══\n" + path.read_text(encoding="utf-8"))
+        ref_text = "".join(parts)
+    return base_prompt + ref_text
 
 
 def _invoke_json_stage(
@@ -974,6 +1046,133 @@ def _invoke_json_stage(
     return parsed, response
 
 
+# ── Stage 0（identify）：先识别整车功能，再按功能精准检索历史知识库 ──
+
+_IDENTIFY_MAX_FUNCTIONS = 10
+
+
+def _run_identify_stage(
+    skill_cfg: dict,
+    identify_cfg: dict,
+    bind_json_model: Callable[[Any], Any],
+    *,
+    rendered: str,
+    doc_block: str,
+    runnable_config: Any,
+) -> tuple[dict[str, Any], Any]:
+    """识别层：只从相关项信息中识别 item 基本信息与整车功能名称清单。
+
+    本阶段不注入知识库、不做安全分析，输出用于驱动功能级精准检索。
+    返回 (identify_info, raw_response)；functions 为空时抛异常由调用方降级。
+    """
+    system_prompt = _build_stage_system_prompt(skill_cfg, identify_cfg)
+    user_message = (
+        rendered
+        + doc_block
+        + "\n\n本阶段只做识别：列出相关项基本信息与【整车层级功能】名称清单，"
+        "不做失效/危害/评级分析；严格只输出约定的紧凑 JSON 对象，不要输出解释。"
+    )
+    max_tokens = identify_cfg.get("max_tokens")
+    parsed, response = _invoke_json_stage(
+        bind_json_model(max_tokens),
+        system_prompt,
+        user_message,
+        stage_name="识别层",
+        max_tokens=max_tokens,
+        runnable_config=runnable_config,
+    )
+    item = parsed.get("item")
+    item = item if isinstance(item, dict) else {}
+    functions: list[str] = []
+    for fn in parsed.get("functions") or []:
+        if isinstance(fn, str):
+            name = fn.strip()
+        elif isinstance(fn, dict):
+            name = str(fn.get("vehicle_function") or fn.get("name") or "").strip()
+        else:
+            name = ""
+        if name and name not in functions:
+            functions.append(name)
+    if not functions:
+        raise ValueError("识别层输出 functions 为空，无法做功能级检索")
+    info = {
+        "item_name": str(item.get("name") or "").strip(),
+        "abbr": str(item.get("abbr") or "").strip(),
+        "domain_prefix": str(item.get("domain_prefix") or "").strip(),
+        "functions": functions[:_IDENTIFY_MAX_FUNCTIONS],
+    }
+    logger.info(
+        "[capability_registry] 识别层结果：item=%s（%s/%s），整车功能 %d 个：%s",
+        info["item_name"], info["abbr"], info["domain_prefix"],
+        len(info["functions"]), info["functions"],
+    )
+    return info, response
+
+
+def _targeted_layered_retrieval(
+    skill_cfg: dict, identify_info: dict[str, Any]
+) -> str:
+    """按识别出的每个整车功能做两轮精准检索，合并去重后四层分组。
+
+    每功能：
+      q1 = "<相关项名> <整车功能名>"  综合召回（功能清单/HARA事件/安全目标）
+      q2 = "<整车功能名> 失效模式"    专项召回 failure_mode 层
+    """
+    from core.kb_client import format_knowledge_layered_block, retrieve_knowledge
+
+    kb_cfg = skill_cfg.get("knowledge") or {}
+    domain = str(kb_cfg.get("domain") or "").strip()
+    if not domain:
+        return ""
+    default_layers = ["function_list", "failure_mode", "hara_event", "safety_goal"]
+    layers = [str(x) for x in (kb_cfg.get("layers") or default_layers)]
+    func_top_k = int(kb_cfg.get("identify_func_top_k", 10) or 10)
+    fm_top_k = int(kb_cfg.get("identify_fm_top_k", 8) or 8)
+    threshold = kb_cfg.get("score_threshold")
+    item_name = identify_info.get("item_name") or ""
+
+    seen: set[str] = set()
+    merged: list[dict[str, Any]] = []
+
+    def _ingest(chunks: Any) -> None:
+        if not isinstance(chunks, list):
+            return
+        for c in chunks:
+            if not isinstance(c, dict):
+                continue
+            content = str(c.get("content") or "")
+            key = str(c.get("id") or c.get("chunk_id") or "").strip() or (
+                content[:120] + f"#{len(content)}"
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(c)
+
+    for fname in identify_info["functions"]:
+        base_query = f"{item_name} {fname}".strip()
+        _ingest(retrieve_knowledge(
+            domain, base_query,
+            top_k=func_top_k, score_threshold=threshold,
+        ))
+        _ingest(retrieve_knowledge(
+            domain, f"{fname} 失效模式",
+            top_k=fm_top_k, score_threshold=threshold, layer="failure_mode",
+        ))
+
+    layer_counts: dict[str, int] = {}
+    for c in merged:
+        ln = str((c.get("meta") or {}).get("layer") or "未标注")
+        layer_counts[ln] = layer_counts.get(ln, 0) + 1
+    logger.info(
+        "[capability_registry] 功能级精准检索：%d 个功能 ×2 轮，去重后 %d 块，层分布=%s",
+        len(identify_info["functions"]), len(merged), layer_counts,
+    )
+    if not merged:
+        return ""
+    return format_knowledge_layered_block(merged, layers, domain)
+
+
 def _execute_staged_skill(
     skill_cfg: dict,
     agent_cfg: dict,
@@ -982,11 +1181,16 @@ def _execute_staged_skill(
     reference_data: dict[str, Any] | None = None,
     runnable_config: Any = None,
 ) -> SkillResult:
-    """map_reduce 两阶段执行内核。
+    """map_reduce 执行内核（identify 识别 → plan 规划 → map 并发评级）。
 
     契约（技能 YAML）：
         execution:
           mode: map_reduce
+          identify:                      # 可选 Stage 0：识别整车功能→精准检索
+            enabled: true
+            system_prompt: {file: ...}
+            references: [...]           # 阶段级参考文档覆盖
+            max_tokens: 4096
           plan: {system_prompt: {file: ...}, max_tokens: 32768}
           map:
             system_prompt: {file: ...}
@@ -1030,17 +1234,16 @@ def _execute_staged_skill(
     rendered = render_prompt_template(
         skill_cfg["prompt_template"], inputs, skill_cfg.get("inputs", {})
     )
-    doc_block = _resolve_document_block(skill_cfg, inputs)
+    # 文档只读一次：正文同时用于消息注入与（无 item_definition 时的）检索 query
+    doc_raw = _read_uploaded_document(skill_cfg, inputs)
+    doc_block = (
+        "\n\n【相关项文档（Markdown，平台从用户上传文件转换，分析以此为主要事实来源）】\n"
+        + doc_raw
+    ) if doc_raw else ""
+    doc_query = _document_query_text(doc_raw)
     ref_block = _build_reference_block(reference_data)
     schema_example_block = (
         _build_schema_example_block(skill_cfg) if output_cfg.get("format") == "json" else ""
-    )
-
-    # ── 规划层知识注入：四层分组大召回（软降级） ──
-    plan_kb_block = _resolve_layered_knowledge_block(skill_cfg, inputs)
-    logger.info(
-        "[capability_registry] 规划层知识注入：%d 字符",
-        len(plan_kb_block),
     )
 
     base_llm = _build_model_with_hint(
@@ -1053,13 +1256,47 @@ def _execute_staged_skill(
             bind_kwargs["max_tokens"] = max_tokens
         return base_llm.bind(**bind_kwargs)
 
+    # ── 阶段 0（可选）：识别相关项与整车功能 → 按功能精准检索历史知识库 ──
+    identify_cfg = exec_cfg.get("identify") or {}
+    plan_kb_block = ""
+    identify_info: dict[str, Any] | None = None
+    identify_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    if identify_cfg.get("enabled"):
+        try:
+            identify_info, identify_response = _run_identify_stage(
+                skill_cfg,
+                identify_cfg,
+                _bind_json_model,
+                rendered=rendered,
+                doc_block=doc_block,
+                runnable_config=runnable_config,
+            )
+            identify_usage = _extract_usage(identify_response)
+            plan_kb_block = _targeted_layered_retrieval(skill_cfg, identify_info)
+            logger.info(
+                "[capability_registry] 识别层精准检索注入：%d 字符；识别功能=%s",
+                len(plan_kb_block), identify_info.get("functions"),
+            )
+        except Exception as exc:  # noqa: BLE001 —— 识别层失败必须软降级，不阻断主流程
+            logger.warning(
+                "[capability_registry] 识别层/精准检索失败，回退粗召回：%s", exc
+            )
+
+    # 回退：未启用识别层 / 识别失败 / 精准检索零命中 → item_definition 或文档头部粗召回
+    if not plan_kb_block:
+        plan_kb_block = _resolve_layered_knowledge_block(
+            skill_cfg, inputs, fallback_query=doc_query
+        )
+        logger.info(
+            "[capability_registry] 规划层知识注入（粗召回回退）：%d 字符",
+            len(plan_kb_block),
+        )
+
     # ── 阶段 1：规划 ──
     plan_user_message = (
         rendered + doc_block + plan_kb_block + ref_block + schema_example_block
     )
-    plan_system_prompt = _build_stage_system_prompt(
-        skill_cfg, plan_cfg.get("system_prompt")
-    )
+    plan_system_prompt = _build_stage_system_prompt(skill_cfg, plan_cfg)
     plan_parsed, plan_response = _invoke_json_stage(
         _bind_json_model(plan_cfg.get("max_tokens")),
         plan_system_prompt,
@@ -1083,9 +1320,7 @@ def _execute_staged_skill(
     )
 
     # ── 阶段 2：逐切片并发评级（单片失败重试 1 次） ──
-    map_system_prompt = _build_stage_system_prompt(
-        skill_cfg, map_cfg.get("system_prompt")
-    )
+    map_system_prompt = _build_stage_system_prompt(skill_cfg, map_cfg)
     map_max_tokens = map_cfg.get("max_tokens")
     item_brief = plan_parsed.get("item") or {}
     item_header = (
@@ -1200,9 +1435,13 @@ def _execute_staged_skill(
 
     plan_usage = _extract_usage(plan_response)
     total_usage = {
-        "prompt_tokens": plan_usage.get("prompt_tokens", 0) + map_usage_sum["prompt_tokens"],
-        "completion_tokens": plan_usage.get("completion_tokens", 0) + map_usage_sum["completion_tokens"],
-        "total_tokens": plan_usage.get("total_tokens", 0) + map_usage_sum["total_tokens"],
+        "prompt_tokens": identify_usage.get("prompt_tokens", 0)
+        + plan_usage.get("prompt_tokens", 0) + map_usage_sum["prompt_tokens"],
+        "completion_tokens": identify_usage.get("completion_tokens", 0)
+        + plan_usage.get("completion_tokens", 0) + map_usage_sum["completion_tokens"],
+        "total_tokens": identify_usage.get("total_tokens", 0)
+        + plan_usage.get("total_tokens", 0) + map_usage_sum["total_tokens"],
+        "stage_identify_calls": 1 if identify_info is not None else 0,
         "stage_plan_calls": 1,
         "stage_map_calls": len(slices),
     }
@@ -1228,13 +1467,21 @@ def _execute_staged_skill(
     return result
 
 
-def _resolve_layered_knowledge_block(skill_cfg: dict, inputs: dict[str, Any]) -> str:
+def _resolve_layered_knowledge_block(
+    skill_cfg: dict,
+    inputs: dict[str, Any],
+    *,
+    fallback_query: str = "",
+) -> str:
     """map_reduce 规划层的知识注入：一次大召回 + 按 meta.layer 分组注入（软降级）。
 
     knowledge 扩展字段：
         plan_top_k: 40                         # 规划层大召回量
         layers: [function_list, ...]           # 分层分段顺序
     未声明 plan_top_k/layers 时回退普通单层注入。
+
+    query 解析顺序：inputs[query_from]（用户显式描述）→ fallback_query
+    （file_id-only 请求时由上传文档正文头部提供，否则 file_id 场景永远检索不到历史数据）。
     """
     kb_cfg = skill_cfg.get("knowledge") or {}
     if not isinstance(kb_cfg, dict) or not kb_cfg:
@@ -1249,6 +1496,11 @@ def _resolve_layered_knowledge_block(skill_cfg: dict, inputs: dict[str, Any]) ->
         domain = str(kb_cfg.get("domain") or "").strip()
         query_from = str(kb_cfg.get("query_from") or "").strip()
         raw_query = str(inputs.get(query_from) or "").strip() if query_from else ""
+        query_source = "item_definition"
+        if not raw_query:
+            # file_id-only：回退到上传文档正文头部
+            raw_query = str(fallback_query or "").strip()
+            query_source = "上传文档正文头部"
         # 截断 query 避免 embedding 模型输入超限导致召回质量退化
         query = raw_query[:500] if len(raw_query) > 500 else raw_query
         if not domain or not query:
@@ -1268,8 +1520,9 @@ def _resolve_layered_knowledge_block(skill_cfg: dict, inputs: dict[str, Any]) ->
             ln = str((c.get("meta") or {}).get("layer") or "未标注")
             layer_counts[ln] = layer_counts.get(ln, 0) + 1
         logger.info(
-            "[capability_registry] 规划层知识检索：query=%r（原始 %d→截断 %d 字符），"
+            "[capability_registry] 规划层知识检索（query 来源=%s）：query=%r（原始 %d→截断 %d 字符），"
             "命中 %d 块，分布 %s",
+            query_source,
             query[:80], len(raw_query), len(query), len(chunks), layer_counts,
         )
         if layers:

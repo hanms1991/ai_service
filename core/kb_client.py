@@ -43,6 +43,52 @@ try:
 except Exception:  # noqa: BLE001 —— .env 不存在/未装 python-dotenv 时退回纯环境变量
     pass
 
+# ── 检索审计日志 logs/kb_retrieval.log（append 累积，便于核查历史数据命中） ──
+_audit_logger = logging.getLogger("core.kb_client.audit")
+_audit_logger.setLevel(logging.INFO)
+_audit_logger.propagate = False
+_AUDIT_PATH = _PROJECT_ROOT / "logs" / "kb_retrieval.log"
+try:
+    _AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _audit_handler = logging.FileHandler(_AUDIT_PATH, encoding="utf-8")
+    _audit_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%Y-%m-%d %H:%M:%S"))
+    _audit_logger.addHandler(_audit_handler)
+except Exception:  # noqa: BLE001 —— 审计文件不可用时不影响主流程
+    _audit_handler = None
+
+
+def _audit_retrieval(
+    domain: str,
+    query: str,
+    *,
+    layer: str | None,
+    kb_ids: Any,
+    chunks: list[dict[str, Any]] | None,
+    note: str = "",
+) -> None:
+    """把一次检索的完整证据写入 logs/kb_retrieval.log（含每块分数/层/来源/内容头部）。"""
+    try:
+        lines = [
+            "═" * 70,
+            f"domain={domain} layer={layer or '-'} kb_ids={kb_ids} note={note}",
+            f"query({len(query)}字符)={query}",
+        ]
+        if chunks is None:
+            lines.append("结果：未检索（见 note）")
+        else:
+            lines.append(f"结果：命中 {len(chunks)} 块")
+            for i, c in enumerate(chunks, 1):
+                meta = c.get("meta") or {}
+                content = str(c.get("content") or "").replace("\n", " ")
+                lines.append(
+                    f"  #{i} score={c.get('score', '?')} layer={meta.get('layer', '-')} "
+                    f"来源={meta.get('source') or c.get('filename') or '-'}"
+                )
+                lines.append(f"      {content[:180]}")
+        _audit_logger.info("\n".join(lines))
+    except Exception:  # noqa: BLE001
+        pass
+
 # ── 注入段落大小控制（防止撑爆 LLM 上下文） ──
 MAX_CHUNK_CHARS = 800      # 单块内容最大字符数（超出截断）
 MAX_TOTAL_CHARS = 8000     # 注入段落正文总字符上限（超出丢弃后续块）
@@ -210,6 +256,8 @@ def retrieve_knowledge(
     """
     query = (query or "").strip()
     if not query:
+        _audit_retrieval(domain, query, layer=layer, kb_ids=None, chunks=None,
+                         note="query 为空，跳过")
         return []
     raw_base_url = str((load_kb_config().get("kb_service") or {}).get("base_url") or "").strip()
     base_url = _service_base_url()
@@ -219,8 +267,12 @@ def retrieve_knowledge(
             "（检查 knowledge.yaml 拼写与 .env 中对应环境变量是否设置），跳过知识检索",
             raw_base_url,
         )
+        _audit_retrieval(domain, query, layer=layer, kb_ids=None, chunks=None,
+                         note=f"base_url 无效：{raw_base_url!r}")
         return []
     if not base_url:
+        _audit_retrieval(domain, query, layer=layer, kb_ids=None, chunks=None,
+                         note="知识库未配置 base_url")
         return []
     try:
         kb_ids = resolve_kb_ids(domain)
@@ -230,6 +282,8 @@ def retrieve_knowledge(
         else:
             # 库名无法解析时不做全库检索：避免把其他领域知识误注入本技能
             logger.warning("[kb_client] 领域 %r 无可用知识库，跳过检索（query=%r）", domain, query[:50])
+            _audit_retrieval(domain, query, layer=layer, kb_ids=kb_ids, chunks=None,
+                             note="领域无可用知识库（库名映射失败）")
             return []
         if score_threshold is not None:
             body["score_threshold"] = float(score_threshold)
@@ -246,7 +300,10 @@ def retrieve_knowledge(
         chunks = resp.json()
         if not isinstance(chunks, list):
             logger.warning("[kb_client] /api/retrieve 返回非列表，忽略（domain=%s）", domain)
+            _audit_retrieval(domain, query, layer=layer, kb_ids=kb_ids, chunks=None,
+                             note="服务端返回非列表")
             return []
+        server_count = len(chunks)
         if layer:
             # 分块级 layer 客户端过滤（auto-kb 的 meta_filter 仅过滤文档级元数据）
             chunks = [
@@ -257,9 +314,16 @@ def retrieve_knowledge(
             "[kb_client] 知识检索命中 %d 块（domain=%s，layer=%s，query=%r）",
             len(chunks), domain, layer or "-", query[:50],
         )
+        _audit_retrieval(
+            domain, query, layer=layer, kb_ids=kb_ids, chunks=chunks,
+            note=f"top_k={body['top_k']} threshold={body.get('score_threshold', '-')}"
+                 + (f"，layer 过滤前 {server_count} 块" if layer else ""),
+        )
         return chunks
     except Exception as exc:  # noqa: BLE001 —— 软降级兜底，见 docstring
         logger.warning("[kb_client] 知识库检索降级（domain=%s）：%s", domain, exc)
+        _audit_retrieval(domain, query, layer=layer, kb_ids=locals().get("kb_ids"),
+                         chunks=None, note=f"检索异常：{exc}")
         return []
 
 
