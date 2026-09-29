@@ -63,6 +63,7 @@
       "word": "丢失",
       "malfunction_behavior": "行驶中转向助力突然消失，转向盘显著变沉",
       "vehicle_hazard": "转向能力下降：驾驶员需用更大力矩转向，车辆可能偏离预期行驶轨迹并与相邻车辆/障碍物碰撞",
+      "source_note": "功能异常表现与整车危害沿用《EPS_HARA_2024.xlsx》#CS_MF_0001_01；场景集在历史基础上新增静止上电工况",
       "source": {"type": "reused", "project": "EPS_HARA_2024.xlsx", "ref_id": "CS_MF_0001_01"},
       "scenarios": [
         {
@@ -114,6 +115,7 @@
       "word": "非预期",
       "malfunction_behavior": "驾驶员未转动转向盘时，系统非预期输出转向助力力矩",
       "vehicle_hazard": "非预期偏航：车辆自行转向偏离车道，可能与相邻车辆/护栏碰撞",
+      "source_note": "整车危害改编自《EPS_HARA_2024.xlsx》#CS_MF_0001_02（原表述为车道偏离）；功能异常表现与场景集本次新增",
       "source": {"type": "adapted", "project": "EPS_HARA_2024.xlsx", "ref_id": "CS_MF_0001_02"},
       "scenarios": [
         {

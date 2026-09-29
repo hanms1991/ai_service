@@ -160,6 +160,7 @@ output:
             word: {type: string}
             malfunction_behavior: {type: string}
             vehicle_hazard: {type: string}
+            source_note: {type: string}
             source: {type: object}
             scenarios:
               type: array

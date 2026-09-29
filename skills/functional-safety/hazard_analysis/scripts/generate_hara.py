@@ -70,9 +70,9 @@ def _style(cell, *, center=False, bold=False, fill=None):
 
 
 def _source_remark(src) -> str:
-    """source 对象 → 备注列文案；缺失/新增无项目 → 模板占位 '/'。"""
+    """source 对象 → 备注列文案；缺失时按新增处理。"""
     if not isinstance(src, dict):
-        return "/"
+        return "【新增】"
     kind = str(src.get("type") or "new").strip().lower()
     project = str(src.get("project") or "").strip()
     ref_id = str(src.get("ref_id") or "").strip()
@@ -80,7 +80,7 @@ def _source_remark(src) -> str:
     tail = project
     if ref_id:
         tail = f"{project}#{ref_id}" if project else ref_id
-    return f"{label}{tail}" if tail else (label if kind != "new" else "/")
+    return f"{label}{tail}" if tail else label
 
 
 def _asil_of(s: int, e: int, c: int) -> str | None:
@@ -308,7 +308,9 @@ def _write_hazop(wb, pfx, functions, func_info, items_by_func, mf_id_of_item, ev
             ws.cell(row=r, column=5, value=mf_id_of_item[id(unit)])
             ws.cell(row=r, column=6, value=unit.get("vehicle_hazard") or "")
             ws.cell(row=r, column=7, value=range_of_item.get(id(unit), ""))
-            ws.cell(row=r, column=8, value=_source_remark(unit.get("source")))
+            # H 列备注：成分级溯源说明（LLM 输出 source_note），缺失时回退条目级 source
+            ws.cell(row=r, column=8, value=(unit.get("source_note") or "").strip()
+                    or _source_remark(unit.get("source")))
             for c in range(2, 9):
                 _style(ws.cell(row=r, column=c), center=(c in (3, 5, 7)))
             r += 1
