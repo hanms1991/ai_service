@@ -79,6 +79,12 @@ execution:
     system_prompt:
       file: stage_plan.md
     max_tokens: 32768
+    # 规划后处理钩子（复用 prepare.script 同模块，入口 fix_plan_items）：
+    # reused/adapted 条目按 source.ref_id 回查知识库 failure_mode 块原文，
+    # 逐字覆盖功能异常表现/整车危害；场景清单按 history_ref 用库原文对齐、
+    # 无效引用剥离、候选漏掉的历史事件强制追加（宁多勿漏）。
+    # 纯代码不调 LLM；异常软降级保留规划层原输出。
+    postprocess_entrypoint: fix_plan_items
   map:
     system_prompt:
       file: stage_rate.md
@@ -231,6 +237,9 @@ output:
                 required: [scene_text]
                 properties:
                   scene_text: {type: string}
+                  # 历史场景骨架：来自历史事件的场景携带其事件 ID（规划后处理
+                  # 按此回查知识库原文校正 scene_text；无效引用自动剥离）
+                  history_ref: {type: string}
                   scene_refs:
                     type: array
                     items: {type: string}

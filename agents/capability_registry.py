@@ -963,6 +963,48 @@ def _run_map_review_hook(ctx: MapReviewContext) -> dict | list | None:
     return fn(ctx)
 
 
+@dataclass
+class PlanPostprocessContext:
+    """map_reduce 规划后处理钩子上下文（稳定契约：只增字段）。
+
+    数据：skill_cfg/plan_parsed（规划层完整输出，钩子可就地修改）/inputs/logger；
+    能力：retrieve_knowledge（技能侧按 ref_id 回查知识库原文）。
+    钩子 execution.plan.postprocess_entrypoint(ctx) -> dict|None：返回诊断统计
+    （引擎仅记日志）；异常由引擎捕获软降级，保留规划层原输出。
+    """
+
+    skill_cfg: dict
+    plan_parsed: dict
+    inputs: dict[str, Any]
+    logger: logging.Logger
+    retrieve_knowledge: Callable[..., list]
+
+
+def _run_plan_postprocess_hook(ctx: PlanPostprocessContext) -> dict | None:
+    """加载执行 execution.plan 声明的规划后处理钩子；未声明返回 None。
+
+    脚本默认复用 execution.prepare.script，可用 plan.postprocess_script 覆盖；
+    入口由 plan.postprocess_entrypoint 指定。钩子就地修改 plan_parsed
+    （如按 source.ref_id 用知识库原文覆盖沿用条目），返回诊断 dict。
+    """
+    exec_cfg = ctx.skill_cfg.get("execution") or {}
+    plan_cfg = exec_cfg.get("plan") or {}
+    entrypoint = str(plan_cfg.get("postprocess_entrypoint") or "").strip()
+    script_rel = plan_cfg.get("postprocess_script") or (
+        (exec_cfg.get("prepare") or {}).get("script")
+    )
+    if not entrypoint or not script_rel:
+        return None
+
+    module = _load_skill_script_module(
+        ctx.skill_cfg, script_rel, _prepare_cache, "skill_prepare"
+    )
+    fn = getattr(module, entrypoint, None)
+    if not callable(fn):
+        raise AttributeError(f"规划后处理脚本 {script_rel} 不存在入口 {entrypoint!r}")
+    result = fn(ctx)
+    return result if isinstance(result, dict) else {}
+
 
 def _format_artifact_summary(
     skill_cfg: dict,
@@ -1384,6 +1426,29 @@ def _execute_staged_skill(
         max_tokens=plan_cfg.get("max_tokens"),
         runnable_config=runnable_config,
     )
+
+    # ── 规划后处理（可选）：技能侧按 ref_id 回查知识库原文校正规划输出 ──
+    if str((plan_cfg.get("postprocess_entrypoint") or "")).strip():
+        try:
+            from core.kb_client import retrieve_knowledge as _pp_retrieve
+
+            pp_result = _run_plan_postprocess_hook(PlanPostprocessContext(
+                skill_cfg=skill_cfg,
+                plan_parsed=plan_parsed,
+                inputs=inputs,
+                logger=logger,
+                retrieve_knowledge=_pp_retrieve,
+            ))
+            if isinstance(pp_result, dict):
+                brief = {
+                    k: v for k, v in pp_result.items()
+                    if isinstance(v, (int, float, str))
+                }
+                logger.info("[capability_registry] 规划后处理完成：%s", brief)
+        except Exception as exc:  # noqa: BLE001 —— 后处理失败软降级，保留规划原输出
+            logger.warning(
+                "[capability_registry] 规划后处理钩子失败（软降级保留原输出）：%s", exc
+            )
 
     slices = plan_parsed.get(slice_path)
     if not isinstance(slices, list) or not slices:

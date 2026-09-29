@@ -339,10 +339,291 @@ def retrieve_map(ctx) -> list[dict]:
     return chunks
 
 
+# ── 规划后处理钩子：按 ref_id 回查知识库原文，逐字覆盖沿用条目 ──────
+
+_FM_FIELD_STOP = (
+    r"\n失效类型选择理由：|\n未分析失效类型|\n覆盖规则说明|"
+    r"\n危害事件统计|\nASIL 分布|\n典型运行场景"
+)
+
+
+def _fm_original_texts(content: str) -> tuple[str, str]:
+    """从 failure_mode 分块正文提取「功能异常表现」「整车危害」原文（值可跨行）。"""
+    text = str(content or "")
+    mb = re.search(
+        r"功能异常表现：(.*?)(?=\n整车危害：|\n\n|" + _FM_FIELD_STOP + r"|$)",
+        text, re.S,
+    )
+    vh = re.search(
+        r"整车危害：(.*?)(?=\n\n|" + _FM_FIELD_STOP + r"|$)",
+        text, re.S,
+    )
+    return (mb.group(1).strip() if mb else "", vh.group(1).strip() if vh else "")
+
+
+def _fetch_fm_originals(retrieve, domain: str, ref: str, func_name: str,
+                        word: str, cache: dict) -> tuple[str, str] | None:
+    """按失效模式 ref_id 回查知识库，返回（功能异常表现, 整车危害）原文。
+
+    先用 ref 直查，未命中再用「功能名 失效词 失效模式」兜底；仍未命中返回 None。
+    """
+    if ref in cache:
+        return cache[ref] or None
+    result: tuple[str, str] | None = None
+    queries = [ref] + ([f"{func_name} {word} 失效模式".strip()] if func_name else [])
+    for q in queries:
+        try:
+            chunks = retrieve(domain, q, top_k=8, layer="failure_mode") or []
+        except Exception as exc:  # noqa: BLE001 —— 回查失败不阻断规划后处理
+            logger.warning(
+                "[hara_prepare] 失效模式回查降级（ref=%s，q=%r）：%s", ref, q[:40], exc,
+            )
+            chunks = []
+        for c in chunks:
+            if not isinstance(c, dict):
+                continue
+            meta = c.get("meta") or {}
+            content = str(c.get("content") or "")
+            if str(meta.get("failure_id") or "").strip() == ref or (
+                content.startswith(f"【失效模式 {ref}】")
+            ):
+                texts = _fm_original_texts(content)
+                if texts[0] or texts[1]:
+                    result = texts
+                    break
+        if result:
+            break
+    cache[ref] = result or ("", "")
+    return result
+
+
+def fix_plan_items(ctx) -> dict:
+    """规划后处理钩子（纯代码，不调 LLM）：沿用内容一律以知识库原文为准。
+
+    第1步 失效模式原文覆盖：source.type∈{reused,adapted} 且有 ref_id 的 HAZOP
+    条目，按 ref_id 回查 failure_mode 块，逐字覆盖 malfunction_behavior /
+    vehicle_hazard（含内部换行）——LLM 转写历史条目时的"添油加醋"在此归零；
+    第2步 场景历史骨架：history_ref 有效的场景用知识库 meta.scene 原文覆盖
+    scene_text，无效引用剥离 history_ref；召回候选中未被任何场景引用的历史
+    事件强制追加为场景（宁多勿漏，实质同场景去重）。
+    """
+    plan = ctx.plan_parsed if isinstance(ctx.plan_parsed, dict) else {}
+    items = plan.get("hazop_items")
+    stats = {"fm_covered": 0, "scene_aligned": 0, "scene_appended": 0}
+    if not isinstance(items, list) or not items:
+        return stats
+    kb_cfg = ctx.skill_cfg.get("knowledge") or {}
+    domain = str(kb_cfg.get("domain") or "").strip()
+    retrieve = ctx.retrieve_knowledge
+    if not domain or retrieve is None:
+        return stats
+    functions = {
+        str(fn.get("fid") or "").strip(): str(fn.get("vehicle_function") or "").strip()
+        for fn in (plan.get("functions") or []) if isinstance(fn, dict)
+    }
+    fm_cache: dict[str, tuple[str, str]] = {}
+    union_cache: dict[tuple[str, str], list[dict]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        src = item.get("source") if isinstance(item.get("source"), dict) else {}
+        stype = str(src.get("type") or "").strip().lower()
+        ref = str(src.get("ref_id") or "").strip()
+        fid = str(item.get("fid") or "").strip()
+        word = str(item.get("word") or "").strip()
+        func_name = functions.get(fid, "")
+
+        # 第1步：失效模式原文覆盖
+        if stype in ("reused", "adapted") and ref:
+            texts = _fetch_fm_originals(
+                retrieve, domain, ref, func_name, word, fm_cache,
+            )
+            if texts:
+                if texts[0]:
+                    item["malfunction_behavior"] = texts[0]
+                if texts[1]:
+                    item["vehicle_hazard"] = texts[1]
+                stats["fm_covered"] += 1
+
+        # 第2步：场景历史骨架（宁多勿漏）
+        if not func_name or not word:
+            continue
+        key = (func_name, word)
+        if key not in union_cache:
+            try:
+                union_cache[key] = _retrieve_event_union(
+                    retrieve, domain, func_name, word, "", kb_cfg,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[hara_prepare] 场景骨架召回降级（%s/%s）：%s",
+                    func_name, word, exc,
+                )
+                union_cache[key] = []
+        by_id: dict[str, dict] = {}
+        for c in union_cache[key]:
+            if isinstance(c, dict):
+                hid = str((c.get("meta") or {}).get("hzrd_id") or "").strip()
+                if hid:
+                    by_id[hid] = c
+        if not by_id:
+            continue
+        scenarios = item.get("scenarios")
+        if not isinstance(scenarios, list):
+            scenarios = []
+        existing_norms = {
+            _scene_norm(str(sc.get("scene_text") or ""))
+            for sc in scenarios if isinstance(sc, dict)
+        }
+        used: set[str] = set()
+        for sc in scenarios:
+            if not isinstance(sc, dict):
+                continue
+            href = str(sc.get("history_ref") or "").strip()
+            if not href:
+                continue
+            meta = (by_id.get(href) or {}).get("meta") or {}
+            scene_text = str(meta.get("scene") or "").strip()
+            if scene_text:
+                sc["scene_text"] = scene_text
+                used.add(href)
+                stats["scene_aligned"] += 1
+            else:
+                sc.pop("history_ref", None)  # 引用无效：剥离标记，避免误导评级层
+        for hid, c in by_id.items():
+            if hid in used:
+                continue
+            scene_text = str((c.get("meta") or {}).get("scene") or "").strip()
+            norm = _scene_norm(scene_text)
+            if not scene_text or norm in existing_norms:
+                continue
+            scenarios.append({"history_ref": hid, "scene_text": scene_text})
+            existing_norms.add(norm)
+            stats["scene_appended"] += 1
+        if scenarios:
+            item["scenarios"] = scenarios
+    logger.info(
+        "[hara_prepare] 规划后处理：失效模式原文覆盖 %d 条，场景原文对齐 %d 条，"
+        "历史场景补录 %d 条",
+        stats["fm_covered"], stats["scene_aligned"], stats["scene_appended"],
+    )
+    return stats
+
+
 # ── 评级结果评审钩子：全量复核 source 标注，疑似项回炉 LLM 二次校验 ──
 
 _REVIEW_SCENE_SIM_DEFAULT = 0.70   # 漏标沿用判定：场景相似度阈值
 _REVIEW_REF_SCENE_SIM = 0.50       # 已引用场景过低的提示阈值
+
+
+# ── 事件块原文物化（reused/adapted 事件内容以知识库原文为准，LLM 只补差） ──
+
+def _parse_event_assessment(content: str) -> dict:
+    """解析事件分块正文：场景/描述/S/E/C 及理由/结论 ASIL/安全目标组。
+
+    历史留白口径：S=0 时 E/C 不评估（输出 null、理由空串）；
+    ASIL=QM 或值为"-"/"无…"时安全目标/安全状态/FTTI 置空串。
+    """
+    text = str(content or "")
+    out = {
+        "scene": "", "desc": "",
+        "S": None, "s_reason": "", "E": None, "e_reason": "",
+        "C": None, "c_reason": "",
+        "asil": "", "sg_text": "", "safe_state": "", "ftti": "",
+    }
+    m = re.search(r"运行场景：(.*)", text)
+    if m:
+        out["scene"] = m.group(1).strip()
+    m = re.search(r"危害事件描述：(.*)", text)
+    if m:
+        out["desc"] = m.group(1).strip()
+    seg_m = re.search(r"- 严重度 S=.*?(?=\n\n结论：|\Z)", text, re.S)
+    if seg_m:
+        for raw in seg_m.group(0).splitlines():
+            line = raw.strip().lstrip("-").strip()
+            m = re.match(r"严重度\s*S=(\d*)[:：]?(.*)", line)
+            if m:
+                out["S"] = int(m.group(1)) if m.group(1) else None
+                out["s_reason"] = m.group(2).strip()
+                continue
+            m = re.match(r"暴露概率\s*E=(\d*)[:：]?(.*)", line)
+            if m:
+                out["E"] = int(m.group(1)) if m.group(1) else None
+                out["e_reason"] = m.group(2).strip()
+                continue
+            m = re.match(r"可控性\s*C=(\d*)[:：]?(.*)", line)
+            if m:
+                out["C"] = int(m.group(1)) if m.group(1) else None
+                out["c_reason"] = m.group(2).strip()
+                continue
+            m = re.match(r"(S\d+[:：].+)", line)
+            if m and out["S"] is not None:
+                out["s_reason"] = "；".join(
+                    x for x in (out["s_reason"], m.group(1).strip()) if x
+                )
+                continue
+            m = re.match(r"(E\d+[:：].+)", line)
+            if m and out["E"] is not None:
+                out["e_reason"] = "；".join(
+                    x for x in (out["e_reason"], m.group(1).strip()) if x
+                )
+                continue
+            m = re.match(r"(C\d+[:：].+)", line)
+            if m and out["C"] is not None:
+                out["c_reason"] = "；".join(
+                    x for x in (out["c_reason"], m.group(1).strip()) if x
+                )
+                continue
+    m = re.search(r"结论：\s*ASIL\s*=\s*(\S+)", text)
+    if m:
+        out["asil"] = m.group(1).strip().strip("。")
+    m = re.search(r"安全目标：(.*)", text)
+    sg = m.group(1).strip() if m else ""
+    m = re.search(r"安全状态：(.*)", text)
+    safe = m.group(1).strip() if m else ""
+    m = re.search(r"FTTI：(.*)", text)
+    ftti = m.group(1).strip() if m else ""
+    is_qm = not out["asil"] or out["asil"].upper() == "QM"
+    out["sg_text"] = "" if is_qm or sg == "-" or sg.startswith("无") else sg
+    out["safe_state"] = "" if is_qm or safe == "-" else safe
+    out["ftti"] = "" if is_qm or ftti == "-" else ftti
+    return out
+
+
+def _apply_materialize(ev: dict, chunk: dict, scope: str) -> bool:
+    """把知识库事件块原文物化到事件 dict；成功 True，解析失败 False（保留原输出）。
+
+    scope="full"（reused）：场景/描述/S/E/C/理由/安全目标组全部按库原文回填；
+    scope="adapted"：仅覆盖场景原文与安全目标组，保留 LLM 的 S/E/C/理由/描述
+    （改编的正是评级，沿用部分仍以库为准）。
+    """
+    meta = chunk.get("meta") or {}
+    parsed = _parse_event_assessment(str(chunk.get("content") or ""))
+    if scope == "full" and parsed["S"] is None and _sec_norm(meta.get("S")) is not None:
+        return False  # 正文解析不到 S 而库 meta 有值：视为解析失败，回退 LLM 原输出
+    scene = str(meta.get("scene") or "").strip() or parsed["scene"]
+    updates: dict = {}
+    if scene:
+        updates["scenario_text"] = scene
+    if scope == "full":
+        if parsed["desc"]:
+            updates["event_description"] = parsed["desc"]
+        updates["S"] = parsed["S"]
+        updates["s_reason"] = parsed["s_reason"]
+        updates["E"] = parsed["E"]
+        updates["e_reason"] = parsed["e_reason"]
+        updates["C"] = parsed["C"]
+        updates["c_reason"] = parsed["c_reason"]
+    updates["sg_text"] = parsed["sg_text"]
+    updates["safe_state"] = parsed["safe_state"]
+    updates["ftti"] = parsed["ftti"]
+    ev.update(updates)
+    src = ev.get("source") if isinstance(ev.get("source"), dict) else {}
+    if src and not str(src.get("project") or "").strip():
+        src_file = str(((meta.get("source") or {}).get("file")) or "").strip()
+        if src_file:
+            src["project"] = src_file
+    return True
 
 
 def _sec_norm(value) -> int | None:
@@ -384,7 +665,10 @@ def _cand_summary(meta: dict, sim: float | None = None) -> dict:
 
 def _review_one(ev: dict, candidates: dict[str, dict],
                 threshold: float) -> tuple[list[str], dict | None]:
-    """单事件比对：返回（疑点列表, 命中的候选历史事件摘要或 None）。"""
+    """单事件比对：返回（疑点列表, 命中的候选历史事件摘要或 None）。
+
+    candidates：{hzrd_id: chunk}（chunk 含 meta+content，供物化与比对共用）。
+    """
     src = ev.get("source")
     if not isinstance(src, dict):
         return ["事件缺少 source 字段"], None
@@ -397,7 +681,8 @@ def _review_one(ev: dict, candidates: dict[str, dict],
             return [], None
         ev_e, ev_c = _sec_norm(ev.get("E")), _sec_norm(ev.get("C"))
         best_id, best_meta, best_sim = "", None, 0.0
-        for hid, meta in candidates.items():
+        for hid, chunk in candidates.items():
+            meta = chunk.get("meta") or {}
             if _sec_norm(meta.get("S")) != ev_s:
                 continue
             if _sec_norm(meta.get("E")) != ev_e or _sec_norm(meta.get("C")) != ev_c:
@@ -424,12 +709,13 @@ def _review_one(ev: dict, candidates: dict[str, dict],
                 f"source.type={stype} 但 ref_id 为空：应补历史事件 ID；"
                 "确无匹配应改判 new"
             ], None
-        meta = candidates.get(ref)
-        if meta is None:
+        chunk = candidates.get(ref)
+        if chunk is None:
             return [
                 f"ref_id={ref} 不在本次召回的历史事件中：请核实该 ID 是否真实存在；"
                 "不存在应改用正确 ID 或改判 new（禁止编造来源）"
             ], None
+        meta = chunk.get("meta") or {}
         issues: list[str] = []
         his_s = _sec_norm(meta.get("S"))
         his_e = _sec_norm(meta.get("E"))
@@ -460,10 +746,13 @@ def _review_one(ev: dict, candidates: dict[str, dict],
 
 
 def review_events(ctx) -> dict:
-    """评审钩子：代码复核本切片全部事件的 source 标注，疑似项回炉 LLM 二次校验。
+    """评审钩子：物化 → 疑点检测 → 复核 LLM → 应用 → 再物化。
 
-    代码只负责"找疑点"（漏标沿用/虚引 ID/评级与所引不一致/场景与所引不符），
-    改不改、怎么改由复核 LLM 决定；复核失败软降级保留原结果。
+    第一步物化（纯代码）：reused 事件全字段按知识库事件块原文回填、adapted
+    事件覆盖场景原文与安全目标组——沿用内容以库原文为准，LLM 只补差；
+    第二步代码比对找疑点（漏标沿用/虚引 ID/评级与所引不一致/场景与所引不符），
+    改不改、怎么改由复核 LLM 决定；复核应用后再物化一遍（改判 reused/adapted
+    的以库原文校正）。物化/复核失败均软降级保留原结果。
     """
     events = ctx.events if isinstance(ctx.events, list) else []
     if not events:
@@ -478,7 +767,7 @@ def review_events(ctx) -> dict:
             break
     word = str(unit.get("word") or "").strip()
 
-    candidates: dict[str, dict] = {}
+    candidates: dict[str, dict] = {}  # hzrd_id -> chunk（meta+content 共用）
     for c in ctx.chunks or []:
         if not isinstance(c, dict):
             continue
@@ -490,7 +779,7 @@ def review_events(ctx) -> dict:
             continue
         if word and str(meta.get("failure_type") or "").strip() != word:
             continue
-        candidates[hid] = meta
+        candidates[hid] = c
     if not candidates:
         return {"events": events, "usage": {}}
 
@@ -498,6 +787,38 @@ def review_events(ctx) -> dict:
     review_cfg = map_cfg.get("review") or {}
     threshold = float(
         review_cfg.get("scene_sim_threshold") or _REVIEW_SCENE_SIM_DEFAULT
+    )
+
+    def _materialize_all() -> int:
+        """物化回填：reused 全字段 / adapted 场景+安全目标组；返回成功条数。"""
+        count = 0
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            src = ev.get("source") if isinstance(ev.get("source"), dict) else {}
+            stype = str(src.get("type") or "").strip().lower()
+            ref = str(src.get("ref_id") or "").strip()
+            if stype not in ("reused", "adapted") or not ref:
+                continue
+            chunk = candidates.get(ref)
+            if chunk is None:
+                continue
+            try:
+                if _apply_materialize(
+                    ev, chunk, "full" if stype == "reused" else "adapted"
+                ):
+                    count += 1
+            except Exception as exc:  # noqa: BLE001 —— 物化失败保留 LLM 原输出
+                ctx.logger.warning(
+                    "[hara_prepare] 事件物化失败（ref=%s，保留原输出）：%s", ref, exc,
+                )
+        return count
+
+    mat_count = _materialize_all()
+    ctx.logger.info(
+        "[hara_prepare] 评级评审（%s/%s）：%d 条事件，物化回填 %d 条"
+        "（reused 全字段/adapted 场景+安全目标组）",
+        fid or "?", word, len(events), mat_count,
     )
 
     suspects: list[dict] = []
@@ -553,8 +874,11 @@ def review_events(ctx) -> dict:
                         merged[k] = v
                 events[i] = merged
                 applied += 1
+
+    mat_count2 = _materialize_all()  # 复核改判后按库原文再校正一遍
     ctx.logger.info(
-        "[hara_prepare] 评级复核（%s/%s）：疑似 %d 条，模型修正回填 %d 条",
-        fid or "?", word, len(suspects), applied,
+        "[hara_prepare] 评级复核（%s/%s）：疑似 %d 条，模型修正回填 %d 条，"
+        "复核后再物化 %d 条",
+        fid or "?", word, len(suspects), applied, mat_count2,
     )
     return {"events": events, "usage": usage}
