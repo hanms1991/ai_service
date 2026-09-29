@@ -56,16 +56,6 @@ _WRAP_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 _FILL_BANNER = PatternFill("solid", fgColor="D9E1F2")
 _FILL_WARN = PatternFill("solid", fgColor="FFF2CC")
 
-_MALFUNCTION_NOTE = (
-    "注：\n"
-    "1.“间歇”意味着功能在一段时间内正常使用与无法使用交替进行，在极端情况下是在一段时间内功能彻底无法使用，可以被“丢失”覆盖；\n"
-    "2.“过少”意味比驾驶员预期的要少，在极端情况下是在一段时间内功能彻底无法使用，可以被“丢失”覆盖；\n"
-    "3.“过早”意味着比驾驶员预期的出现时间要早，在极端情况下是在驾驶员不需要激活的情况下激活，可以被“非预期”覆盖；\n"
-    "4.“振荡”意味着功能在一段时间内可能执行的过多在另一段时间内执行过少，可以被“过多”和“过少”覆盖；\n"
-    "5.“部分”意味着仅有部分功能实现，在极端情况下是功能几乎完全未激活，可以被“丢失”覆盖；\n"
-    "6.“过晚”意味着比驾驶员预期的出现时间要晚，在极端情况下是在驾驶员需要的情况下一直未激活，可以被“丢失”覆盖；"
-)
-
 
 # ════════════════════════════════════════════════════════════════
 # 工具函数
@@ -211,11 +201,21 @@ def _write_functions(wb, pfx, functions, func_info):
         remark = _source_remark(f.get("source"))
         doc_ref = f.get("doc_ref") or ""
         for k, feat in enumerate(features):
+            do_hara = str(feat.get("do_hara") or "是").strip()
             ws.cell(row=r, column=3, value=feat.get("feature_list_id") or "")
             ws.cell(row=r, column=4, value=feat.get("description") or "")
-            ws.cell(row=r, column=5, value=feat.get("do_hara") or "是")
+            ws.cell(row=r, column=5, value=do_hara)
             ws.cell(row=r, column=6, value=feat.get("doc_ref") or doc_ref)
-            ws.cell(row=r, column=7, value=remark if k == 0 else "/")
+            # 备注列：do_hara=否 的 feature 必须写明不进行 HARA 分析的理由；
+            # 首行无排除理由时回落为功能级来源标注
+            reason = str(feat.get("no_hara_reason") or "").strip()
+            if do_hara == "否" and reason:
+                g_val = reason
+            elif k == 0:
+                g_val = remark
+            else:
+                g_val = ""
+            ws.cell(row=r, column=7, value=g_val)
             for c in range(3, 8):
                 _style(ws.cell(row=r, column=c))
             r += 1
@@ -253,31 +253,29 @@ def _write_malfunctions(wb, pfx, functions, func_info, matrix):
         for k, word in enumerate(WORDS):
             ws.cell(row=r, column=3 + k, value="√" if selections.get(word) else "")
         ws.cell(row=r, column=14, value=m.get("rationale") or "")
-        ws.cell(row=r, column=15, value=_source_remark(m.get("source")))
+        # O 列备注：逐词溯源说明（LLM 输出 source_note），缺失时回退条目级 source
+        ws.cell(row=r, column=15, value=(m.get("source_note") or "").strip()
+                or _source_remark(m.get("source")))
         for c in range(1, 16):
             _style(ws.cell(row=r, column=c), center=(c in (1,) or 3 <= c <= 13),
                    bold=(c <= 2))
         r += 1
 
-    # 失效词覆盖注释（数据末尾整行）
-    note_row = r
-    ws.cell(row=note_row, column=1, value=_MALFUNCTION_NOTE)
-    _merge(ws, f"A{note_row}:O{note_row}")
-    cell = ws.cell(row=note_row, column=1)
-    _style(cell)
-    ws.row_dimensions[note_row].height = 110
-
-    # 模板图片原锚点靠近旧注释行（R3），删除数据行后锚点上移到表头附近；
-    # 统一重锚到注释行左侧，避免遮挡表头。
+    # 词表注释已取消（覆盖关系由模型在选择理由中自行分析，不写编号注释行）。
+    # 图片统一放在数据内容下方一行，并保持原始尺寸（OneCellAnchor 必须显式给
+    # ext，否则图片会显示为极小尺寸）。
+    img_row = r  # r 已是最后一条数据的下一行
     try:
         from openpyxl.drawing.spreadsheet_drawing import OneCellAnchor, AnchorMarker
         from openpyxl.drawing.xdr import XDRPositiveSize2D
         from openpyxl.utils.units import pixels_to_EMU
 
         for img in getattr(ws, "_images", []):
+            cx = pixels_to_EMU(int(getattr(img, "width", 0) or 640))
+            cy = pixels_to_EMU(int(getattr(img, "height", 0) or 360))
             img.anchor = OneCellAnchor(
-                _from=AnchorMarker(col=13, colOff=0, row=note_row - 1, rowOff=0),
-                ext=XDRPositiveSize2D(pixels_to_EMU(160), pixels_to_EMU(90)),
+                _from=AnchorMarker(col=0, colOff=0, row=img_row - 1, rowOff=0),
+                ext=XDRPositiveSize2D(cx, cy),
             )
     except Exception:
         pass  # 锚点调整失败不影响出表

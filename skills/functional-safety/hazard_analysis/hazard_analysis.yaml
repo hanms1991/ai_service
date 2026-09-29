@@ -137,6 +137,7 @@ output:
                   feature_list_id: {type: string}
                   description: {type: string}
                   do_hara: {type: string}
+                  no_hara_reason: {type: string}
                   doc_ref: {type: string}
       malfunction_matrix:
         type: array
@@ -147,6 +148,7 @@ output:
             fid: {type: string}
             selections: {type: object}
             rationale: {type: string}
+            source_note: {type: string}
             source: {type: object}
       hazop_items:
         type: array
