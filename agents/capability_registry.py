@@ -41,6 +41,7 @@ _skill_cfg_cache: dict[str, dict] = {}
 _REGISTRY: dict[str, Any] = {"agents": {}}
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 # 技能内部结构化 LLM 调用（json_mode：规划层/评级层/单阶段 JSON 技能）的 tag。
 # 这些调用产出的 JSON 是中间产物（随后走确定性渲染或直接落 structured），
@@ -966,6 +967,10 @@ def _invoke_json_stage(
         ) from e
     if not isinstance(parsed, dict):
         raise ValueError(f"{stage_name}输出 JSON 顶层必须是对象，实际为 {type(parsed).__name__}")
+    logger.info(
+        "[capability_registry] %s 完成，输出 %d 字符，摘要：%s",
+        stage_name, len(raw_text), raw_text[:500],
+    )
     return parsed, response
 
 
@@ -1033,6 +1038,10 @@ def _execute_staged_skill(
 
     # ── 规划层知识注入：四层分组大召回（软降级） ──
     plan_kb_block = _resolve_layered_knowledge_block(skill_cfg, inputs)
+    logger.info(
+        "[capability_registry] 规划层知识注入：%d 字符",
+        len(plan_kb_block),
+    )
 
     base_llm = _build_model_with_hint(
         _resolve_model(agent_cfg.get("model")), skill_cfg.get("model_hint")
@@ -1066,6 +1075,12 @@ def _execute_staged_skill(
             f"规划层输出缺少非空列表 {slice_path!r}，无法进入评级阶段；"
             "请检查相关项描述是否包含可分析的整车功能与安全关键失效。"
         )
+    funcs = plan_parsed.get("functions") or []
+    matrix = plan_parsed.get("malfunction_matrix") or []
+    logger.info(
+        "[capability_registry] 规划层结果：%d 功能 / %d 失效矩阵行 / %d HAZOP 条目",
+        len(funcs), len(matrix), len(slices),
+    )
 
     # ── 阶段 2：逐切片并发评级（单片失败重试 1 次） ──
     map_system_prompt = _build_stage_system_prompt(
@@ -1106,6 +1121,14 @@ def _execute_staged_skill(
                         layer=map_layer,
                     )
                     map_kb_block = format_knowledge_block(chunks, domain)
+                    logger.info(
+                        "[capability_registry] 评级切片 %d（%s/%s）知识库命中 %d 块，注入 %d 字符",
+                        index + 1,
+                        unit.get("fid", ""),
+                        unit.get("word", ""),
+                        len(chunks),
+                        len(map_kb_block),
+                    )
                 except Exception as exc:  # noqa: BLE001 —— 知识注入永不阻断
                     logger.warning(
                         "[capability_registry] 评级切片知识注入降级：%s", exc
@@ -1225,7 +1248,9 @@ def _resolve_layered_knowledge_block(skill_cfg: dict, inputs: dict[str, Any]) ->
 
         domain = str(kb_cfg.get("domain") or "").strip()
         query_from = str(kb_cfg.get("query_from") or "").strip()
-        query = str(inputs.get(query_from) or "").strip() if query_from else ""
+        raw_query = str(inputs.get(query_from) or "").strip() if query_from else ""
+        # 截断 query 避免 embedding 模型输入超限导致召回质量退化
+        query = raw_query[:500] if len(raw_query) > 500 else raw_query
         if not domain or not query:
             return ""
         layers = kb_cfg.get("layers") or []
@@ -1236,6 +1261,16 @@ def _resolve_layered_knowledge_block(skill_cfg: dict, inputs: dict[str, Any]) ->
             top_k=plan_top_k if plan_top_k else kb_cfg.get("top_k"),
             score_threshold=kb_cfg.get("score_threshold"),
             meta_filter=kb_cfg.get("meta_filter") or None,
+        )
+        # 各层命中分布
+        layer_counts: dict[str, int] = {}
+        for c in chunks:
+            ln = str((c.get("meta") or {}).get("layer") or "未标注")
+            layer_counts[ln] = layer_counts.get(ln, 0) + 1
+        logger.info(
+            "[capability_registry] 规划层知识检索：query=%r（原始 %d→截断 %d 字符），"
+            "命中 %d 块，分布 %s",
+            query[:80], len(raw_query), len(query), len(chunks), layer_counts,
         )
         if layers:
             layers = [str(x) for x in layers]

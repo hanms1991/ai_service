@@ -28,6 +28,7 @@ import httpx
 import yaml
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 # knowledge.yaml 位置：项目根/agents/configs/knowledge.yaml
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "agents" / "configs" / "knowledge.yaml"
