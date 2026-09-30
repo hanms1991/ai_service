@@ -397,6 +397,72 @@ def _fetch_fm_originals(retrieve, domain: str, ref: str, func_name: str,
     return result
 
 
+def _parse_function_list_chunk(content: str) -> dict:
+    """解析功能清单分块正文，提取功能名与 Feature 列表。
+
+    返回 {name, features: [{feature_list_id, description, do_hara}]}。
+    解析失败返回空 dict。
+    """
+    text = str(content or "")
+    out: dict = {}
+    # 功能名：【相关项功能清单 CS_func_0001 转向助力功能】
+    m = re.search(r"【相关项功能清单\s+\S+\s+(.+?)】", text)
+    if m:
+        out["name"] = m.group(1).strip()
+    features: list[dict] = []
+    # 进行 HARA 分析的 Feature
+    in_hara = False
+    for line in text.splitlines():
+        s = line.strip()
+        if "进行 HARA 分析的 Feature" in s:
+            in_hara = True
+            continue
+        if "不进行 HARA" in s or "未进行 HARA" in s:
+            in_hara = False
+            continue
+        m = re.match(r"[-•]\s*(\S+)\s+(.+)", s)
+        if m:
+            features.append({
+                "feature_list_id": m.group(1).strip(),
+                "description": m.group(2).strip(),
+                "do_hara": "是" if in_hara else "否",
+            })
+    if features:
+        out["features"] = features
+    return out
+
+
+def _retrieve_function_list(retrieve, domain: str, func_name: str,
+                            top_k: int = 10) -> dict | None:
+    """按功能名检索知识库功能清单分块，返回解析后的功能名+Feature列表。"""
+    if not func_name:
+        return None
+    try:
+        chunks = retrieve(
+            domain, f"{func_name} 相关项功能清单",
+            top_k=top_k, layer="function_list",
+        ) or []
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[hara_prepare] 功能清单检索降级（func=%s）：%s", func_name, exc)
+        return None
+    for c in chunks:
+        if not isinstance(c, dict):
+            continue
+        meta = c.get("meta") or {}
+        meta_func = str(meta.get("func") or meta.get("name") or "").strip()
+        # 双向包含匹配
+        if meta_func and meta_func not in func_name and func_name not in meta_func:
+            continue
+        parsed = _parse_function_list_chunk(str(c.get("content") or ""))
+        # 用 content 中的功能名做二次校验
+        cname = parsed.get("name", "")
+        if cname and cname not in func_name and func_name not in cname:
+            continue
+        if parsed.get("features"):
+            return parsed
+    return None
+
+
 def _retrieve_function_failure_modes(retrieve, domain: str, func_name: str,
                                      top_k: int = 20) -> list[dict]:
     """按功能名检索知识库中该功能的全部历史失效模式（确定性提取）。
@@ -423,7 +489,10 @@ def _retrieve_function_failure_modes(retrieve, domain: str, func_name: str,
         if not isinstance(c, dict):
             continue
         meta = c.get("meta") or {}
-        if str(meta.get("func") or "").strip() != func_name:
+        # 功能名双向包含匹配：LLM 生成的 vehicle_function 可能带"功能(EPB)"等后缀，
+        # 知识库 meta.func 通常是纯功能名，故用包含关系而非精确相等
+        meta_func = str(meta.get("func") or "").strip()
+        if meta_func and meta_func not in func_name and func_name not in meta_func:
             continue
         word = str(meta.get("failure_type") or "").strip()
         if not word or word in seen_words:
@@ -446,6 +515,12 @@ def _retrieve_function_failure_modes(retrieve, domain: str, func_name: str,
 def fix_plan_items(ctx) -> dict:
     """规划后处理钩子（纯代码，不调 LLM）：知识库内容一律以原文为准，LLM 只补差。
 
+    核心原则：沿用（reused）= 100% 全字段从知识库取，LLM 不生成任何内容；
+    改编（adapted）= 部分字段从知识库取、部分由 LLM 修改；新增（new）= LLM 全量生成。
+    适用于功能清单 / 失效模式 / HARA 事件 / 安全目标 四层数据。
+
+    第-1步 功能清单覆盖：对每个功能检索知识库 function_list 层，按 feature_list_id
+    匹配并覆盖 Feature 描述（do_hara 判断保留 LLM 输出，因需依据当前相关项定义）；
     第0步 失效模式确定性提取：对每个功能按功能名检索知识库 failure_mode 层，
     获取该功能全部历史失效模式（malfunction_behavior/vehicle_hazard 原文）；
     第1步 失效模式原文覆盖：LLM 生成的 hazop_items 中，凡知识库已有的失效
@@ -462,20 +537,57 @@ def fix_plan_items(ctx) -> dict:
     if not isinstance(items, list):
         items = []
         plan["hazop_items"] = items
-    stats = {"fm_covered": 0, "fm_appended": 0, "scene_aligned": 0, "scene_appended": 0}
+    stats = {
+        "func_covered": 0, "fm_covered": 0, "fm_appended": 0,
+        "scene_aligned": 0, "scene_appended": 0,
+    }
     kb_cfg = ctx.skill_cfg.get("knowledge") or {}
     domain = str(kb_cfg.get("domain") or "").strip()
     retrieve = ctx.retrieve_knowledge
     if not domain or retrieve is None:
         return stats
+    fn_list = plan.get("functions") or []
     functions = {
         str(fn.get("fid") or "").strip(): str(fn.get("vehicle_function") or "").strip()
-        for fn in (plan.get("functions") or []) if isinstance(fn, dict)
+        for fn in fn_list if isinstance(fn, dict)
     }
     matrix_by_fid = {
         str(m.get("fid") or "").strip(): m
         for m in (plan.get("malfunction_matrix") or []) if isinstance(m, dict)
     }
+
+    # 第-1步：功能清单覆盖（Feature 描述从知识库取，do_hara 保留 LLM 判断）
+    for fn in fn_list:
+        if not isinstance(fn, dict):
+            continue
+        func_name = str(fn.get("vehicle_function") or "").strip()
+        if not func_name:
+            continue
+        kb_func = _retrieve_function_list(retrieve, domain, func_name)
+        if not kb_func:
+            continue
+        kb_feats = {
+            str(f.get("feature_list_id") or "").strip(): f
+            for f in (kb_func.get("features") or []) if isinstance(f, dict)
+        }
+        lfeats = fn.get("features")
+        if not isinstance(lfeats, list):
+            continue
+        covered = 0
+        for lf in lfeats:
+            if not isinstance(lf, dict):
+                continue
+            fid2 = str(lf.get("feature_list_id") or "").strip()
+            kb_f = kb_feats.get(fid2)
+            if kb_f and str(kb_f.get("description") or "").strip():
+                lf["description"] = kb_f["description"]
+                covered += 1
+        if covered:
+            stats["func_covered"] += covered
+            logger.info(
+                "[hara_prepare] 功能清单覆盖：%s 命中 %d 个 Feature 描述",
+                func_name, covered,
+            )
 
     # 第0步：对每个功能检索知识库全部历史失效模式（一次检索覆盖11失效词）
     fm_by_func: dict[str, dict[str, dict]] = {}
@@ -578,10 +690,16 @@ def fix_plan_items(ctx) -> dict:
                 union_cache[key] = []
         by_id: dict[str, dict] = {}
         for c in union_cache[key]:
-            if isinstance(c, dict):
-                hid = str((c.get("meta") or {}).get("hzrd_id") or "").strip()
-                if hid:
-                    by_id[hid] = c
+            if not isinstance(c, dict):
+                continue
+            meta = c.get("meta") or {}
+            # 只保留属于当前失效词的历史事件，避免同功能多失效切片重复沿用同一批事件
+            c_word = str(meta.get("failure_type") or "").strip()
+            if c_word and c_word != word:
+                continue
+            hid = str(meta.get("hzrd_id") or "").strip()
+            if hid:
+                by_id[hid] = c
         if not by_id:
             continue
         scenarios = item.get("scenarios")
@@ -619,9 +737,9 @@ def fix_plan_items(ctx) -> dict:
         if scenarios:
             item["scenarios"] = scenarios
     logger.info(
-        "[hara_prepare] 规划后处理：失效模式原文覆盖 %d 条，知识库失效补全 %d 条，"
-        "场景原文对齐 %d 条，历史场景补录 %d 条",
-        stats["fm_covered"], stats.get("fm_appended", 0),
+        "[hara_prepare] 规划后处理：功能 Feature 覆盖 %d 条，失效模式原文覆盖 %d 条，"
+        "知识库失效补全 %d 条，场景原文对齐 %d 条，历史场景补录 %d 条",
+        stats.get("func_covered", 0), stats["fm_covered"], stats.get("fm_appended", 0),
         stats["scene_aligned"], stats["scene_appended"],
     )
     return stats
@@ -710,14 +828,22 @@ def _parse_event_assessment(content: str) -> dict:
 def _apply_materialize(ev: dict, chunk: dict, scope: str) -> bool:
     """把知识库事件块原文物化到事件 dict；成功 True，解析失败 False（保留原输出）。
 
-    scope="full"（reused）：场景/描述/S/E/C/理由/安全目标组全部按库原文回填；
-    scope="adapted"：仅覆盖场景原文与安全目标组，保留 LLM 的 S/E/C/理由/描述
+    沿用（reused）= 100% 全字段覆盖：场景/描述/S/E/C/理由/安全目标组全部按库原文回填；
+    改编（adapted）= 仅覆盖场景原文与安全目标组，保留 LLM 的 S/E/C/理由/描述
     （改编的正是评级，沿用部分仍以库为准）。
+
+    S/E/C 优先从 meta 取（可靠），content 解析作为回退；理由从 content 解析。
     """
     meta = chunk.get("meta") or {}
     parsed = _parse_event_assessment(str(chunk.get("content") or ""))
-    if scope == "full" and parsed["S"] is None and _sec_norm(meta.get("S")) is not None:
-        return False  # 正文解析不到 S 而库 meta 有值：视为解析失败，回退 LLM 原输出
+    # S/E/C：meta 优先，解析回退（历史留白 S=0→E/C 为 None 时仍需覆盖）
+    sec = {
+        "S": _sec_norm(meta.get("S")) if _sec_norm(meta.get("S")) is not None else parsed["S"],
+        "E": _sec_norm(meta.get("E")) if _sec_norm(meta.get("E")) is not None else parsed["E"],
+        "C": _sec_norm(meta.get("C")) if _sec_norm(meta.get("C")) is not None else parsed["C"],
+    }
+    if scope == "full" and sec["S"] is None and _sec_norm(meta.get("S")) is None and parsed["S"] is None:
+        return False  # meta 与解析均无 S：视为解析失败，回退 LLM 原输出
     scene = str(meta.get("scene") or "").strip() or parsed["scene"]
     updates: dict = {}
     if scene:
@@ -725,11 +851,11 @@ def _apply_materialize(ev: dict, chunk: dict, scope: str) -> bool:
     if scope == "full":
         if parsed["desc"]:
             updates["event_description"] = parsed["desc"]
-        updates["S"] = parsed["S"]
+        updates["S"] = sec["S"]
         updates["s_reason"] = parsed["s_reason"]
-        updates["E"] = parsed["E"]
+        updates["E"] = sec["E"]
         updates["e_reason"] = parsed["e_reason"]
-        updates["C"] = parsed["C"]
+        updates["C"] = sec["C"]
         updates["c_reason"] = parsed["c_reason"]
     updates["sg_text"] = parsed["sg_text"]
     updates["safe_state"] = parsed["safe_state"]
