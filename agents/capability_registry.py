@@ -49,6 +49,13 @@ logger.setLevel(logging.INFO)
 # 避免把内部 JSON token 推给前端。
 SKILL_INTERNAL_LLM_TAG = "skill_internal_llm"
 
+# 技能内部 LLM 调用的单次超时（秒）。全局模型 streaming=True，该超时对流式调用
+# 的语义是「相邻 chunk 之间的最大静默间隔」：上游断流/连接挂起时在超时后抛异常，
+# 走既有重试/失败路径，而不是让整个技能执行永久卡死（前端只能干等事件超时）。
+# 通过 llm.bind(timeout=...) 以 SDK 每请求超时的方式叠加，不改全局共享模型实例。
+# 可用环境变量 SKILL_LLM_TIMEOUT_SECONDS 覆盖。
+SKILL_LLM_TIMEOUT_SECONDS = int(os.getenv("SKILL_LLM_TIMEOUT_SECONDS", "300"))
+
 
 def _with_internal_tag(runnable_config: Any) -> dict:
     """在 invoke config 上叠加「技能内部调用」tag（保留原 config 的 callbacks/tags）。"""
@@ -1127,11 +1134,14 @@ def _execute_skill_core(
 
     system_prompt = _build_skill_system_prompt(skill_cfg, agent_cfg)
 
-    invoke_model = llm
+    invoke_model = llm.bind(timeout=SKILL_LLM_TIMEOUT_SECONDS)
     if output_format == "json" and output_schema:
         # json_mode + 技能级输出上限（HARA 等大 JSON 技能必须高于全局 LLM_MAX_TOKENS，
         # 否则可见输出在 max_tokens 处被截断，JSON 不闭合 → 解析失败）
-        bind_kwargs: dict[str, Any] = {"response_format": {"type": "json_object"}}
+        bind_kwargs: dict[str, Any] = {
+            "response_format": {"type": "json_object"},
+            "timeout": SKILL_LLM_TIMEOUT_SECONDS,
+        }
         skill_max_tokens = output_cfg.get("max_tokens")
         if isinstance(skill_max_tokens, int) and skill_max_tokens > 0:
             bind_kwargs["max_tokens"] = skill_max_tokens
@@ -1342,7 +1352,12 @@ def _execute_staged_skill(
         skill_cfg["prompt_template"], inputs, skill_cfg.get("inputs", {})
     )
     # 文档只读一次：正文同时用于消息注入与（无 item_definition 时的）检索 query
+    logger.info(
+        "[capability_registry] 分阶段技能开始（skill=%s）：读取上传文档（file_id=%s）",
+        skill_cfg.get("name"), inputs.get("file_id") or "-",
+    )
     doc_raw = _read_uploaded_document(skill_cfg, inputs)
+    logger.info("[capability_registry] 读取上传文档完成：%d 字符", len(doc_raw or ""))
     doc_block = (
         "\n\n【相关项文档（Markdown，平台从用户上传文件转换，分析以此为主要事实来源）】\n"
         + doc_raw
@@ -1358,7 +1373,10 @@ def _execute_staged_skill(
     )
 
     def _bind_json_model(max_tokens: Any) -> Any:
-        bind_kwargs: dict[str, Any] = {"response_format": {"type": "json_object"}}
+        bind_kwargs: dict[str, Any] = {
+            "response_format": {"type": "json_object"},
+            "timeout": SKILL_LLM_TIMEOUT_SECONDS,
+        }
         if isinstance(max_tokens, int) and max_tokens > 0:
             bind_kwargs["max_tokens"] = max_tokens
         return base_llm.bind(**bind_kwargs)
@@ -1370,6 +1388,11 @@ def _execute_staged_skill(
     prepare_ctx: PrepareContext | None = None
     if (exec_cfg.get("prepare") or {}).get("script"):
         from core.kb_client import format_knowledge_layered_block, retrieve_knowledge
+
+        logger.info(
+            "[capability_registry] prepare 钩子开始（script=%s）",
+            exec_cfg["prepare"].get("script"),
+        )
 
         prepare_ctx = PrepareContext(
             skill_cfg=skill_cfg,
@@ -1418,6 +1441,12 @@ def _execute_staged_skill(
         rendered + doc_block + plan_kb_block + ref_block + schema_example_block
     )
     plan_system_prompt = _build_stage_system_prompt(skill_cfg, plan_cfg)
+    logger.info(
+        "[capability_registry] 规划层开始：注入 %d 字符（文档 %d + 知识 %d），"
+        "max_tokens=%s",
+        len(plan_user_message), len(doc_block), len(plan_kb_block),
+        plan_cfg.get("max_tokens"),
+    )
     plan_parsed, plan_response = _invoke_json_stage(
         _bind_json_model(plan_cfg.get("max_tokens")),
         plan_system_prompt,
@@ -1467,6 +1496,10 @@ def _execute_staged_skill(
     # ── 阶段 2：逐切片并发评级（单片失败重试 1 次） ──
     map_system_prompt = _build_stage_system_prompt(skill_cfg, map_cfg)
     map_max_tokens = map_cfg.get("max_tokens")
+    logger.info(
+        "[capability_registry] 评级阶段开始：%d 个切片，并发 %d，max_tokens=%s",
+        len(slices), max_workers, map_max_tokens,
+    )
     item_brief = plan_parsed.get("item") or {}
     item_header = (
         f"相关项名称：{item_brief.get('name', '')}；"
