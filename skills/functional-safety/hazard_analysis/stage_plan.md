@@ -49,19 +49,24 @@
 仅对矩阵中选中且**安全关键**的失效词建立条目。
 
 **失效模式内容的处理原则（最高优先，省 token 且准确）**：
-- 若【历史项目参考】中已存在同功能同失效词的失效模式条目（带 failure_id），
-  则本条目的 `malfunction_behavior` 与 `vehicle_hazard` **留空字符串**即可，
-  系统会自动按知识库原文逐字填充；你只需正确填写 `fid`、`word`、
-  `source.type=reused`、`source.ref_id=知识库中的 failure_id`；
-- 仅当知识库中确实没有同功能同失效词的参考时，才由你完整撰写
-  `malfunction_behavior`（功能异常表现，驾驶员可感知的具体现象）与
-  `vehicle_hazard`（整车危害，车辆运动/碰撞趋势，结构建议"危害类别：现象与后果"，
-  不写内部故障原因），并标 `source.type=new`；
+- 若【历史项目参考】中已存在同功能同失效词的失效模式条目（带 failure_id）
+  且内容可直接沿用，则本条目的 `malfunction_behavior` 与 `vehicle_hazard`
+  **留空字符串**即可，系统会自动按知识库原文逐字填充；你只需正确填写
+  `fid`、`word`、`source.type=reused`、`source.ref_id=知识库中的 failure_id`；
+- 若知识库条目内容与本项目的功能边界/架构有出入、需要修改，则标
+  `source.type=adapted` 并**由你撰写修改后的完整文本**（系统不会覆盖
+  adapted 条目），`source.ref_id` 指向所参照的历史条目；
+- 仅当知识库中确实没有同功能同失效词的参考时，才完整撰写两字段并标
+  `source.type=new`；
+- **无法判断知识库是否已有该条目时，正常撰写完整文本并按实际情况标注
+  source（宁误写勿漏写，系统会自动校正）**；`malfunction_behavior` 写
+  驾驶员可感知的具体现象，`vehicle_hazard` 写车辆运动/碰撞趋势（结构建议
+  "危害类别：现象与后果"，不写内部故障原因）。
 
 每条包含：
 - `word`：失效词（与矩阵一致）；`fid`：所属功能临时键；
-- `malfunction_behavior`：沿用知识库时留空，新增时填写；
-- `vehicle_hazard`：沿用知识库时留空，新增时填写；
+- `malfunction_behavior`：reused 时留空，adapted/new 时填写；
+- `vehicle_hazard`：reused 时留空，adapted/new 时填写；
 - `scenarios`：该失效需要分析的**完整运行场景清单**，要求：
   1. 场景必须充分：从《运行场景库》4 个维度（环境 SE / 行驶位置 SL / 车辆状态 SV /
      交通参与者 SP）中逐一排查与该失效相关的场景，并做跨维度组合

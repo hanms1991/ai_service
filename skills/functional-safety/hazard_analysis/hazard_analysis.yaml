@@ -79,11 +79,15 @@ execution:
     system_prompt:
       file: stage_plan.md
     max_tokens: 32768
-    # 规划后处理钩子（复用 prepare.script 同模块，入口 fix_plan_items）：
-    # reused/adapted 条目按 source.ref_id 回查知识库 failure_mode 块原文，
-    # 逐字覆盖功能异常表现/整车危害；场景清单按 history_ref 用库原文对齐、
-    # 无效引用剥离、候选漏掉的历史事件强制追加（宁多勿漏）。
-    # 纯代码不调 LLM；异常软降级保留规划层原输出。
+    # 规划后处理钩子（复用 prepare.script 同模块，入口 fix_plan_items）——
+    # 知识库优先，纯代码不调 LLM，异常软降级保留规划层原输出：
+    #   第-1步 功能清单覆盖：Feature 描述按 feature_list_id 用知识库原文覆盖；
+    #   第0步 按功能检索知识库全部历史失效模式（malfunction_behavior/vehicle_hazard 原文）；
+    #   第1步 reused/缺省条目按 fid+word 匹配知识库，强制用库原文覆盖并置
+    #         reused+修正 ref_id；adapted 条目保留 LLM 改编文本不覆盖；
+    #   第1.5步 知识库有而 LLM 未生成的失效强制追加（宁多勿漏），并同步失效矩阵 selections；
+    #   第2步 场景骨架：场景按 history_ref 用库原文对齐、无效引用剥离、
+    #         候选中未被引用的历史事件按实质去重后强制追加（宁多勿漏）。
     postprocess_entrypoint: fix_plan_items
   map:
     system_prompt:
@@ -130,6 +134,9 @@ execution:
 # ────────────────────────────────────────────────────────────────────
 knowledge:
   domain: 功能安全
+  # query_from 仅作用于引擎粗召回兜底路径（prepare 钩子失败/零命中时的一次性
+  # 大召回）：取 inputs[query_from] 构造 query，为空时降级用文档正文前 500 字符。
+  # HARA 主路径（prepare 钩子）检索用的是识别出的整车功能名，不依赖此键。
   query_from: item_definition
   top_k: 5
   score_threshold: 0.3
@@ -226,8 +233,8 @@ output:
           properties:
             fid: {type: string}
             word: {type: string}
-            malfunction_behavior: {type: string}
-            vehicle_hazard: {type: string}
+            malfunction_behavior: {type: string, description: "标 reused（知识库已有该功能该失效）时留空串，系统按知识库原文自动填充；标 adapted/new 时由你撰写完整文本"}
+            vehicle_hazard: {type: string, description: "同上：reused 留空串由系统填充，adapted/new 撰写完整文本"}
             source_note: {type: string}
             source: {type: object}
             scenarios:

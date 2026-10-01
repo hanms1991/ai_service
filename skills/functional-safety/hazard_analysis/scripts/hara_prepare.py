@@ -604,7 +604,9 @@ def fix_plan_items(ctx) -> dict:
     union_cache: dict[tuple[str, str], list[dict]] = {}
     covered_pairs: set[tuple[str, str]] = set()
 
-    # 第1步：失效模式原文覆盖（知识库有则强制用原文，一字不差）
+    # 第1步：失效模式原文覆盖（reused/缺省条目：知识库有则强制用原文，一字不差；
+    # adapted=LLM 有意改编，保留其文本不覆盖，与 HARA 事件层 _materialize 的
+    # full/adapted 语义对齐；改编条目同样计入 covered_pairs，第1.5步不再重复追加）
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -612,28 +614,32 @@ def fix_plan_items(ctx) -> dict:
         word = str(item.get("word") or "").strip()
         func_name = functions.get(fid, "")
         fm = fm_by_func.get(func_name, {}).get(word)
-        if fm:
-            item["malfunction_behavior"] = fm["malfunction_behavior"]
-            item["vehicle_hazard"] = fm["vehicle_hazard"]
-            src = item.get("source") if isinstance(item.get("source"), dict) else {}
-            src["type"] = "reused"
-            src["ref_id"] = fm["failure_id"]
-            if not str(src.get("project") or "").strip():
-                src_file = str(
-                    (((fm["chunk"].get("meta") or {}).get("source") or {}).get("file"))
-                    or ""
-                ).strip()
-                if src_file:
-                    src["project"] = src_file
-            item["source"] = src
-            # 同步失效矩阵：知识库命中的失效必须标记为选中
-            m = matrix_by_fid.get(fid)
-            if m is not None:
-                sel = m.get("selections") if isinstance(m.get("selections"), dict) else {}
-                sel[word] = True
-                m["selections"] = sel
+        if not fm:
+            continue
+        src = item.get("source") if isinstance(item.get("source"), dict) else {}
+        if str(src.get("type") or "").strip().lower() == "adapted":
             covered_pairs.add((fid, word))
-            stats["fm_covered"] += 1
+            continue
+        item["malfunction_behavior"] = fm["malfunction_behavior"]
+        item["vehicle_hazard"] = fm["vehicle_hazard"]
+        src["type"] = "reused"
+        src["ref_id"] = fm["failure_id"]
+        if not str(src.get("project") or "").strip():
+            src_file = str(
+                (((fm["chunk"].get("meta") or {}).get("source") or {}).get("file"))
+                or ""
+            ).strip()
+            if src_file:
+                src["project"] = src_file
+        item["source"] = src
+        # 同步失效矩阵：知识库命中的失效必须标记为选中
+        m = matrix_by_fid.get(fid)
+        if m is not None:
+            sel = m.get("selections") if isinstance(m.get("selections"), dict) else {}
+            sel[word] = True
+            m["selections"] = sel
+        covered_pairs.add((fid, word))
+        stats["fm_covered"] += 1
 
     # 第1.5步：补全知识库有但 LLM 未生成的失效模式（宁多勿漏）
     for fid, func_name in functions.items():
