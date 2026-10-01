@@ -1117,6 +1117,45 @@ def _sec_norm(value) -> int | None:
         return None
 
 
+# ISO 26262-3 Table 4 确定性 ASIL 反算。
+# 注意：必须与 scripts/generate_hara.py 的 _ASIL_TABLE/_asil_of 保持一致，
+# 评审钩子据此预判"显著事件（ASIL≥A）必须挂安全目标"。
+_REVIEW_ASIL_TABLE = {
+    (1, 1): {1: "QM", 2: "QM", 3: "QM"},
+    (1, 2): {1: "QM", 2: "QM", 3: "QM"},
+    (1, 3): {1: "QM", 2: "QM", 3: "A"},
+    (1, 4): {1: "QM", 2: "A", 3: "B"},
+    (2, 1): {1: "QM", 2: "QM", 3: "QM"},
+    (2, 2): {1: "QM", 2: "QM", 3: "A"},
+    (2, 3): {1: "QM", 2: "A", 3: "B"},
+    (2, 4): {1: "A", 2: "B", 3: "C"},
+    (3, 1): {1: "QM", 2: "QM", 3: "A"},
+    (3, 2): {1: "QM", 2: "A", 3: "B"},
+    (3, 3): {1: "A", 2: "B", 3: "C"},
+    (3, 4): {1: "B", 2: "C", 3: "D"},
+}
+
+
+def _event_asil(ev: dict) -> str | None:
+    """按渲染器同一规则由 S/E/C 反算事件 ASIL。
+
+    返回 "QM"/"A"/"B"/"C"/"D"；S/E/C 缺失或越界（渲染器标 CHECK）时返回 None。
+    """
+    s = _sec_norm(ev.get("S"))
+    e = _sec_norm(ev.get("E"))
+    c = _sec_norm(ev.get("C"))
+    # 经验做法：S=0 直接 QM（E/C 可不评估）；S>0 且 E=0 直接 QM（C 可不评估）
+    if s == 0 or (s is not None and e == 0):
+        return "QM"
+    if s is None or e is None or c is None:
+        return None
+    if not (0 <= s <= 3 and 0 <= e <= 4 and 0 <= c <= 3):
+        return None
+    if c == 0:
+        return "QM"
+    return _REVIEW_ASIL_TABLE[(s, e)][c]
+
+
 def _scene_norm(text: str) -> str:
     return re.sub(
         r"[\s，。、；：,.;:!？?()（）\"'“”‘’\-—]+", "", str(text or "")
@@ -1227,13 +1266,20 @@ def _review_one(ev: dict, candidates: dict[str, dict],
 
 
 def review_events(ctx) -> dict:
-    """评审钩子：物化 → 疑点检测 → 复核 LLM → 应用 → 再物化。
+    """评审钩子：物化 → 疑点检测（source 标注 + 安全目标缺口）→ 复核 LLM → 应用 → 再物化。
 
-    第一步物化（纯代码）：reused 事件全字段按知识库事件块原文回填、adapted
-    事件覆盖场景原文与安全目标组——沿用内容以库原文为准，LLM 只补差；
-    第二步代码比对找疑点（漏标沿用/虚引 ID/评级与所引不一致/场景与所引不符），
-    改不改、怎么改由复核 LLM 决定；复核应用后再物化一遍（改判 reused/adapted
-    的以库原文校正）。物化/复核失败均软降级保留原结果。
+    第一步物化（纯代码，仅在有历史召回时）：reused 事件全字段按知识库事件块
+    原文回填、adapted 事件覆盖场景原文与安全目标组——沿用内容以库原文为准，
+    LLM 只补差；
+    第二步代码级检测两类疑点：
+      A. source 标注疑点（漏标沿用/虚引 ID/评级与所引不一致/场景与所引不符），
+         仅在本切片有历史召回时检测；
+      B. 安全目标缺口（与历史召回无关，始终检测）：按 S/E/C 矩阵确定性反算
+         ASIL≥A 的显著事件，若 sg_text/safe_state/ftti 缺失即疑似评级层遗漏，
+         连同同切片邻近事件（同危害机理应共用同一目标文字）回炉 LLM 补全一次；
+    改不改、怎么改由复核 LLM 决定。sg_gap 类只允许白名单回填安全目标三字段，
+    防止复核顺带改动 S/E/C；source 类保持整事件合并。物化/复核失败均软降级
+    保留原结果；补全后仍缺失的，由渲染器标黄并在交付摘要中提示人工补全。
     """
     events = ctx.events if isinstance(ctx.events, list) else []
     if not events:
@@ -1261,8 +1307,6 @@ def review_events(ctx) -> dict:
         if word and str(meta.get("failure_type") or "").strip() != word:
             continue
         candidates[hid] = c
-    if not candidates:
-        return {"events": events, "usage": {}}
 
     map_cfg = (ctx.skill_cfg.get("execution") or {}).get("map") or {}
     review_cfg = map_cfg.get("review") or {}
@@ -1297,35 +1341,100 @@ def review_events(ctx) -> dict:
 
     mat_count = _materialize_all()
     ctx.logger.info(
-        "[hara_prepare] 评级评审（%s/%s）：%d 条事件，物化回填 %d 条"
-        "（reused 全字段/adapted 场景+安全目标组）",
-        fid or "?", word, len(events), mat_count,
+        "[hara_prepare] 评级评审（%s/%s）：%d 条事件，历史候选 %d 块，"
+        "物化回填 %d 条（reused 全字段/adapted 场景+安全目标组）",
+        fid or "?", word, len(events), len(candidates), mat_count,
     )
 
     suspects: list[dict] = []
+    # A 类：source 标注疑点（无历史召回时不检测，避免把"查无候选"误判为虚引）
+    if candidates:
+        for i, ev in enumerate(events):
+            if not isinstance(ev, dict):
+                continue
+            issues, matched = _review_one(ev, candidates, threshold)
+            if issues:
+                suspects.append({
+                    "index": i, "kind": "source_review",
+                    "issues": issues, "matched_history": matched,
+                })
+
+    # B 类：安全目标缺口（ASIL≥A 的显著事件缺 sg_text/safe_state/ftti）
+    sg_gap_indexes: set[int] = set()
+    _SG_FIELDS = ("sg_text", "safe_state", "ftti")
+    _SG_LABEL = {"sg_text": "安全目标", "safe_state": "安全状态", "ftti": "FTTI"}
     for i, ev in enumerate(events):
         if not isinstance(ev, dict):
             continue
-        issues, matched = _review_one(ev, candidates, threshold)
-        if issues:
-            suspects.append(
-                {"index": i, "issues": issues, "matched_history": matched}
-            )
+        asil = _event_asil(ev)
+        if asil is None or asil == "QM":
+            continue
+        missing = [
+            _SG_LABEL[k] for k in _SG_FIELDS
+            if not str(ev.get(k) or "").strip()
+        ]
+        if not missing:
+            continue
+        sg_gap_indexes.add(i)
+        suspects.append({
+            "index": i, "kind": "sg_gap",
+            "issues": [
+                f"安全目标缺口：系统按 ISO 26262 矩阵由该事件 S/E/C 判定 "
+                f"ASIL={asil}（显著事件，必须建立安全目标），但"
+                f"{'/'.join(missing)}为空，疑似评级层遗漏。请补全 "
+                f"sg_text/safe_state/ftti 三项：sg_text 用「防止……」句式，"
+                "并与 context_events 中同危害机理事件的安全目标文字保持完全"
+                "一致；safe_state 给出可达到的安全状态；ftti 给时间要求"
+                "（无数据时带 TBD）。禁止修改 S/E/C 与其他字段；系统以矩阵"
+                "判定为准，宁可补齐由系统/人工复核，也不要留空。"
+            ],
+            "matched_history": None,
+            "computed_asil": asil,
+        })
+
     ctx.logger.info(
-        "[hara_prepare] 评级评审（%s/%s）：%d 条事件，疑似标注问题 %d 条",
-        fid or "?", word, len(events), len(suspects),
+        "[hara_prepare] 评级评审（%s/%s）：%d 条事件，source 标注疑点 %d 条，"
+        "安全目标缺口 %d 条",
+        fid or "?", word, len(events),
+        len(suspects) - len(sg_gap_indexes), len(sg_gap_indexes),
     )
     if not suspects:
         return {"events": events, "usage": {}}
 
+    # 同切片邻近事件（同一功能失效单元）作为补全上下文：同危害机理事件应共用
+    # 完全相同的安全目标文字，供复核 LLM 对齐
+    context_events = []
+    for i, ev in enumerate(events):
+        if not isinstance(ev, dict) or i in sg_gap_indexes:
+            continue
+        context_events.append({
+            "index": i,
+            "scenario_text": str(ev.get("scenario_text") or "")[:200],
+            "S": _sec_norm(ev.get("S")),
+            "E": _sec_norm(ev.get("E")),
+            "C": _sec_norm(ev.get("C")),
+            "asil": _event_asil(ev),
+            "sg_text": str(ev.get("sg_text") or ""),
+            "safe_state": str(ev.get("safe_state") or ""),
+            "ftti": str(ev.get("ftti") or ""),
+        })
     system_prompt = ctx.build_stage_prompt(review_cfg)
     payload = {
+        "unit": {
+            "fid": fid,
+            "word": word,
+            "malfunction_behavior": str(unit.get("malfunction_behavior") or ""),
+            "vehicle_hazard": str(unit.get("vehicle_hazard") or ""),
+        },
         "suspects": suspects,
         "current_events": [events[s["index"]] for s in suspects],
+        "context_events": context_events,
     }
     user_message = (
-        "以下事件的 source 标注经系统比对存在疑点，请按系统提示词逐条复核，"
-        "输出修正后的完整事件（index 必须与 suspects 一致）。\n"
+        "以下 HARA 事件经系统代码级校验存在疑点（suspects 中 kind 标明类型："
+        "source_review=source 标注疑点，sg_gap=显著事件缺少安全目标）。"
+        "请严格按系统提示词逐条复核，只对疑点事件输出修正后的完整事件"
+        "（index 必须与 suspects 一致，不得新增或遗漏）。\n"
         + json.dumps(payload, ensure_ascii=False, indent=1)
     )
     max_tokens = review_cfg.get("max_tokens")
@@ -1340,6 +1449,7 @@ def review_events(ctx) -> dict:
 
     fixed = parsed.get("events")
     applied = 0
+    sg_filled = 0
     if isinstance(fixed, list):
         by_index: dict[int, dict] = {}
         for fe in fixed:
@@ -1348,18 +1458,40 @@ def review_events(ctx) -> dict:
         for s in suspects:
             i = s["index"]
             fe = by_index.get(i)
-            if isinstance(fe, dict):
-                merged = dict(events[i])          # 原事件兜底，防复核输出缺字段
-                for k, v in fe.items():
-                    if k != "index":
-                        merged[k] = v
-                events[i] = merged
-                applied += 1
+            if not isinstance(fe, dict):
+                continue
+            if s.get("kind") == "sg_gap":
+                # 白名单回填：只接受非空安全目标三字段，杜绝复核改动 S/E/C
+                changed = False
+                for k in _SG_FIELDS:
+                    v = fe.get(k)
+                    if isinstance(v, str) and v.strip():
+                        events[i][k] = v.strip()
+                        changed = True
+                if changed:
+                    sg_filled += 1
+                    applied += 1
+                continue
+            merged = dict(events[i])          # 原事件兜底，防复核输出缺字段
+            for k, v in fe.items():
+                if k != "index":
+                    merged[k] = v
+            events[i] = merged
+            applied += 1
 
     mat_count2 = _materialize_all()  # 复核改判后按库原文再校正一遍
+    # 复核+再物化后仍缺安全目标的显著事件：留给渲染器标黄与交付摘要人工提示
+    sg_still = 0
+    for i in sg_gap_indexes:
+        ev = events[i] if i < len(events) else {}
+        if isinstance(ev, dict) and _event_asil(ev) not in (None, "QM") and any(
+            not str(ev.get(k) or "").strip() for k in _SG_FIELDS
+        ):
+            sg_still += 1
     ctx.logger.info(
-        "[hara_prepare] 评级复核（%s/%s）：疑似 %d 条，模型修正回填 %d 条，"
-        "复核后再物化 %d 条",
-        fid or "?", word, len(suspects), applied, mat_count2,
+        "[hara_prepare] 评级复核（%s/%s）：疑似 %d 条（安全目标缺口 %d），"
+        "模型回填 %d 条（其中安全目标补全 %d 条，仍缺 %d 条），复核后再物化 %d 条",
+        fid or "?", word, len(suspects), len(sg_gap_indexes),
+        applied, sg_filled, sg_still, mat_count2,
     )
     return {"events": events, "usage": usage}

@@ -958,7 +958,9 @@ class MapReviewContext:
     """map_reduce 每切片结果评审钩子上下文（稳定契约：只增字段）。
 
     数据：skill_cfg/index（0 基切片序号）/unit（当前切片 dict）/plan_parsed/
-          events（评级层原始输出事件列表）/chunks（本切片召回的历史知识分块）/logger；
+          events（评级层原始输出事件列表）/chunks（本切片召回的历史知识分块，
+          可能为空列表——不依赖历史召回的复核如"显著事件缺少安全目标"仍会执行，
+          钩子须自行处理空 chunks）/logger；
     能力：bind_json_model / build_stage_prompt（传完整阶段配置）/
           invoke_json_stage / extract_usage（复核 LLM 调用与 token 计量）。
     钩子 review_entrypoint(ctx) -> {"events": [...], "usage": {...}}（list 视为仅
@@ -1675,40 +1677,41 @@ def _execute_staged_skill(
                     f"评级层(切片{index + 1})输出缺少列表字段 {events_key!r}"
                 )
 
-            # 评审钩子（技能侧复核 source 标注，疑似项回炉 LLM 二次校验）：
-            # 异常软降级保留原结果；usage 并入本切片计量
+            # 评审钩子（技能侧代码级复核，疑似项回炉 LLM 二次校验）：
+            # 只要技能声明了 review_entrypoint 就执行——部分复核（如显著事件
+            # 缺少安全目标的补全）不依赖历史召回，chunks 允许为空；
+            # 未声明入口时钩子返回 None；异常软降级保留原结果，usage 并入本切片。
             review_usage: dict = {}
-            if map_chunks:
-                try:
-                    review_result = _run_map_review_hook(MapReviewContext(
-                        skill_cfg=skill_cfg,
-                        index=index,
-                        unit=unit,
-                        plan_parsed=plan_parsed,
-                        events=events,
-                        chunks=map_chunks,
-                        logger=logger,
-                        bind_json_model=_bind_json_model,
-                        build_stage_prompt=lambda cfg: _build_stage_system_prompt(
-                            skill_cfg, cfg
-                        ),
-                        invoke_json_stage=_invoke_json_stage,
-                        extract_usage=_extract_usage,
-                    ))
-                except Exception as exc:  # noqa: BLE001 —— 评审失败不阻断出表
-                    logger.warning(
-                        "[capability_registry] 评级切片 %d 评审钩子降级（保留原结果）：%s",
-                        index + 1, exc,
-                    )
-                else:
-                    if isinstance(review_result, dict):
-                        if isinstance(review_result.get("events"), list):
-                            events = review_result["events"]
-                        ru = review_result.get("usage")
-                        if isinstance(ru, dict):
-                            review_usage = ru
-                    elif isinstance(review_result, list):
-                        events = review_result
+            try:
+                review_result = _run_map_review_hook(MapReviewContext(
+                    skill_cfg=skill_cfg,
+                    index=index,
+                    unit=unit,
+                    plan_parsed=plan_parsed,
+                    events=events,
+                    chunks=map_chunks,
+                    logger=logger,
+                    bind_json_model=_bind_json_model,
+                    build_stage_prompt=lambda cfg: _build_stage_system_prompt(
+                        skill_cfg, cfg
+                    ),
+                    invoke_json_stage=_invoke_json_stage,
+                    extract_usage=_extract_usage,
+                ))
+            except Exception as exc:  # noqa: BLE001 —— 评审失败不阻断出表
+                logger.warning(
+                    "[capability_registry] 评级切片 %d 评审钩子降级（保留原结果）：%s",
+                    index + 1, exc,
+                )
+            else:
+                if isinstance(review_result, dict):
+                    if isinstance(review_result.get("events"), list):
+                        events = review_result["events"]
+                    ru = review_result.get("usage")
+                    if isinstance(ru, dict):
+                        review_usage = ru
+                elif isinstance(review_result, list):
+                    events = review_result
 
             usage = _extract_usage(map_response)
             for k in ("prompt_tokens", "completion_tokens", "total_tokens"):

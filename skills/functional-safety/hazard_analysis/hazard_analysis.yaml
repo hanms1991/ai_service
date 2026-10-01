@@ -1,7 +1,7 @@
 name: hazard_analysis
 display_name: 功能安全危害分析（HARA）
 description: 基于相关项定义文档或功能/系统描述，按 ISO 26262 与团队标准模板完成整车功能枚举、11 个失效词过滤、充分场景 HAZOP 展开与逐场景 S/E/C 评级，产出 11-Sheet 团队标准 HARA 工作簿（xlsx），历史项目条目优先沿用并在备注列标注来源。
-version: 3.0.0
+version: 3.1.0
 risk_level: medium
 domain:
   - 功能安全
@@ -106,9 +106,13 @@ execution:
       请按系统提示词的「场景并集」规则处理：先对清单中每个场景输出一条 HARA 事件，
       再把历史参考中同功能同失效、清单缺失的历史事件补录为 reused 事件，
       实质相同场景去重；只输出 JSON 对象。
-    # 评审钩子（复用 prepare.script 同模块）：代码比对全部事件 source 标注与本次
-    # 召回候选，疑似项（漏标沿用/虚引 ID/评级与所引不一致）回炉大模型二次校验；
-    # 代码不改标，改判由复核 LLM 决定；异常软降级保留原评级结果。
+    # 评审钩子（复用 prepare.script 同模块）：代码级复核全部事件——
+    # ① source 标注与召回候选比对，疑似项（漏标沿用/虚引 ID/评级与所引不一致）
+    #   回炉大模型二次校验（仅在有历史召回时检测）；
+    # ② 按 S/E/C 矩阵确定性反算 ASIL，ASIL≥A 的显著事件缺 sg_text/safe_state/
+    #   ftti 时，连同同切片邻近事件回炉大模型补全一次（与历史召回无关，始终执行）；
+    # 代码不改标/评级，补全采用字段白名单，异常软降级保留原评级结果；
+    # 仍缺的条目由渲染器标黄并在交付摘要中提示人工补全。
     review_entrypoint: review_events
     review:
       system_prompt:
@@ -291,6 +295,8 @@ output:
       hara_events: HARA 危害事件数
       events_qm: QM 事件
       events_asil: ASIL≥A 显著事件
+      issues_sg_missing: 缺少安全目标待人工补全
+      issues_sec_check: S/E/C 待复核条目
       safety_goals_vh: 整车安全目标数（合并后）
       reused: 沿用历史条目
       adapted: 改编历史条目

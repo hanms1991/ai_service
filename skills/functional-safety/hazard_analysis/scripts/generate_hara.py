@@ -153,18 +153,28 @@ def generate(in_path: str, out_path: str) -> dict:
     _write_functions(wb, pfx, functions, func_info)
     _write_malfunctions(wb, pfx, functions, func_info, matrix)
     _write_hazop(wb, pfx, functions, func_info, items_by_func, mf_id_of_item, event_records)
-    sg_left, vh_goals = _write_hara(wb, pfx, functions, func_info, items_by_func, event_records)
+    sg_left, vh_goals, validation = _write_hara(
+        wb, pfx, functions, func_info, items_by_func, event_records
+    )
     _write_safety_goals(wb, sg_left, vh_goals)
 
     # 统计
+    n_sec_check = len(validation["sec_check"])
+    n_qm = sum(1 for r in event_records if r["asil"] == "QM") - n_sec_check
     stats.update({
         "functions": len(functions),
         "sc_malfunctions": len(hazop),
         "hara_events": len(event_records),
-        "events_qm": sum(1 for r in event_records if r["asil"] == "QM"),
-        "events_asil": sum(1 for r in event_records if r["asil"] != "QM"),
+        "events_qm": n_qm,
+        "events_asil": len(event_records) - n_qm - n_sec_check,
+        "events_sec_check": n_sec_check,
         "safety_goals_vh": len(vh_goals),
         "reused": 0, "adapted": 0, "new": 0,
+        # 交付物校验（评级复核 LLM 补全一轮后的最终结果）：
+        # issues_* 需人工处理；qm_sg_cleared 为系统自动纠正，不算问题
+        "issues_sg_missing": len(validation["missing_sg"]),
+        "issues_sec_check": n_sec_check,
+        "qm_sg_cleared": validation["qm_sg_cleared"],
     })
     for r in event_records:
         kind = str((r["event"].get("source") or {}).get("type") or "new").lower()
@@ -331,6 +341,9 @@ def _write_hara(wb, pfx, functions, func_info, items_by_func, event_records):
     # 每功能 SG 独立序号
     sg_counter: dict[str, int] = defaultdict(int)
     sg_left = []   # 中间安全目标行（仅 ASIL≥A）
+    # 交付物校验明细：评级复核 LLM 补全一次后仍残留的问题，随 stats 上抛，
+    # 并由 summarize() 在交付摘要中显式提示人工处理
+    validation = {"missing_sg": [], "sec_check": [], "qm_sg_cleared": 0}
     r = 3
     for fid, items in items_by_func.items():
         fseq = func_info[fid]["seq"]
@@ -359,6 +372,12 @@ def _write_hara(wb, pfx, functions, func_info, items_by_func, event_records):
             if asil is None:
                 asil = "CHECK"
                 warnings.append("S/E/C 越界，请复核")
+                validation["sec_check"].append({
+                    "hzrd_id": rec["hzrd_id"], "func": fname,
+                    "mf_id": rec["mf_id"], "word": rec["unit"].get("word") or "",
+                    "asil": asil,
+                    "scenario": str(ev.get("scenario_text") or "")[:60],
+                })
 
             sg_text = str(ev.get("sg_text") or "").strip()
             safe_state = str(ev.get("safe_state") or "").strip()
@@ -374,9 +393,16 @@ def _write_hara(wb, pfx, functions, func_info, items_by_func, event_records):
                 })
                 if not sg_text:
                     warnings.append("显著事件缺少安全目标")
+                    validation["missing_sg"].append({
+                        "hzrd_id": rec["hzrd_id"], "func": fname,
+                        "mf_id": rec["mf_id"], "word": rec["unit"].get("word") or "",
+                        "asil": asil,
+                        "scenario": str(ev.get("scenario_text") or "")[:60],
+                    })
             elif sg_text:
                 # QM/CHECK 事件不建立安全目标：清空模型误填内容，避免流出到下游表格
                 warnings.append("QM 事件不应挂安全目标（已自动清空）")
+                validation["qm_sg_cleared"] += 1
                 sg_text, safe_state, ftti = "", "", ""
 
             values = [
@@ -437,7 +463,7 @@ def _write_hara(wb, pfx, functions, func_info, items_by_func, event_records):
             "safe_state": top["safe_state"], "ftti": top["ftti"],
             "remark": remark,
         })
-    return sg_left, vh_goals
+    return sg_left, vh_goals, validation
 
 
 def _write_safety_goals(wb, sg_left, vh_goals):
@@ -506,21 +532,127 @@ def _extract_vehicle_goals(artifact_path: str, limit: int = 15) -> list[dict]:
         return []
 
 
-def summarize(in_json_path: str, artifact_path: str) -> str:
-    """引擎 output.renderer.summary_entrypoint：返回附加 markdown 段落。"""
-    goals = _extract_vehicle_goals(artifact_path)
-    if not goals:
-        return ""
+def _extract_validation(artifact_path: str) -> dict:
+    """从渲染后的「HARA 分析」sheet 回读校验结果（与黄色高亮/备注列完全一致）。
+
+    数据自 R3 起，列：A 危害事件ID / B 整车功能 / C 失效ID / F 运行场景 /
+    O ASIL / T 备注。返回：
+      missing_sg：显著事件（ASIL≥A）缺安全目标（评级复核 LLM 补全一轮后仍缺）；
+      sec_check：S/E/C 越界或缺失、无法定级（渲染器标 CHECK）；
+      qm_cleared：QM 事件误挂安全目标、已由系统自动清空的条数（非问题）。
+    """
+    out = {"missing_sg": [], "sec_check": [], "qm_cleared": 0}
+    try:
+        wb = load_workbook(artifact_path, read_only=True, data_only=True)
+        if "HARA 分析" not in wb.sheetnames:
+            wb.close()
+            return out
+        ws = wb["HARA 分析"]
+        for row in ws.iter_rows(min_row=3, values_only=True):
+            hid = row[0] if len(row) > 0 else None
+            if not hid or not str(hid).strip():
+                continue
+            remark = str(row[19] or "") if len(row) > 19 else ""
+            base = {
+                "hzrd_id": str(hid),
+                "func": str(row[1] or ""),
+                "mf_id": str(row[2] or ""),
+                "asil": str(row[14] or ""),
+                "scenario": str(row[5] or "").replace("\n", " "),
+            }
+            if "显著事件缺少安全目标" in remark:
+                out["missing_sg"].append(base)
+            if "S/E/C 越界" in remark:
+                out["sec_check"].append(base)
+            if "已自动清空" in remark:
+                out["qm_cleared"] += 1
+        wb.close()
+    except Exception:
+        return out
+    return out
+
+
+def _md_cell(text: str, limit: int = 40) -> str:
+    s = str(text or "").replace("|", "／").replace("\n", " ").strip()
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+def _render_validation(val: dict) -> str:
+    """校验结论段落：无问题显式通过；有问题逐条列出需人工处理项。"""
+    missing = val.get("missing_sg") or []
+    sec = val.get("sec_check") or []
+    cleared = int(val.get("qm_cleared") or 0)
+    if not missing and not sec:
+        lines = [
+            "**交付物校验：通过**",
+            "",
+            "- 全部显著事件（ASIL≥A）均已挂接安全目标，S/E/C 评级无越界或缺项。",
+        ]
+        if cleared:
+            lines.append(
+                f"- {cleared} 条 QM 事件误挂的安全目标已由系统自动清空，无需人工处理。"
+            )
+        return "\n".join(lines)
+
+    n = len(missing) + len(sec)
     lines = [
-        f"**整车安全目标清单（按最高 ASIL 排序，前 {len(goals)} 条，全量见工作簿）**：",
+        f"**⚠️ 交付物校验：{n} 条需人工处理**（系统已自动回炉大模型补全一次仍未闭环；"
+        "工作簿「HARA 分析」sheet 已黄色高亮，详见备注列）：",
         "",
-        "| 整车安全目标 ID | ASIL | 安全目标 |",
-        "|---|---|---|",
     ]
-    for g in goals:
-        goal_text = str(g["goal"]).replace("|", "／").replace("\n", " ")
-        lines.append(f"| {g['sg_id']} | {g['asil']} | {goal_text} |")
-    return "\n".join(lines)
+    if missing:
+        lines.append(
+            f"1. **显著事件缺少安全目标（{len(missing)} 条）**——请人工补全"
+            "安全目标（防止……）、安全状态、FTTI："
+        )
+        lines += ["", "| 危害事件ID | 整车功能 | 失效ID | ASIL | 运行场景 |",
+                  "|---|---|---|---|---|"]
+        for e in missing:
+            lines.append(
+                f"| {e['hzrd_id']} | {_md_cell(e['func'], 16)} | {e['mf_id']} "
+                f"| {e['asil']} | {_md_cell(e['scenario'])} |"
+            )
+        lines.append("")
+    if sec:
+        idx = 2 if missing else 1
+        lines.append(
+            f"{idx}. **S/E/C 越界或缺失（{len(sec)} 条）**——请人工复核评级，"
+            "定级为 ASIL≥A 后再补挂安全目标："
+        )
+        lines += ["", "| 危害事件ID | 整车功能 | 失效ID | 运行场景 |",
+                  "|---|---|---|---|"]
+        for e in sec:
+            lines.append(
+                f"| {e['hzrd_id']} | {_md_cell(e['func'], 16)} | {e['mf_id']} "
+                f"| {_md_cell(e['scenario'])} |"
+            )
+        lines.append("")
+    if cleared:
+        lines.append(
+            f"（另：{cleared} 条 QM 事件误挂的安全目标已自动清空，无需处理。）"
+        )
+    return "\n".join(lines).rstrip()
+
+
+def summarize(in_json_path: str, artifact_path: str) -> str:
+    """引擎 output.renderer.summary_entrypoint：返回附加 markdown 段落。
+
+    首段为交付物校验结论（通过/需人工处理清单）；其后附整车安全目标清单。
+    """
+    sections = [_render_validation(_extract_validation(artifact_path))]
+    goals = _extract_vehicle_goals(artifact_path)
+    if goals:
+        goal_lines = [
+            f"**整车安全目标清单（按最高 ASIL 排序，前 {len(goals)} 条，全量见工作簿）**：",
+            "",
+            "| 整车安全目标 ID | ASIL | 安全目标 |",
+            "|---|---|---|",
+        ]
+        for g in goals:
+            goal_text = str(g["goal"]).replace("|", "／").replace("\n", " ")
+            goal_lines.append(f"| {g['sg_id']} | {g['asil']} | {goal_text} |")
+        sections.append("\n".join(goal_lines))
+    return "\n\n".join(s for s in sections if s and s.strip())
 
 
 if __name__ == "__main__":
