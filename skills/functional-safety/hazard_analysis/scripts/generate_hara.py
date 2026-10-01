@@ -375,7 +375,9 @@ def _write_hara(wb, pfx, functions, func_info, items_by_func, event_records):
                 if not sg_text:
                     warnings.append("显著事件缺少安全目标")
             elif sg_text:
-                warnings.append("QM 事件不应挂安全目标")
+                # QM/CHECK 事件不建立安全目标：清空模型误填内容，避免流出到下游表格
+                warnings.append("QM 事件不应挂安全目标（已自动清空）")
+                sg_text, safe_state, ftti = "", "", ""
 
             values = [
                 rec["hzrd_id"], fname, rec["mf_id"],
