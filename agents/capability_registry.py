@@ -883,7 +883,11 @@ def _load_skill_script_module(skill_cfg: dict, script_rel: str,
 def _run_prepare_hook(ctx: PrepareContext) -> dict | None:
     """加载并执行技能声明的 execution.prepare 脚本；未声明返回 None。
 
-    约定入口 prepare(ctx) -> dict，引擎只解释约定键 kb_block/usage，
+    约定入口 prepare(ctx) -> dict，引擎解释约定键：
+      - kb_block：注入规划层的历史知识块（空串 → 引擎回退粗召回）；
+      - usage：钩子内 LLM 调用的 token 计量；
+      - doc_supplement：可选，技能侧对上传文档的确定性结构化补充
+        （如直接解析 DOCX 功能清单表格），非空时紧随文档块注入规划层；
     其余键透传忽略；异常由调用方捕获软降级。
     """
     prepare_cfg = (ctx.skill_cfg.get("execution") or {}).get("prepare") or {}
@@ -1435,6 +1439,9 @@ def _execute_staged_skill(
     prepare_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     prepare_invoked = False
     plan_kb_block = ""
+    # 技能侧对上传文档的确定性结构化补充（如 DOCX 功能清单直解析，
+    # 修正平台 Markdown 表格转换的合并单元格错列）；紧随 doc_block 注入规划层
+    plan_doc_supplement = ""
     prepare_ctx: PrepareContext | None = None
     if (exec_cfg.get("prepare") or {}).get("script"):
         from core.kb_client import format_knowledge_layered_block, retrieve_knowledge
@@ -1464,12 +1471,14 @@ def _execute_staged_skill(
             hook_result = _run_prepare_hook(prepare_ctx) or {}
             prepare_invoked = True
             plan_kb_block = str(hook_result.get("kb_block") or "")
+            plan_doc_supplement = str(hook_result.get("doc_supplement") or "")
             hook_usage = hook_result.get("usage") or {}
             if isinstance(hook_usage, dict):
                 for k in prepare_usage:
                     prepare_usage[k] = int(hook_usage.get(k, 0) or 0)
             logger.info(
-                "[capability_registry] prepare 钩子知识注入：%d 字符", len(plan_kb_block),
+                "[capability_registry] prepare 钩子知识注入：%d 字符；文档结构化补充：%d 字符",
+                len(plan_kb_block), len(plan_doc_supplement),
             )
         except Exception as exc:  # noqa: BLE001 —— 前置钩子失败必须软降级，不阻断主流程
             logger.warning(
@@ -1488,16 +1497,24 @@ def _execute_staged_skill(
         )
 
     # ── 阶段 1：规划 ──
+    plan_doc_supplement_block = (
+        f"\n\n{plan_doc_supplement.strip()}\n" if plan_doc_supplement else ""
+    )
     plan_user_message = (
-        rendered + doc_block + plan_kb_block + ref_block + schema_example_block
+        rendered
+        + doc_block
+        + plan_doc_supplement_block
+        + plan_kb_block
+        + ref_block
+        + schema_example_block
     )
     plan_system_prompt = _build_stage_system_prompt(skill_cfg, plan_cfg)
     emit_skill_progress("正在规划：梳理功能、失效模式与场景清单…")
     logger.info(
-        "[capability_registry] 规划层开始：注入 %d 字符（文档 %d + 知识 %d），"
-        "max_tokens=%s",
-        len(plan_user_message), len(doc_block), len(plan_kb_block),
-        plan_cfg.get("max_tokens"),
+        "[capability_registry] 规划层开始：注入 %d 字符（文档 %d + 结构化补充 %d "
+        "+ 知识 %d），max_tokens=%s",
+        len(plan_user_message), len(doc_block), len(plan_doc_supplement_block),
+        len(plan_kb_block), plan_cfg.get("max_tokens"),
     )
     plan_parsed, plan_response = _invoke_json_stage(
         _bind_json_model(plan_cfg.get("max_tokens")),

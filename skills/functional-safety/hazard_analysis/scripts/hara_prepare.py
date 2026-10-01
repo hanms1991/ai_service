@@ -22,10 +22,12 @@ execution.prepare.script 由引擎动态加载调用。
 from __future__ import annotations
 
 import difflib
+import importlib.util
 import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 logger = logging.getLogger("skills.hara_prepare")
 
@@ -45,6 +47,59 @@ _DEFAULT_EVENT_FACETS = [
     "颠簸 减速带 紧急避让",
 ]
 
+# 同目录结构化抽取模块（doc_item_table.py）的惰性加载缓存
+_DOC_EXTRACTOR = None
+_DOC_EXTRACTOR_NAME = "doc_item_table"
+
+
+def _load_doc_extractor():
+    """惰性加载同目录 doc_item_table 模块（技能脚本以独立模块方式被引擎加载）。"""
+    global _DOC_EXTRACTOR
+    if _DOC_EXTRACTOR is None:
+        path = Path(__file__).resolve().parent / f"{_DOC_EXTRACTOR_NAME}.py"
+        spec = importlib.util.spec_from_file_location(
+            f"hara_{_DOC_EXTRACTOR_NAME}", path
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _DOC_EXTRACTOR = module
+    return _DOC_EXTRACTOR
+
+
+def _build_doc_supplement(ctx) -> str:
+    """从上传的原始 DOCX 确定性抽取功能清单，返回注入识别/规划层的权威段落。
+
+    平台 Markdown 转换对合并单元格表格不稳定（vMerge 续行被丢弃导致错列，
+    LLM 会把同一功能编号的多行实现要素误枚举为重复 Feature）；此处绕过
+    Markdown 直接解析原始 Word。仅处理 file_id 对应的 .docx；无文件/非
+    docx/解析失败一律软降级返回空串，不阻断技能执行。
+    """
+    try:
+        source_cfg = ctx.skill_cfg.get("document_source") or {}
+        file_id_input = str(source_cfg.get("file_id_input") or "file_id")
+        file_id = str((ctx.inputs or {}).get(file_id_input) or "").strip()
+        if not file_id:
+            return ""
+        from core.file_sandbox import get_meta, resolve_stored_path
+
+        meta = get_meta(file_id)
+        if (meta.ext or "").lower() != ".docx":
+            return ""
+        extractor = _load_doc_extractor()
+        data = extractor.extract_item_functions(resolve_stored_path(file_id))
+        supplement = extractor.render_supplement(data) if data else ""
+        if supplement:
+            logger.info(
+                "[hara_prepare] 功能清单结构化抽取成功：%d 个整车功能，%d 个 Feature",
+                len(data.get("functions") or []),
+                sum(len(f.get("features") or [])
+                    for f in (data.get("functions") or [])),
+            )
+        return supplement
+    except Exception as exc:  # noqa: BLE001 —— 抽取是增强而非前提
+        logger.warning("[hara_prepare] 功能清单结构化抽取降级：%s", exc)
+        return ""
+
 
 def prepare(ctx) -> dict:
     """识别相关项/整车功能，按功能双路精准检索，返回规划层知识注入块。"""
@@ -55,7 +110,10 @@ def prepare(ctx) -> dict:
     if not identify_cfg.get("enabled"):
         return {"kb_block": "", "usage": {}, "identify_info": None}
 
-    info, response = _run_identify_stage(ctx, identify_cfg)
+    # 确定性结构化抽取（DOCX 功能清单）：同时供识别层与规划层使用
+    doc_supplement = _build_doc_supplement(ctx)
+
+    info, response = _run_identify_stage(ctx, identify_cfg, doc_supplement)
     kb_block = _targeted_layered_retrieval(ctx, skill_cfg, info)
     logger.info(
         "[hara_prepare] 识别层精准检索注入：%d 字符；识别功能=%s",
@@ -65,23 +123,27 @@ def prepare(ctx) -> dict:
         "kb_block": kb_block,
         "usage": ctx.extract_usage(response),
         "identify_info": info,
+        "doc_supplement": doc_supplement,
     }
 
 
 # ── Stage 0：识别相关项与整车功能清单 ──────────────────────────────
 
-def _run_identify_stage(ctx, identify_cfg: dict):
+def _run_identify_stage(ctx, identify_cfg: dict, doc_supplement: str = ""):
     """识别层：只从相关项信息中识别 item 基本信息与整车功能名称清单。
 
     不注入知识库、不做安全分析，输出用于驱动功能级精准检索。
     functions 为空时抛异常，由引擎统一软降级。
     """
     system_prompt = ctx.build_stage_prompt(identify_cfg)
+    supplement_block = f"\n\n{doc_supplement}\n" if doc_supplement else ""
     user_message = (
         ctx.rendered
         + ctx.doc_block
+        + supplement_block
         + "\n\n本阶段只做识别：列出相关项基本信息与【整车层级功能】名称清单，"
         "不做失效/危害/评级分析；严格只输出约定的紧凑 JSON 对象，不要输出解释。"
+        "若上方提供了《系统结构化抽取：相关项功能清单》，整车功能以该块分组为准。"
     )
     max_tokens = identify_cfg.get("max_tokens")
     parsed, response = ctx.invoke_json_stage(
@@ -512,6 +574,62 @@ def _retrieve_function_failure_modes(retrieve, domain: str, func_name: str,
     return result
 
 
+def _name_norm(text: str) -> str:
+    """名称归一：去空白与标点并小写，用于无编号 Feature 的重复判定。"""
+    return re.sub(
+        r"[\s，。、；：,.;:!？?()（）\"'“”‘’\-—_/]+", "", str(text or "")
+    ).lower()
+
+
+def _merge_feature(base: dict, dup: dict) -> None:
+    """把重复 Feature（同 feature_list_id 或同名）dup 合并进首条 base。"""
+    if not str(base.get("description") or "").strip() and str(
+        dup.get("description") or ""
+    ).strip():
+        base["description"] = dup["description"]
+    # do_hara：任一"是"即"是"；否则取首个非空
+    if str(dup.get("do_hara") or "").strip() == "是":
+        base["do_hara"] = "是"
+    elif not str(base.get("do_hara") or "").strip():
+        base["do_hara"] = dup.get("do_hara") or ""
+    for field in ("no_hara_reason", "doc_ref"):
+        bval = str(base.get(field) or "").strip()
+        dval = str(dup.get(field) or "").strip()
+        if dval and dval not in bval:
+            base[field] = "；".join(x for x in (bval, dval) if x)
+    if not isinstance(base.get("source"), dict) and isinstance(
+        dup.get("source"), dict
+    ):
+        base["source"] = dup["source"]
+
+
+def _dedupe_function_features(plan: dict) -> int:
+    """规划层 Feature 去重兜底：同功能内按 feature_list_id（无编号按名称）归并。
+
+    Word 模板不固定（纵向合并、一个编号跨多行实现要素）时，LLM 可能按表格
+    行枚举重复 Feature；此处是不依赖文档解析与知识库的最后防线。返回合并条数。
+    """
+    merged = 0
+    for fn in plan.get("functions") or []:
+        if not isinstance(fn, dict) or not isinstance(fn.get("features"), list):
+            continue
+        seen: dict[str, int] = {}
+        kept: list[dict] = []
+        for feat in fn["features"]:
+            if not isinstance(feat, dict):
+                continue
+            fid = str(feat.get("feature_list_id") or "").strip()
+            key = f"id:{fid.lower()}" if fid else f"name:{_name_norm(feat.get('description'))}"
+            if key in seen:
+                _merge_feature(kept[seen[key]], feat)
+                merged += 1
+                continue
+            seen[key] = len(kept)
+            kept.append(feat)
+        fn["features"] = kept
+    return merged
+
+
 def fix_plan_items(ctx) -> dict:
     """规划后处理钩子（纯代码，不调 LLM）：知识库内容一律以原文为准，LLM 只补差。
 
@@ -537,9 +655,14 @@ def fix_plan_items(ctx) -> dict:
     if not isinstance(items, list):
         items = []
         plan["hazop_items"] = items
+    # 第-2步：Feature 去重兜底（不依赖知识库；在任何 KB 处理前先归并，
+    # 防止模板中一个功能编号跨多行实现要素被 LLM 枚举成多个重复 Feature）
+    deduped = _dedupe_function_features(plan)
+    if deduped:
+        logger.info("[hara_prepare] 规划后处理：归并重复 Feature %d 条", deduped)
     stats = {
         "func_covered": 0, "fm_covered": 0, "fm_appended": 0,
-        "scene_aligned": 0, "scene_appended": 0,
+        "scene_aligned": 0, "scene_appended": 0, "features_deduped": deduped,
     }
     kb_cfg = ctx.skill_cfg.get("knowledge") or {}
     domain = str(kb_cfg.get("domain") or "").strip()

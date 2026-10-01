@@ -16,7 +16,9 @@
 """
 from __future__ import annotations
 
+import logging
 import os
+import tempfile
 
 from langchain_core.tools import tool
 
@@ -27,9 +29,33 @@ from core.file_sandbox import (
     resolve_stored_path,
 )
 
+logger = logging.getLogger("tools.read_document")
+
 
 def _max_chars() -> int:
     return int(os.getenv("READ_DOC_MAX_CHARS", "60000"))
+
+
+def _prepare_convert_path(path: str, ext: str) -> tuple[str, str | None]:
+    """转换前预处理，返回（实际转换路径, 临时文件路径或 None）。
+
+    docx：先把纵向合并单元格（vMerge）实物化再交给 markitdown。
+    markitdown 的 mammoth 后端会丢弃 vMerge 续行单元格，导致续行整体
+    左移错列（功能清单类层级表会因此被误读为重复行）。预处理失败时
+    软降级为原文件，绝不阻断读取。
+    """
+    if ext.lower() != ".docx":
+        return path, None
+    try:
+        from core.docx_tables import fill_vertical_merges
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".docx", delete=False)
+        tmp.close()
+        fill_vertical_merges(path, tmp.name)
+        return tmp.name, tmp.name
+    except Exception as exc:  # noqa: BLE001 —— 预处理是增强而非前提
+        logger.warning("[read_document] docx 合并单元格预处理失败，按原文件转换：%s", exc)
+        return path, None
 
 
 @tool("read_document")
@@ -75,8 +101,16 @@ def read_document(file_id: str) -> str:
         )
 
     try:
-        result = MarkItDown().convert(str(path))
-        text = (getattr(result, "text_content", None) or "").strip()
+        convert_path, tmp_path = _prepare_convert_path(str(path), meta.ext)
+        try:
+            result = MarkItDown().convert(convert_path)
+            text = (getattr(result, "text_content", None) or "").strip()
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
     except Exception as e:  # noqa: BLE001
         return (
             f"[读取失败] 文件 {meta.original_name!r}（{meta.ext}）解析失败：{e}。"
