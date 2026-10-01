@@ -282,17 +282,56 @@ async def run_invoke_stream(
         version="v2",
     )
 
+    # ── 进度事件：把图节点/工具的执行阶段以 status 事件推给前端（长任务不再静默）。
+    # 只发节点边界事件（event.name == langgraph_node，避免节点内部每个子链路都刷屏）
+    # 与工具开始事件；相邻重复文案去重。playground 不识别该类型会自动忽略。
+    node_stage_labels = {
+        "intent_router": "正在理解你的需求…",
+        "planner": "正在规划执行步骤…",
+        "executor": "正在执行（文档读取/技能运行中，长任务可能需要数分钟）…",
+        "chat": "正在生成回复…",
+    }
+    tool_stage_labels = {
+        "read_document": "正在读取上传文档…",
+        "execute_skill": "正在执行技能…",
+    }
+    last_stage = ""
+
+    def _stage_event(label: str) -> str | None:
+        nonlocal last_stage
+        if not label or label == last_stage:
+            return None
+        last_stage = label
+        return json.dumps({"type": "status", "stage": label}, ensure_ascii=False) + "\n"
+
     try:
         while True:
             # 两个事件之间允许的最长等待（LLM 卡住则超时）
             event = await asyncio.wait_for(events.__anext__(), timeout=effective_timeout)
             event_type = event.get("event")
+            metadata = event.get("metadata", {}) or {}
+            node_name = metadata.get("langgraph_node", "")
+
+            # 节点边界 → 阶段提示
+            if event_type == "on_chain_start" and event.get("name") == node_name:
+                line = _stage_event(node_stage_labels.get(node_name, ""))
+                if line:
+                    yield line
+                continue
+            # 工具开始 → 工具提示
+            if event_type == "on_tool_start":
+                tname = str(event.get("name") or "")
+                line = _stage_event(
+                    tool_stage_labels.get(tname, f"正在调用工具：{tname}…" if tname else "")
+                )
+                if line:
+                    yield line
+                continue
+
             # 只处理 chat model 的 token 流事件
             if event_type != "on_chat_model_stream":
                 continue
             # 过滤：只推送最终输出节点的 token
-            metadata = event.get("metadata", {}) or {}
-            node_name = metadata.get("langgraph_node", "")
             if node_name not in output_nodes:
                 continue
             # 过滤：技能内部结构化调用（规划/评级/JSON 中间产物）不推给前端

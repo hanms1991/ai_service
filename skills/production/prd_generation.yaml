@@ -34,6 +34,9 @@ inputs:
 
 output:
   format: markdown
+  # 完整 8 章节实测约 16.3k completion tokens（全局默认 8192 会在半路硬截断），
+  # 取 20480 留约 25% 余量
+  max_tokens: 204800
 
 prompt_template: |
   请根据以下输入生成一份完整的汽车功能 PRD 文档（Markdown 格式）。

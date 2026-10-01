@@ -48,6 +48,9 @@ system_prompt: |
 
 output:
   format: markdown
+  # 多用例大表格正文冗长（单张用例表可达上千字），全局默认 8192 会在半路硬截断，
+  # 取 24576 覆盖全量 L3 功能点的用例规格
+  max_tokens: 24576
 
 prompt_template: |
   请基于以下 PRD 生成结构化用例规格（Use Case Specification）。

@@ -1134,7 +1134,10 @@ def _execute_skill_core(
 
     system_prompt = _build_skill_system_prompt(skill_cfg, agent_cfg)
 
-    invoke_model = llm.bind(timeout=SKILL_LLM_TIMEOUT_SECONDS)
+    # 技能级输出上限：json 与 markdown 长文档技能均可声明 output.max_tokens
+    # 覆盖全局 LLM_MAX_TOKENS（PRD/UC 等长文档在默认 8192 下会被硬截断）
+    skill_max_tokens = output_cfg.get("max_tokens")
+    has_skill_max = isinstance(skill_max_tokens, int) and skill_max_tokens > 0
     if output_format == "json" and output_schema:
         # json_mode + 技能级输出上限（HARA 等大 JSON 技能必须高于全局 LLM_MAX_TOKENS，
         # 否则可见输出在 max_tokens 处被截断，JSON 不闭合 → 解析失败）
@@ -1142,10 +1145,14 @@ def _execute_skill_core(
             "response_format": {"type": "json_object"},
             "timeout": SKILL_LLM_TIMEOUT_SECONDS,
         }
-        skill_max_tokens = output_cfg.get("max_tokens")
-        if isinstance(skill_max_tokens, int) and skill_max_tokens > 0:
+        if has_skill_max:
             bind_kwargs["max_tokens"] = skill_max_tokens
         invoke_model = llm.bind(**bind_kwargs)
+    elif has_skill_max:
+        invoke_model = llm.bind(timeout=SKILL_LLM_TIMEOUT_SECONDS,
+                                max_tokens=skill_max_tokens)
+    else:
+        invoke_model = llm.bind(timeout=SKILL_LLM_TIMEOUT_SECONDS)
 
     # 内部 JSON 调用打 tag（流式接口据此过滤 token）；纯文本技能不打，其输出即交付文本
     if output_format == "json" and output_schema:
@@ -1161,16 +1168,31 @@ def _execute_skill_core(
     )
     raw_text = response.content if isinstance(response.content, str) else str(response.content)
 
-    # 截断预检：finish_reason=length 时 JSON 必然不完整，直接给出可操作的错误
+    # 截断预检：finish_reason=length
     finish_reason = ""
     resp_meta = getattr(response, "response_metadata", None)
     if isinstance(resp_meta, dict):
         finish_reason = str(resp_meta.get("finish_reason") or "").lower()
     if finish_reason == "length":
-        limit = output_cfg.get("max_tokens") or os.getenv("LLM_MAX_TOKENS", "?")
-        raise ValueError(
-            f"模型输出达到 token 上限（max_tokens={limit}）被截断，JSON 不完整。"
-            f"已生成 {len(raw_text)} 字符；请在技能契约 output.max_tokens 中提高上限后重试。"
+        limit = skill_max_tokens or os.getenv("LLM_MAX_TOKENS", "?")
+        if output_format == "json" and output_schema:
+            # JSON 必然不闭合，无法解析/渲染，直接给出可操作的错误
+            raise ValueError(
+                f"模型输出达到 token 上限（max_tokens={limit}）被截断，JSON 不完整。"
+                f"已生成 {len(raw_text)} 字符；请在技能契约 output.max_tokens 中提高上限后重试。"
+            )
+        # markdown/纯文本：已生成内容对用户仍有价值。旧逻辑直接抛异常，导致用户
+        # 看着流式输出的几千字被丢弃、终态替换成一句安抚话术；现保留部分正文，
+        # 追加醒目的截断提示后正常返回（流式已吐出的内容与终态一致，不会被覆盖）。
+        skill_name_log = skill_cfg.get("name") or skill_cfg.get("id") or "?"
+        logger.warning(
+            "技能 %s 输出达到 max_tokens=%s 被截断，已生成 %s 字符，按部分结果返回",
+            skill_name_log, limit, len(raw_text),
+        )
+        raw_text = raw_text.rstrip() + (
+            f"\n\n> ⚠️ **输出长度达到模型上限（max_tokens={limit}），文档在此处被截断，"
+            "后续内容未生成。** 可以缩小本次生成范围（例如只生成指定章节）后重试，"
+            "或在技能契约的 output.max_tokens 中提高上限。"
         )
 
     structured = _validate_structured_output(raw_text, output_schema)

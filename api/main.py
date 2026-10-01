@@ -31,7 +31,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.deps import get_api_keys
 from api.errors import ApiError, internal_error
-from api.routes import capabilities, files, invoke, tasks
+from api.routes import capabilities, files, invoke, tasks, web
+from api.services.web_auth import init_db as init_web_db
 from api.services.agent_runner import set_supervisor_graph
 from api.services.callbacks import CallbackClient, load_whitelist_from_env, set_callback_client
 from api.services.scene_resolver import init_scene_resolver
@@ -58,6 +59,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ── 2. 初始化 SceneResolver（加载 scenes.yaml + 交叉校验注册表） ──
     resolver = init_scene_resolver()
     scene_count = len(resolver.list_scenes())
+
+    # ── 2c. Web 端账号/会话库（/chat 轻量多用户页面） ──
+    init_web_db()
 
     # ── 2b. 初始化 TaskStore + CallbackClient（M2） ──
     ttl_hours = int(os.getenv("TASK_RESULT_TTL_HOURS", "24"))
@@ -253,6 +257,9 @@ def create_app() -> FastAPI:
     app.include_router(capabilities.router, prefix="/api/v1")
     app.include_router(files.router, prefix="/api/v1")
 
+    # Web 端页面专用路由（Cookie 鉴权，前缀 /ui/api 定义在路由内）
+    app.include_router(web.router)
+
     # Playground 静态调试台（同源免 CORS；html=True 使 /playground 直达 index.html）
     playground_dir = PROJECT_ROOT / "playground"
     if playground_dir.is_dir():
@@ -261,6 +268,20 @@ def create_app() -> FastAPI:
             StaticFiles(directory=str(playground_dir), html=True),
             name="playground",
         )
+
+    # 轻量多用户对话页面（DeepSeek 风格）；根路径直达该页面
+    webchat_dir = PROJECT_ROOT / "webchat"
+    if webchat_dir.is_dir():
+        app.mount(
+            "/chat",
+            StaticFiles(directory=str(webchat_dir), html=True),
+            name="webchat",
+        )
+
+        @app.get("/")
+        def _root_redirect():
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(url="/chat/")
 
     return app
 

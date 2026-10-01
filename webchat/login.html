@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>登录 · AutoAgent</title>
+  <link rel="stylesheet" href="style.css?v=20261001c" />
+</head>
+<body>
+  <div class="login-wrap">
+    <form class="login-card" id="login-form">
+      <h1 class="login-brand">AutoAgent</h1>
+      <div class="login-sub">功能安全智能助手</div>
+      <label for="username">用户名</label>
+      <input id="username" autocomplete="username" required />
+      <label for="password">密码</label>
+      <input id="password" type="password" autocomplete="current-password" required />
+      <button class="btn-primary" id="btn-login" type="submit">登录</button>
+      <div class="login-err" id="err"></div>
+    </form>
+  </div>
+  <script>
+    // 已登录则直接跳转
+    fetch('/ui/api/me', { credentials: 'same-origin' })
+      .then(r => { if (r.ok) location.href = '/chat/'; })
+      .catch(() => {});
+
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById('btn-login');
+      const errEl = document.getElementById('err');
+      errEl.textContent = '';
+      btn.disabled = true;
+      try {
+        const r = await fetch('/ui/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({
+            username: document.getElementById('username').value,
+            password: document.getElementById('password').value,
+          }),
+        });
+        if (r.ok) {
+          location.href = '/chat/';
+        } else {
+          const d = await r.json().catch(() => ({}));
+          errEl.textContent = (d.error && d.error.message) || '登录失败';
+        }
+      } catch (err) {
+        errEl.textContent = '网络错误：' + err.message;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
