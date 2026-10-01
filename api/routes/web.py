@@ -177,6 +177,21 @@ async def conv_messages(conv_id: str, user: dict = Depends(require_web_user)) ->
     return {"messages": web_store.list_messages(user["id"], conv_id)}
 
 
+@router.post("/conversations/{conv_id}/messages/{msg_id}/feedback")
+async def set_message_feedback(
+    conv_id: str, msg_id: int, body: dict, user: dict = Depends(require_web_user)
+) -> dict:
+    """设置助手消息反馈：value=1 赞 / -1 踩 / 0 取消。"""
+    value = int(body.get("value", 0) or 0)
+    if value not in (-1, 0, 1):
+        raise ApiError(code="INVALID_VALUE", message="value 只能为 1、-1 或 0",
+                       http_status=400)
+    ok = web_store.set_feedback(user["id"], conv_id, msg_id, value)
+    if not ok:
+        raise ApiError(code="MSG_NOT_FOUND", message="消息不存在", http_status=404)
+    return {"ok": True}
+
+
 # ────────────────────────────────────────────────────────────────────
 # 流式对话代理
 # ────────────────────────────────────────────────────────────────────
@@ -247,10 +262,10 @@ async def conv_chat(conv_id: str, body: ChatBody, user: dict = Depends(require_w
         error_obj: dict[str, Any] | None = None
         stopped = False
 
-        def _finalize_run(final_text: str, *, is_error: bool = False) -> list[dict[str, str]]:
+        def _finalize_run(final_text: str, *, is_error: bool = False) -> tuple[int, list[dict[str, str]]]:
             """登记本次执行产生的交付物，并随助手消息一起落库。
 
-            返回新增交付物 [{file_id, filename}]，供流结束后推送 artifacts 事件。
+            返回 (assistant_msg_id, 新增交付物)，供流结束后推送 artifacts/msg_saved 事件。
             （低并发内网工具，沙箱前后快照差分足够可靠；停止时产物也可能已渲染完。）
             """
             after_metas = {m.file_id: m for m in list_files()}
@@ -262,12 +277,12 @@ async def conv_chat(conv_id: str, body: ChatBody, user: dict = Depends(require_w
                     conversation_id=conv_id, filename=meta.original_name,
                 )
                 new_files.append({"file_id": fid, "filename": meta.original_name})
-            web_store.add_message(
+            msg_id = web_store.add_message(
                 user["id"], conv_id, "assistant", final_text,
                 is_error=is_error,
                 attachments=[f["file_id"] for f in new_files],
             )
-            return new_files
+            return msg_id, new_files
 
         try:
             stream = agent_runner.run_invoke_stream(
@@ -336,14 +351,18 @@ async def conv_chat(conv_id: str, body: ChatBody, user: dict = Depends(require_w
             if error_obj else "（执行结束，无文本输出）"
         )
         try:
-            new_files = await asyncio.shield(
+            msg_id, new_files = await asyncio.shield(
                 asyncio.to_thread(_finalize_run, final_text, is_error=is_error)
             )
         except Exception:
-            new_files = []
+            msg_id, new_files = 0, []
         if new_files:
             yield json.dumps(
                 {"type": "artifacts", "files": new_files}, ensure_ascii=False
+            ) + "\n"
+        if msg_id:
+            yield json.dumps(
+                {"type": "msg_saved", "msg_id": msg_id}, ensure_ascii=False
             ) + "\n"
 
     return _ndjson_response(event_stream())

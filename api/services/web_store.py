@@ -158,7 +158,7 @@ def add_message(
 def list_messages(user_id: int, conv_id: str) -> list[dict[str, Any]]:
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT m.id, m.role, m.content, m.is_error, m.created_at "
+            "SELECT m.id, m.role, m.content, m.is_error, m.feedback, m.created_at "
             "FROM messages m JOIN conversations c ON m.conversation_id = c.id "
             "WHERE c.id = ? AND c.user_id = ? ORDER BY m.id",
             (conv_id, user_id),
@@ -192,6 +192,19 @@ def list_messages(user_id: int, conv_id: str) -> list[dict[str, Any]]:
                 )
                 result[target_idx]["attachments"].extend(dict(o) for o in orphans)
     return result
+
+
+def set_feedback(user_id: int, conv_id: str, msg_id: int, value: int) -> bool:
+    """设置助手消息的反馈（1=赞，-1=踩，0=取消）。带归属校验。"""
+    value = 1 if value > 0 else (-1 if value < 0 else 0)
+    with get_db() as conn:
+        cur = conn.execute(
+            "UPDATE messages SET feedback = ? "
+            "WHERE id = ? AND conversation_id = ? "
+            "AND EXISTS (SELECT 1 FROM conversations WHERE id = conversation_id AND user_id = ?)",
+            (value if value else None, msg_id, conv_id, user_id),
+        )
+    return cur.rowcount > 0
 
 
 # ────────────────────────────────────────────────────────────────────

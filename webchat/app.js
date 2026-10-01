@@ -412,7 +412,8 @@
     const msgs = $("messages");
     msgs.innerHTML = "";
     (msgD.messages || []).forEach((m) =>
-      appendMsgEl(m.role, m.content, !!m.is_error, m.attachments || null));
+      appendMsgEl(m.role, m.content, !!m.is_error, m.attachments || null,
+                  m.id || null, m.feedback || 0));
     scrollBottom();
     renderChips();
   }
@@ -527,7 +528,8 @@
     scrollBottom();
   }
 
-  function appendMsgEl(role, content, isError = false, attachments = null) {
+  function appendMsgEl(role, content, isError = false, attachments = null,
+                       msgId = null, feedback = 0) {
     const empty = $("empty-state");
     if (empty) empty.remove();
     // 用户附件先以卡片输出（文字在上一条消息之后、文字气泡之前）
@@ -536,19 +538,124 @@
     }
     const row = document.createElement("div");
     row.className = `msg-row ${role}`;
+    if (msgId) row.dataset.msgId = String(msgId);
     const who = role === "user" ? state.user.username.slice(0, 1) : "AI";
     row.innerHTML =
       `<div class="msg-avatar">${esc(who)}</div>
        <div class="msg-body ${isError ? "error" : ""}">
          <div class="msg-bubble">${fmt(content)}</div>
+         ${buildMsgActions(role, feedback)}
        </div>`;
     $("messages").appendChild(row);
+    bindMsgActions(row, role);
     // AI 产物卡片挂在回复气泡下方（左侧），点击可下载
     if (role === "assistant" && attachments && attachments.length) {
       appendFileRows(attachments, "assistant");
     }
     scrollBottom();
     return row.querySelector(".msg-bubble");
+  }
+
+  // 操作栏 SVG 图标（lucide 风格，16x16，currentColor 继承）
+  const ICONS = {
+    copy: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+    redo: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>',
+    up: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 10v12"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z"/></svg>',
+    down: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 14V2"/><path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88Z"/></svg>',
+  };
+
+  function buildMsgActions(role, feedback = 0) {
+    const upOn = feedback === 1 ? " on" : "";
+    const downOn = feedback === -1 ? " on" : "";
+    if (role === "user") {
+      return `<div class="msg-actions">
+        <button class="act-btn act-copy" title="复制">${ICONS.copy}</button>
+      </div>`;
+    }
+    return `<div class="msg-actions">
+      <button class="act-btn act-copy" title="复制">${ICONS.copy}</button>
+      <button class="act-btn act-redo" title="重新生成">${ICONS.redo}</button>
+      <button class="act-btn act-up${upOn}" title="赞">${ICONS.up}</button>
+      <button class="act-btn act-down${downOn}" title="踩">${ICONS.down}</button>
+    </div>`;
+  }
+
+  function bindMsgActions(row, role) {
+    const bubble = row.querySelector(".msg-bubble");
+    const actions = row.querySelector(".msg-actions");
+    if (!actions) return;
+
+    // 复制：取气泡纯文本（保留换行）
+    const copyBtn = actions.querySelector(".act-copy");
+    if (copyBtn) {
+      copyBtn.addEventListener("click", async () => {
+        const text = bubble ? bubble.innerText : "";
+        if (!text.trim()) return;
+        try {
+          await navigator.clipboard.writeText(text);
+        } catch {
+          const ta = document.createElement("textarea");
+          ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+          document.body.appendChild(ta); ta.select();
+          try { document.execCommand("copy"); } catch {}
+          ta.remove();
+        }
+        flashIcon(copyBtn, "已复制");
+      });
+    }
+
+    if (role !== "assistant") return;
+
+    // 重新生成：重发该助手消息的上一条用户消息
+    const redoBtn = actions.querySelector(".act-redo");
+    if (redoBtn) {
+      redoBtn.addEventListener("click", () => {
+        const rows = Array.from($("messages").querySelectorAll(".msg-row"));
+        const idx = rows.indexOf(row);
+        const prevUser = [...rows.slice(0, idx)].reverse()
+          .find((r) => r.classList.contains("user"));
+        if (!prevUser) return;
+        const text = (prevUser.querySelector(".msg-bubble") || {}).innerText || "";
+        if (!text.trim()) return;
+        send(text.trim());
+      });
+    }
+
+    // 赞 / 踩：互斥（再点取消），失败回滚
+    const upBtn = actions.querySelector(".act-up");
+    const downBtn = actions.querySelector(".act-down");
+    const setFeedback = async (btn, value) => {
+      const msgId = row.dataset.msgId;
+      if (!msgId) return;
+      const wasUp = upBtn.classList.contains("on");
+      const wasDown = downBtn.classList.contains("on");
+      const toggle = (value === 1 && wasUp) || (value === -1 && wasDown);
+      const next = toggle ? 0 : value;
+      // 乐观更新
+      upBtn.classList.toggle("on", next === 1);
+      downBtn.classList.toggle("on", next === -1);
+      try {
+        await api(`/ui/api/conversations/${state.currentId}/messages/${msgId}/feedback`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ value: next }),
+        });
+      } catch {
+        // 回滚
+        upBtn.classList.toggle("on", wasUp);
+        downBtn.classList.toggle("on", wasDown);
+      }
+    };
+    if (upBtn) upBtn.addEventListener("click", () => setFeedback(upBtn, 1));
+    if (downBtn) downBtn.addEventListener("click", () => setFeedback(downBtn, -1));
+  }
+
+  // 图标按钮短暂的反馈态（复制成功提示）
+  function flashIcon(btn, label) {
+    const orig = btn.innerHTML;
+    btn.classList.add("ok");
+    btn.innerHTML = `<span class="act-tip">${esc(label)}</span>`;
+    setTimeout(() => { btn.innerHTML = orig; btn.classList.remove("ok"); }, 1200);
   }
 
   function scrollBottom() {
@@ -637,9 +744,9 @@
     }
   }
 
-  async function send() {
+  async function send(prefillText) {
     const input = $("input");
-    const message = input.value.trim();
+    const message = (typeof prefillText === "string" ? prefillText : input.value).trim();
     if (!message || state.sending) return;
 
     setSendingUI(true);
@@ -652,6 +759,7 @@
     let renderer = null;
     let full = "";
     let stageFaded = false;
+    let assistantRow = null;
 
     const fadeStage = () => {
       if (stageFaded) return;
@@ -670,12 +778,12 @@
       state.abortCtrl = new AbortController();
       const convId = state.currentId;
       const scene = $("scene-select").value;
-      input.value = "";
-      autoGrow();
+      if (typeof prefillText !== "string") { input.value = ""; autoGrow(); }
       appendMsgEl("user", message, false, sentFiles);
       state.uploads = state.uploads.filter((f) => !sentIds.has(f.file_id));
       renderChips();
       const bubble = appendMsgEl("assistant", "");
+      assistantRow = bubble.closest(".msg-row");
       renderer = createStreamRenderer(bubble);
       statusLine = startStatus(bubble);
       heartbeat = startHeartbeat(bubble);
@@ -754,6 +862,11 @@
             // AI 产物：以文件卡片挂在助手回复气泡下方，点击下载
             if (Array.isArray(evt.files) && evt.files.length) {
               appendFileRows(evt.files, "assistant");
+            }
+          } else if (evt.type === "msg_saved") {
+            // 助手消息已落库，记录 msg_id 供赞/踩反馈使用
+            if (assistantRow && evt.msg_id) {
+              assistantRow.dataset.msgId = String(evt.msg_id);
             }
           } else if (evt.type === "error") {
             finalized = true;

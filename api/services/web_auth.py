@@ -113,6 +113,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
         if "pinned_at" not in existing:
             conn.execute("ALTER TABLE conversations ADD COLUMN pinned_at TEXT")
+        # 消息反馈列（赞/踩）：NULL=无，1=赞，-1=踩
+        msg_cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
+        if "feedback" not in msg_cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN feedback INTEGER")
 
 
 # ────────────────────────────────────────────────────────────────────

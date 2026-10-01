@@ -137,6 +137,30 @@ select.scene-select {
 }
 .msg-body.error .msg-bubble { color: var(--danger); font-size: 14px;
   background: #fef0f0; border-radius: 8px; padding: 8px 12px; }
+
+/* ── 消息操作栏（复制 / 重新生成 / 赞 / 踩） ── */
+.msg-actions {
+  display: flex; align-items: center; gap: 2px;
+  margin-top: 4px; opacity: 0; transition: opacity .15s;
+}
+.msg-row:hover .msg-actions,
+.msg-actions:focus-within { opacity: 1; }
+.msg-row.user .msg-actions { justify-content: flex-end; }
+.msg-row.assistant .msg-actions { justify-content: flex-start; }
+.act-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; padding: 0; border: none; background: transparent;
+  border-radius: 6px; color: var(--text-3); cursor: pointer;
+  transition: background .15s, color .15s;
+}
+.act-btn:hover { background: #eef0f3; color: var(--text); }
+.act-btn.act-up.on { color: var(--accent); }
+.act-btn.act-down.on { color: var(--danger); }
+.act-btn.ok .act-tip { font-size: 11px; color: var(--accent); }
+.act-btn svg { pointer-events: none; }
+@media (max-width: 640px) {
+  .msg-actions { opacity: 1; }
+}
 .msg-body pre {
   background: var(--code-bg); border-radius: 8px; padding: 12px 14px;
   overflow-x: auto; font-size: 13px; line-height: 1.5;
