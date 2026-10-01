@@ -74,6 +74,10 @@ class RenameBody(BaseModel):
     title: str
 
 
+class PinBody(BaseModel):
+    pinned: bool
+
+
 class ChatBody(BaseModel):
     message: str
     scene: str | None = ""
@@ -151,6 +155,13 @@ async def conv_rename(conv_id: str, body: RenameBody, user: dict = Depends(requi
     return {"ok": True}
 
 
+@router.post("/conversations/{conv_id}/pin")
+async def conv_pin(conv_id: str, body: PinBody, user: dict = Depends(require_web_user)) -> dict:
+    if not web_store.set_pinned(user["id"], conv_id, body.pinned):
+        raise ApiError(code="CONV_NOT_FOUND", message="会话不存在", http_status=404)
+    return {"ok": True, "pinned": body.pinned}
+
+
 @router.delete("/conversations/{conv_id}")
 async def conv_delete(conv_id: str, user: dict = Depends(require_web_user)) -> dict:
     if not web_store.delete_conversation(user["id"], conv_id):
@@ -183,8 +194,47 @@ async def conv_chat(conv_id: str, body: ChatBody, user: dict = Depends(require_w
     if scene != (conv.get("scene") or ""):
         web_store.set_scene(user["id"], conv_id, scene)
 
-    # 用户消息先落库；首条消息自动生成标题
-    web_store.add_message(user["id"], conv_id, "user", message)
+    # ── 附件文档：前端自动携带当前所有已上传 file_id（用户不可见）。
+    # 双重注入：
+    #   1) file_id 列表 → planner 提取后填入技能 inputs.file_id，技能内部 read_document 读全文；
+    #   2) 文档内容预览（截断）→ 走「中枢自处理」路径时 LLM 也能直接看到文档内容，
+    #      避免 file_id 被自处理路径忽略导致"读不到文档"。
+    agent_message = message
+    raw_ids = [str(f).strip() for f in (body.file_ids or []) if str(f).strip()]
+    if raw_ids:
+        owned: list[str] = []
+        for fid in raw_ids:
+            if web_store.owns_file(user["id"], fid):
+                owned.append(fid)
+        if owned:
+            from tools.read_document import read_document as _read_doc
+
+            previews: list[str] = []
+            for fid in owned:
+                try:
+                    text = await asyncio.to_thread(
+                        _read_doc.invoke, {"file_id": fid}, {"callbacks": []}
+                    )
+                    text = str(text)
+                except Exception:
+                    text = ""
+                if text:
+                    # 单文档预览截断 6000 字符，多文档总量控制在 12000 字符内，
+                    # 避免长文档把 prompt 撑爆；技能路径仍通过 file_id 读全文
+                    previews.append(f"【文档 {fid} 内容预览】\n{text[:6000]}")
+            preview_block = "\n\n".join(previews)[:12000]
+            agent_message = (
+                f"我已上传的文档 file_id：{', '.join(owned)}\n"
+                f"{preview_block}\n\n"
+                f"用户请求：{message}"
+            )
+
+    # 用户消息先落库（携带的附件登记 message_files，前端渲染为附件气泡）；
+    # 首条消息自动生成标题；落库 content 用原始 message，不含 file_id
+    sent_file_ids = owned if raw_ids else []
+    web_store.add_message(
+        user["id"], conv_id, "user", message, attachments=sent_file_ids
+    )
     web_store.set_first_title(user["id"], conv_id, message)
 
     # 交付物快照：执行前后文件沙箱新增的 file_id 归属于本会话
@@ -196,19 +246,31 @@ async def conv_chat(conv_id: str, body: ChatBody, user: dict = Depends(require_w
         error_obj: dict[str, Any] | None = None
         stopped = False
 
-        def _register_artifacts() -> None:
-            # 新产生的沙箱文件登记为该会话的交付物（低并发内网工具，快照差分足够可靠）
+        def _finalize_run(final_text: str, *, is_error: bool = False) -> list[dict[str, str]]:
+            """登记本次执行产生的交付物，并随助手消息一起落库。
+
+            返回新增交付物 [{file_id, filename}]，供流结束后推送 artifacts 事件。
+            （低并发内网工具，沙箱前后快照差分足够可靠；停止时产物也可能已渲染完。）
+            """
             after_metas = {m.file_id: m for m in list_files()}
+            new_files: list[dict[str, str]] = []
             for fid in set(after_metas) - before_ids:
                 meta = after_metas[fid]
                 web_store.register_file(
                     user["id"], fid, "artifact",
                     conversation_id=conv_id, filename=meta.original_name,
                 )
+                new_files.append({"file_id": fid, "filename": meta.original_name})
+            web_store.add_message(
+                user["id"], conv_id, "assistant", final_text,
+                is_error=is_error,
+                attachments=[f["file_id"] for f in new_files],
+            )
+            return new_files
 
         try:
             stream = agent_runner.run_invoke_stream(
-                message=message,
+                message=agent_message,
                 scene=scene or None,
                 inputs=None,
                 thread_id=conv["thread_id"],
@@ -236,6 +298,15 @@ async def conv_chat(conv_id: str, body: ChatBody, user: dict = Depends(require_w
             # 用户点了「停止」/ 浏览器关闭连接：取消会传播到 graph 执行
             # （任务取消抛 CancelledError；部分 ASGI 清理路径注入 GeneratorExit）
             stopped = True
+            # 停止路径无法再向客户端推送事件：shield 内完成「产物登记+消息落库」，
+            # 刷新历史时产物卡片仍会随消息带出
+            final_text = ("".join(done_parts) or "".join(token_parts)).strip()
+            final_text = (final_text + "\n\n（用户已停止生成，以上为已输出的部分内容）"
+                          if final_text else "（用户已停止生成）")
+            try:
+                await asyncio.shield(asyncio.to_thread(_finalize_run, final_text))
+            except Exception:
+                pass
             raise
         except ApiError as e:
             error_obj = {"code": e.code, "message": e.message}
@@ -245,41 +316,25 @@ async def conv_chat(conv_id: str, body: ChatBody, user: dict = Depends(require_w
             error_obj = {"code": "STREAM_FAILED", "message": str(e)}
             yield json.dumps({"type": "error", "code": "STREAM_FAILED", "message": str(e)},
                              ensure_ascii=False) + "\n"
-        finally:
-            # 助手消息落库（正常完成/失败/被停止均留痕）。取消期间用 shield 保护
-            # 这次毫秒级 SQLite 写入不随连接取消而中断。
-            final_text = ("".join(done_parts) or "".join(token_parts)).strip()
-            try:
-                if stopped:
-                    if final_text:
-                        final_text += "\n\n（用户已停止生成，以上为已输出的部分内容）"
-                    else:
-                        final_text = "（用户已停止生成）"
-                    await asyncio.shield(
-                        asyncio.to_thread(
-                            web_store.add_message, user["id"], conv_id, "assistant", final_text
-                        )
-                    )
-                elif error_obj and not final_text:
-                    await asyncio.shield(
-                        asyncio.to_thread(
-                            web_store.add_message,
-                            user["id"], conv_id, "assistant",
-                            f"[{error_obj.get('code', 'ERROR')}] "
-                            f"{error_obj.get('message', '执行失败')}",
-                            is_error=True,
-                        )
-                    )
-                elif final_text:
-                    await asyncio.shield(
-                        asyncio.to_thread(
-                            web_store.add_message, user["id"], conv_id, "assistant", final_text
-                        )
-                    )
-                # 已产生的交付物同样登记（停止时可能已渲染完文件）
-                await asyncio.shield(asyncio.to_thread(_register_artifacts))
-            except Exception:
-                pass  # 清理失败不影响响应结束/取消传播
+
+        # 正常/错误路径（连接仍存活）：先落库并登记交付物，再推送 artifacts 事件，
+        # 前端把产物卡片渲染在助手回复气泡下方
+        raw_text = ("".join(done_parts) or "".join(token_parts)).strip()
+        is_error = bool(error_obj and not raw_text)
+        final_text = raw_text or (
+            f"[{error_obj.get('code', 'ERROR')}] {error_obj.get('message', '执行失败')}"
+            if error_obj else "（执行结束，无文本输出）"
+        )
+        try:
+            new_files = await asyncio.shield(
+                asyncio.to_thread(_finalize_run, final_text, is_error=is_error)
+            )
+        except Exception:
+            new_files = []
+        if new_files:
+            yield json.dumps(
+                {"type": "artifacts", "files": new_files}, ensure_ascii=False
+            ) + "\n"
 
     return _ndjson_response(event_stream())
 

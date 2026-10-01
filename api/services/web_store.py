@@ -39,11 +39,31 @@ def get_conversation(user_id: int, conv_id: str) -> dict[str, Any] | None:
 def list_conversations(user_id: int) -> list[dict[str, Any]]:
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT id, title, scene, created_at, updated_at "
-            "FROM conversations WHERE user_id = ? ORDER BY updated_at DESC",
+            "SELECT id, title, scene, pinned, pinned_at, created_at, updated_at "
+            "FROM conversations WHERE user_id = ? "
+            "ORDER BY pinned DESC, pinned_at DESC, updated_at DESC",
             (user_id,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def set_pinned(user_id: int, conv_id: str, pinned: bool) -> bool:
+    """置顶/取消置顶（带归属校验）。置顶时间决定置顶组内的先后。"""
+    with get_db() as conn:
+        if pinned:
+            cur = conn.execute(
+                "UPDATE conversations SET pinned = 1, "
+                "pinned_at = datetime('now','localtime') "
+                "WHERE id = ? AND user_id = ?",
+                (conv_id, user_id),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE conversations SET pinned = 0, pinned_at = NULL "
+                "WHERE id = ? AND user_id = ?",
+                (conv_id, user_id),
+            )
+    return cur.rowcount > 0
 
 
 def rename_conversation(user_id: int, conv_id: str, title: str) -> bool:
@@ -100,7 +120,13 @@ def set_first_title(user_id: int, conv_id: str, text: str) -> None:
 # ────────────────────────────────────────────────────────────────────
 
 def add_message(
-    user_id: int, conv_id: str, role: str, content: str, *, is_error: bool = False
+    user_id: int,
+    conv_id: str,
+    role: str,
+    content: str,
+    *,
+    is_error: bool = False,
+    attachments: list[str] | None = None,
 ) -> int:
     with get_db() as conn:
         # 双重归属校验：会话必须属于该用户
@@ -114,11 +140,19 @@ def add_message(
             "INSERT INTO messages(conversation_id, role, content, is_error) VALUES (?, ?, ?, ?)",
             (conv_id, role, content, 1 if is_error else 0),
         )
+        msg_id = int(cur.lastrowid)
+        # 登记消息附件（去重；INSERT OR IGNORE 容忍重复提交）
+        if attachments:
+            for fid in dict.fromkeys(str(f).strip() for f in attachments if str(f).strip()):
+                conn.execute(
+                    "INSERT OR IGNORE INTO message_files(message_id, file_id) VALUES (?, ?)",
+                    (msg_id, fid),
+                )
         conn.execute(
             "UPDATE conversations SET updated_at = datetime('now','localtime') WHERE id = ?",
             (conv_id,),
         )
-        return int(cur.lastrowid)
+        return msg_id
 
 
 def list_messages(user_id: int, conv_id: str) -> list[dict[str, Any]]:
@@ -129,7 +163,35 @@ def list_messages(user_id: int, conv_id: str) -> list[dict[str, Any]]:
             "WHERE c.id = ? AND c.user_id = ? ORDER BY m.id",
             (conv_id, user_id),
         ).fetchall()
-    return [dict(r) for r in rows]
+        result: list[dict[str, Any]] = []
+        for r in rows:
+            item = dict(r)
+            atts = conn.execute(
+                "SELECT f.file_id, f.filename FROM message_files mf "
+                "JOIN web_files f ON f.file_id = mf.file_id "
+                "WHERE mf.message_id = ? ORDER BY mf.created_at, f.filename",
+                (item["id"],),
+            ).fetchall()
+            item["attachments"] = [dict(a) for a in atts]
+            result.append(item)
+        # 兼容改版前的旧产物：已登记到会话、但未关联任何消息的 artifact，
+        # 挂到最后一条助手消息（无助手消息则挂最后一条）展示，避免丢失下载入口
+        if result:
+            orphans = conn.execute(
+                "SELECT f.file_id, f.filename FROM web_files f "
+                "WHERE f.user_id = ? AND f.kind = 'artifact' AND f.conversation_id = ? "
+                "AND NOT EXISTS (SELECT 1 FROM message_files mf WHERE mf.file_id = f.file_id) "
+                "ORDER BY f.created_at, f.filename",
+                (user_id, conv_id),
+            ).fetchall()
+            if orphans:
+                target_idx = next(
+                    (i for i in range(len(result) - 1, -1, -1)
+                     if result[i]["role"] == "assistant"),
+                    len(result) - 1,
+                )
+                result[target_idx]["attachments"].extend(dict(o) for o in orphans)
+    return result
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -172,6 +234,10 @@ def list_files(
     if kind is not None:
         sql += " AND kind = ?"
         params.append(kind)
+    # 待发送暂存区（kind=upload）只显示尚未随消息发送的文件；
+    # 已关联消息的文件以附件气泡形式存在于消息流中，不再挂在输入框上方。
+    if kind == "upload":
+        sql += " AND NOT EXISTS (SELECT 1 FROM message_files mf WHERE mf.file_id = web_files.file_id)"
     sql += " ORDER BY created_at DESC, file_id DESC LIMIT 100"
     with get_db() as conn:
         rows = conn.execute(sql, params).fetchall()

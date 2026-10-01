@@ -66,6 +66,8 @@ def init_db() -> None:
                 title      TEXT NOT NULL DEFAULT '新会话',
                 scene      TEXT NOT NULL DEFAULT '',
                 thread_id  TEXT NOT NULL UNIQUE,    -- LangGraph checkpoint 线程
+                pinned     INTEGER NOT NULL DEFAULT 0,   -- 是否置顶
+                pinned_at  TEXT,                          -- 置顶时间（置顶组内排序）
                 created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -92,8 +94,25 @@ def init_db() -> None:
                 created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
+
+            -- 消息与附件的关联：用户发送消息时携带的上传文档登记于此，
+            -- 附件以独立气泡渲染在消息流中；关联后不再出现在输入框暂存区。
+            CREATE TABLE IF NOT EXISTS message_files (
+                message_id INTEGER NOT NULL,
+                file_id    TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                PRIMARY KEY (message_id, file_id),
+                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+                FOREIGN KEY (file_id) REFERENCES web_files(file_id) ON DELETE CASCADE
+            );
             """
         )
+        # 老库增量迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列
+        existing = {r["name"] for r in conn.execute("PRAGMA table_info(conversations)")}
+        if "pinned" not in existing:
+            conn.execute("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+        if "pinned_at" not in existing:
+            conn.execute("ALTER TABLE conversations ADD COLUMN pinned_at TEXT")
 
 
 # ────────────────────────────────────────────────────────────────────

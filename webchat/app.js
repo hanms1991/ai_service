@@ -10,8 +10,7 @@
     sending: false,
     abortCtrl: null,
     elapsedTimer: null,
-    uploads: [],   // 当前用户的上传文件
-    artifacts: [], // 当前会话的交付物
+    uploads: [],   // 当前用户待发送的上传文件
   };
 
   const HINTS = [
@@ -244,7 +243,35 @@
     };
   }
 
-  // ── 会话列表 ────────────────────────────────────────────────
+  // ── 会话列表（分组：置顶 / 今天 / 最近7天 / 最近30天 / 更早） ──
+  function parseConvDate(s) {
+    // 后端时间为本地时区 "YYYY-MM-DD HH:MM:SS"，补 T 让浏览器按本地时间解析
+    const d = new Date(String(s || "").replace(" ", "T"));
+    return isNaN(d.getTime()) ? Date.now() : d.getTime();
+  }
+
+  function convGroups(list) {
+    const now = new Date();
+    const today0 = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const DAY = 86400000;
+    const groups = [
+      { key: "pinned", label: "置顶", items: [] },
+      { key: "today", label: "今天", items: [] },
+      { key: "week", label: "最近7天", items: [] },
+      { key: "month", label: "最近30天", items: [] },
+      { key: "older", label: "更早", items: [] },
+    ];
+    list.forEach((c) => {
+      if (c.pinned) { groups[0].items.push(c); return; }
+      const days = Math.floor((today0 - parseConvDate(c.updated_at)) / DAY);
+      if (days <= 0) groups[1].items.push(c);
+      else if (days <= 7) groups[2].items.push(c);
+      else if (days <= 30) groups[3].items.push(c);
+      else groups[4].items.push(c);
+    });
+    return groups.filter((g) => g.items.length);
+  }
+
   function renderConvList() {
     const ul = $("conv-list");
     if (!state.conversations.length) {
@@ -252,26 +279,102 @@
       return;
     }
     ul.innerHTML = "";
-    state.conversations.forEach((c) => {
-      const div = document.createElement("div");
-      div.className = "conv-item" + (c.id === state.currentId ? " active" : "");
-      div.innerHTML =
-        `<span class="conv-title" title="${esc(c.title)}">${esc(c.title)}</span>
-         <span class="conv-ops">
-           <button class="icon-btn act-rename" title="重命名">✎</button>
-           <button class="icon-btn act-del" title="删除">✕</button>
-         </span>`;
-      div.querySelector(".conv-title").onclick = () => selectConv(c.id);
-      div.querySelector(".act-rename").onclick = (e) => {
-        e.stopPropagation();
-        renameConv(c);
-      };
-      div.querySelector(".act-del").onclick = (e) => {
-        e.stopPropagation();
-        deleteConv(c);
-      };
-      ul.appendChild(div);
+    convGroups(state.conversations).forEach((g) => {
+      const h = document.createElement("div");
+      h.className = "conv-group-label";
+      h.textContent = g.label;
+      ul.appendChild(h);
+      g.items.forEach((c) => ul.appendChild(buildConvItem(c)));
     });
+  }
+
+  function buildConvItem(c) {
+    const div = document.createElement("div");
+    div.className = "conv-item" + (c.id === state.currentId ? " active" : "")
+      + (c.pinned ? " pinned" : "");
+    div.innerHTML =
+      `<span class="conv-title" title="${esc(c.title)}">
+         ${c.pinned ? '<span class="pin-flag" title="已置顶">📌</span>' : ""}${esc(c.title)}
+       </span>
+       <span class="conv-ops">
+         <button class="icon-btn act-pin${c.pinned ? " on" : ""}" title="${c.pinned ? "取消置顶" : "置顶"}">📌</button>
+         <button class="icon-btn act-rename" title="重命名">✎</button>
+         <button class="icon-btn act-del" title="删除">✕</button>
+       </span>`;
+    div.querySelector(".conv-title").onclick = () => selectConv(c.id);
+    div.querySelector(".act-pin").onclick = (e) => {
+      e.stopPropagation();
+      togglePin(c);
+    };
+    div.querySelector(".act-rename").onclick = (e) => {
+      e.stopPropagation();
+      renameConv(c, div);
+    };
+    div.querySelector(".act-del").onclick = (e) => {
+      e.stopPropagation();
+      deleteConv(c, div);
+    };
+    return div;
+  }
+
+  // ── 锚点弹层：确认删除 / 重命名输入（定位在被操作会话项附近，非浏览器顶部） ──
+  let popoverState = null;
+  function closeItemPopover() {
+    if (!popoverState) return;
+    popoverState.backdrop.remove();
+    popoverState.pop.remove();
+    document.removeEventListener("keydown", popoverState.onKey, true);
+    popoverState = null;
+  }
+
+  function showItemPopover(anchorEl, innerHTML) {
+    closeItemPopover();
+    const backdrop = document.createElement("div");
+    backdrop.className = "pop-backdrop";
+    const pop = document.createElement("div");
+    pop.className = "item-popover";
+    pop.innerHTML = innerHTML;
+    document.body.appendChild(backdrop);
+    document.body.appendChild(pop);
+
+    const close = () => closeItemPopover();
+    backdrop.onclick = close;
+    pop.onclick = (e) => e.stopPropagation();
+    const onKey = (e) => { if (e.key === "Escape") close(); };
+    document.addEventListener("keydown", onKey, true);
+    popoverState = { backdrop, pop, onKey };
+
+    // 定位：优先在会话项下方靠左；空间不足翻到上方；横向不超出视口
+    const r = anchorEl.getBoundingClientRect();
+    pop.style.visibility = "hidden";
+    const w = pop.offsetWidth;
+    const h = pop.offsetHeight;
+    const vw = document.documentElement.clientWidth;
+    const vh = document.documentElement.clientHeight;
+    let left = r.left;
+    if (left + w > vw - 8) left = Math.max(8, vw - w - 8);
+    let top = r.bottom + 6;
+    if (top + h > vh - 8) top = Math.max(8, r.top - h - 6);
+    pop.style.left = left + "px";
+    pop.style.top = top + "px";
+    pop.style.visibility = "visible";
+    return { pop, close };
+  }
+
+  async function togglePin(c) {
+    const next = !c.pinned;
+    try {
+      await api(`/ui/api/conversations/${c.id}/pin`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pinned: next }),
+      });
+      const d = await api("/ui/api/conversations");
+      state.conversations = d.conversations || [];
+      renderConvList();
+    } catch (err) {
+      alert("操作失败：" + err.message);
+    }
   }
 
   async function loadConvs(selectId = null) {
@@ -294,7 +397,6 @@
          <div>输入问题开始对话；可上传文档并发起 HARA 等功能分析</div>
        </div>`;
     $("topbar-title").textContent = "";
-    state.artifacts = [];
     renderChips();
   }
 
@@ -306,14 +408,11 @@
     $("topbar-title").textContent = conv ? conv.title : "";
     $("scene-select").value = (conv && conv.scene) || "";
 
-    const [msgD, artD] = await Promise.all([
-      api(`/ui/api/conversations/${id}/messages`),
-      api(`/ui/api/files?conversation_id=${id}&kind=artifact`),
-    ]);
-    state.artifacts = artD.files || [];
+    const msgD = await api(`/ui/api/conversations/${id}/messages`);
     const msgs = $("messages");
     msgs.innerHTML = "";
-    (msgD.messages || []).forEach((m) => appendMsgEl(m.role, m.content, !!m.is_error));
+    (msgD.messages || []).forEach((m) =>
+      appendMsgEl(m.role, m.content, !!m.is_error, m.attachments || null));
     scrollBottom();
     renderChips();
   }
@@ -328,29 +427,113 @@
     await loadConvs(d.conversation.id);
   }
 
-  async function renameConv(c) {
-    const title = prompt("会话标题", c.title);
-    if (title === null || !title.trim()) return;
-    await api(`/ui/api/conversations/${c.id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: title.trim() }),
-    });
-    await loadConvs(state.currentId);
+  function renameConv(c, anchorEl) {
+    const { pop, close } = showItemPopover(anchorEl,
+      `<div class="pop-title">重命名会话</div>
+       <input class="pop-input" type="text" maxlength="100" value="${esc(c.title)}">
+       <div class="pop-actions">
+         <button class="pop-btn" data-act="cancel">取消</button>
+         <button class="pop-btn pop-btn-primary" data-act="ok">确定</button>
+       </div>`);
+    const input = pop.querySelector(".pop-input");
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+    const submit = async () => {
+      const title = input.value.trim();
+      if (!title) { input.focus(); return; }
+      close();
+      try {
+        await api(`/ui/api/conversations/${c.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title }),
+        });
+        await loadConvs(state.currentId);
+      } catch (err) {
+        alert("重命名失败：" + err.message);
+      }
+    };
+    pop.querySelector('[data-act="ok"]').onclick = submit;
+    pop.querySelector('[data-act="cancel"]').onclick = close;
+    input.onkeydown = (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") submit();
+    };
   }
 
-  async function deleteConv(c) {
+  function deleteConv(c, anchorEl) {
     if (state.sending && state.currentId === c.id) stopSend(true);
-    if (!confirm(`确定删除会话「${c.title}」？历史消息将一并删除。`)) return;
-    await api(`/ui/api/conversations/${c.id}`, { method: "DELETE" });
-    if (state.currentId === c.id) state.currentId = null;
-    await loadConvs();
+    const { pop, close } = showItemPopover(anchorEl,
+      `<div class="pop-title">删除会话</div>
+       <div class="pop-text">确定删除会话「${esc(c.title)}」？历史消息将一并删除。</div>
+       <div class="pop-actions">
+         <button class="pop-btn" data-act="cancel">取消</button>
+         <button class="pop-btn pop-btn-danger" data-act="ok">删除</button>
+       </div>`);
+    pop.querySelector('[data-act="cancel"]').onclick = close;
+    pop.querySelector('[data-act="ok"]').onclick = async () => {
+      close();
+      try {
+        await api(`/ui/api/conversations/${c.id}`, { method: "DELETE" });
+        if (state.currentId === c.id) state.currentId = null;
+        await loadConvs();
+      } catch (err) {
+        alert("删除失败：" + err.message);
+      }
+    };
   }
 
   // ── 消息渲染 ────────────────────────────────────────────────
-  function appendMsgEl(role, content, isError = false) {
+  // 扩展名 → 卡片图标/类型标签/配色
+  const FILE_TYPES = {
+    doc: { icon: "W", label: "Word", cls: "ft-word" },
+    docx: { icon: "W", label: "Word", cls: "ft-word" },
+    xls: { icon: "X", label: "Excel", cls: "ft-excel" },
+    xlsx: { icon: "X", label: "Excel", cls: "ft-excel" },
+    csv: { icon: "X", label: "Excel", cls: "ft-excel" },
+    ppt: { icon: "P", label: "PowerPoint", cls: "ft-ppt" },
+    pptx: { icon: "P", label: "PowerPoint", cls: "ft-ppt" },
+    pdf: { icon: "PDF", label: "PDF", cls: "ft-pdf" },
+    txt: { icon: "T", label: "文本", cls: "ft-text" },
+    md: { icon: "T", label: "Markdown", cls: "ft-text" },
+    json: { icon: "{ }", label: "JSON", cls: "ft-text" },
+    html: { icon: "< >", label: "网页", cls: "ft-text" },
+    htm: { icon: "< >", label: "网页", cls: "ft-text" },
+  };
+
+  // 文件卡片行：用户附件在文字气泡上方（右侧），AI 产物在回复下方（左侧），点击下载
+  function appendFileRows(attachments, role) {
+    const who = role === "user" ? state.user.username.slice(0, 1) : "AI";
+    attachments.forEach((f) => {
+      const name = f.filename || f.file_id;
+      const ext = (name.includes(".") ? name.split(".").pop() : "").toLowerCase();
+      const t = FILE_TYPES[ext] || { icon: "•", label: ext ? ext.toUpperCase() : "文件", cls: "ft-file" };
+      const row = document.createElement("div");
+      row.className = `msg-row ${role} attach-row`;
+      row.innerHTML =
+        `<div class="msg-avatar">${esc(who)}</div>
+         <div class="msg-body">
+           <a class="file-bubble" href="/ui/api/files/${esc(f.file_id)}/download"
+              target="_blank" rel="noopener" title="点击下载 ${esc(name)}">
+             <span class="file-icon ${t.cls}">${t.icon}</span>
+             <span class="file-meta">
+               <span class="file-name">${esc(name)}</span>
+               <span class="file-type">${t.label}</span>
+             </span>
+           </a>
+         </div>`;
+      $("messages").appendChild(row);
+    });
+    scrollBottom();
+  }
+
+  function appendMsgEl(role, content, isError = false, attachments = null) {
     const empty = $("empty-state");
     if (empty) empty.remove();
+    // 用户附件先以卡片输出（文字在上一条消息之后、文字气泡之前）
+    if (role === "user" && attachments && attachments.length) {
+      appendFileRows(attachments, "user");
+    }
     const row = document.createElement("div");
     row.className = `msg-row ${role}`;
     const who = role === "user" ? state.user.username.slice(0, 1) : "AI";
@@ -360,6 +543,10 @@
          <div class="msg-bubble">${fmt(content)}</div>
        </div>`;
     $("messages").appendChild(row);
+    // AI 产物卡片挂在回复气泡下方（左侧），点击可下载
+    if (role === "assistant" && attachments && attachments.length) {
+      appendFileRows(attachments, "assistant");
+    }
     scrollBottom();
     return row.querySelector(".msg-bubble");
   }
@@ -472,23 +659,35 @@
     };
 
     try {
+      // 本次发送携带的附件（快照）：渲染成附件气泡后即从输入框暂存区移除
+      const sentFiles = state.uploads.slice();
+      const sentIds = new Set(sentFiles.map((f) => f.file_id));
+
       if (!state.currentId) await createConv();
       state.abortCtrl = new AbortController();
       const convId = state.currentId;
       const scene = $("scene-select").value;
       input.value = "";
       autoGrow();
-      appendMsgEl("user", message);
+      appendMsgEl("user", message, false, sentFiles);
+      state.uploads = state.uploads.filter((f) => !sentIds.has(f.file_id));
+      renderChips();
       const bubble = appendMsgEl("assistant", "");
       renderer = createStreamRenderer(bubble);
       statusLine = startStatus(bubble);
       heartbeat = startHeartbeat(bubble);
 
+      const _fids = sentFiles.map((f) => f.file_id);
       const r = await fetch(`/ui/api/conversations/${convId}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "same-origin",
-        body: JSON.stringify({ message, scene }),
+        body: JSON.stringify({
+          message,
+          scene,
+          // 自动携带当前所有已上传文档（用户不可见），后端校验归属后注入上下文
+          file_ids: _fids,
+        }),
         signal: state.abortCtrl.signal,
       });
       if (r.status === 401) { location.href = "/chat/login.html"; return; }
@@ -533,6 +732,11 @@
             full = evt.output || full;
             renderer.finalize(full);
             scrollBottom();
+          } else if (evt.type === "artifacts") {
+            // AI 产物：以文件卡片挂在助手回复气泡下方，点击下载
+            if (Array.isArray(evt.files) && evt.files.length) {
+              appendFileRows(evt.files, "assistant");
+            }
           } else if (evt.type === "error") {
             finalized = true;
             bubble.parentElement.classList.add("error");
@@ -549,7 +753,7 @@
 
       await Promise.all([
         loadConvsKeep(convId),
-        refreshArtifacts(convId),
+        refreshUploads(),
       ]);
     } catch (err) {
       if (err.name === "AbortError") {
@@ -588,13 +792,7 @@
   function renderChips() {
     const box = $("chips");
     box.innerHTML = "";
-    if (state.artifacts.length) {
-      const label = document.createElement("span");
-      label.className = "chips-label";
-      label.textContent = "本会话交付物：";
-      box.appendChild(label);
-      state.artifacts.forEach((f) => box.appendChild(fileChip(f, "artifact")));
-    }
+    // 仅展示「待发送」的上传文档；AI 产物以文件卡片挂在助手回复气泡下方
     if (state.uploads.length) {
       const label = document.createElement("span");
       label.className = "chips-label";
@@ -611,17 +809,7 @@
     span.innerHTML =
       `${icon} <span class="chip-name">${esc(f.filename || f.file_id)}</span>
        <a href="/ui/api/files/${esc(f.file_id)}/download" title="下载">下载</a>`;
-    if (kind === "upload") {
-      const ins = document.createElement("button");
-      ins.textContent = "引用";
-      ins.title = "把 file_id 插入输入框";
-      ins.onclick = () => {
-        const ta = $("input");
-        ta.value += (ta.value && !ta.value.endsWith(" ") ? " " : "") + f.file_id;
-        ta.focus();
-      };
-      span.appendChild(ins);
-    }
+    // 已上传文档在发送时自动携带，无需手动引用
     const del = document.createElement("button");
     del.className = "del";
     del.textContent = "✕";
@@ -638,12 +826,6 @@
   async function refreshUploads() {
     const d = await api("/ui/api/files?kind=upload");
     state.uploads = d.files || [];
-    renderChips();
-  }
-
-  async function refreshArtifacts(convId) {
-    const d = await api(`/ui/api/files?conversation_id=${convId}&kind=artifact`);
-    state.artifacts = d.files || [];
     renderChips();
   }
 

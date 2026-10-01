@@ -85,6 +85,10 @@ def _classify_intent(messages: list) -> str:
 
 # ── 节点函数 ──
 
+# 32 位十六进制 file_id（webchat 自动把上传文档拼进消息时用此标识）
+_FILE_ID_RE = re.compile(r"\b[0-9a-f]{32}\b", re.IGNORECASE)
+
+
 def intent_router_node(state: SupervisorState) -> dict:
     """意图分类节点：闲聊走快路径，其余走 LLM 分类。"""
     messages = state.get("messages", [])
@@ -92,6 +96,11 @@ def intent_router_node(state: SupervisorState) -> dict:
         return {"route": "task"}
 
     user_msg = messages[-1].content if hasattr(messages[-1], "content") else str(messages[-1])
+
+    # 含上传文档 file_id 的消息强制走 task：chat_node 无工具能力无法读取文档，
+    # 必须交给 planner 走技能/工具链才能让 read_document 生效。
+    if _FILE_ID_RE.search(user_msg):
+        return {"route": "task"}
 
     # Layer 1: 规则快路径
     if _is_small_talk(user_msg):
