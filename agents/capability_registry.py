@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -55,6 +56,33 @@ SKILL_INTERNAL_LLM_TAG = "skill_internal_llm"
 # 通过 llm.bind(timeout=...) 以 SDK 每请求超时的方式叠加，不改全局共享模型实例。
 # 可用环境变量 SKILL_LLM_TIMEOUT_SECONDS 覆盖。
 SKILL_LLM_TIMEOUT_SECONDS = int(os.getenv("SKILL_LLM_TIMEOUT_SECONDS", "300"))
+
+# ── 技能执行进度上报 ────────────────────────────────────────────
+# 技能内核在关键阶段（规划/逐项评估/渲染交付物等）调用 emit_skill_progress，
+# 把人类可读的步骤说明推给流式执行方（agent_runner）转换为前端 status 事件，
+# 让长任务（如 HARA 数分钟）期间用户能看到后台在持续推进。
+# 通过 ContextVar 传递：executor 节点同步执行于线程池时 contextvars 随
+# copy_context 复制，内核线程内 emit 即可达；无监听方（CLI/同步调用）为 no-op。
+_skill_progress_cb: ContextVar = ContextVar("skill_progress_cb", default=None)
+
+
+def emit_skill_progress(text: str) -> None:
+    cb = _skill_progress_cb.get()
+    if not cb:
+        return
+    try:
+        cb(str(text))
+    except Exception:  # noqa: BLE001 —— 进度上报永不影响技能执行
+        pass
+
+
+def bind_skill_progress(cb: Callable[[str], None]):
+    """绑定当前上下文的技能进度回调；返回 token，供执行方结束时 reset。"""
+    return _skill_progress_cb.set(cb)
+
+
+def unbind_skill_progress(token) -> None:
+    _skill_progress_cb.reset(token)
 
 
 def _with_internal_tag(runnable_config: Any) -> dict:
@@ -1411,6 +1439,7 @@ def _execute_staged_skill(
     if (exec_cfg.get("prepare") or {}).get("script"):
         from core.kb_client import format_knowledge_layered_block, retrieve_knowledge
 
+        emit_skill_progress("正在识别功能项并检索历史知识…")
         logger.info(
             "[capability_registry] prepare 钩子开始（script=%s）",
             exec_cfg["prepare"].get("script"),
@@ -1463,6 +1492,7 @@ def _execute_staged_skill(
         rendered + doc_block + plan_kb_block + ref_block + schema_example_block
     )
     plan_system_prompt = _build_stage_system_prompt(skill_cfg, plan_cfg)
+    emit_skill_progress("正在规划：梳理功能、失效模式与场景清单…")
     logger.info(
         "[capability_registry] 规划层开始：注入 %d 字符（文档 %d + 知识 %d），"
         "max_tokens=%s",
@@ -1518,6 +1548,9 @@ def _execute_staged_skill(
     # ── 阶段 2：逐切片并发评级（单片失败重试 1 次） ──
     map_system_prompt = _build_stage_system_prompt(skill_cfg, map_cfg)
     map_max_tokens = map_cfg.get("max_tokens")
+    emit_skill_progress(
+        f"正在逐项评估严重度/暴露率/可控度（共 {len(slices)} 项，可并行）…"
+    )
     logger.info(
         "[capability_registry] 评级阶段开始：%d 个切片，并发 %d，max_tokens=%s",
         len(slices), max_workers, map_max_tokens,
@@ -1695,7 +1728,12 @@ def _execute_staged_skill(
             for i, unit in enumerate(slices)
         }
         errors: list[BaseException] = []
+        done_count = 0
         for future in as_completed(futures):
+            done_count += 1
+            emit_skill_progress(
+                f"正在逐项评估严重度/暴露率/可控度（已完成 {done_count}/{len(slices)} 项）…"
+            )
             try:
                 idx, events, map_usage = future.result()
                 deduped: list = []
@@ -1748,6 +1786,7 @@ def _execute_staged_skill(
 
     # ── 确定性渲染：JSON → 文件交付物（与单阶段内核一致） ──
     if output_cfg.get("format") == "json" and structured is not None:
+        emit_skill_progress("正在汇总评估结果并生成交付文件…")
         artifact_meta, stats = _run_renderer(skill_cfg, structured)
         if artifact_meta is not None:
             from core.file_sandbox import resolve_stored_path

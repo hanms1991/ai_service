@@ -217,13 +217,23 @@ textarea#input {
 /* ── 执行进度状态条 ─────────────────────────────────────────── */
 .status-line {
   margin-top: 6px; font-size: 13px; color: var(--text-2);
-  display: flex; align-items: center; gap: 8px;
   transition: opacity .35s ease, transform .35s ease;
 }
+.status-line .status-main {
+  display: flex; align-items: center; gap: 8px;
+}
+/* 静默心跳沿用旧的单行结构（无 status-main / history） */
+.status-line.heartbeat { display: flex; align-items: center; gap: 8px; }
 .status-line.fading { opacity: 0; transform: translateY(-4px); }
 .status-line[hidden] { display: none; }
 .status-line.heartbeat { color: var(--text-3); font-size: 12.5px; }
 .status-line .elapsed { color: var(--text-3); font-variant-numeric: tabular-nums; }
+/* 已完成步骤（技能内核上报的真实阶段，非本地轮播提示） */
+.stage-history {
+  margin-top: 6px; display: flex; flex-direction: column; gap: 3px;
+}
+.stage-done { font-size: 12px; color: var(--text-3); display: flex; gap: 6px; }
+.stage-done .tick { color: #1a9e57; font-weight: 600; }
 .dots { display: inline-flex; gap: 3px; }
 .dots span {
   width: 5px; height: 5px; border-radius: 50%; background: var(--accent);

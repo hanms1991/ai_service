@@ -264,10 +264,26 @@ async def run_invoke_stream(
     # 技能内部结构化调用（规划层/评级层/JSON 技能）也发生在 executor 节点内，
     # 其 JSON token 是中间产物；capability_registry 用此 tag 标记，必须过滤，
     # 否则前端会看到大段原始 JSON 而非最终交付摘要
-    from agents.capability_registry import SKILL_INTERNAL_LLM_TAG
+    from agents.capability_registry import SKILL_INTERNAL_LLM_TAG, bind_skill_progress
 
     internal_tags = {SKILL_INTERNAL_LLM_TAG}
     full_output: list[str] = []
+
+    # ── 技能内核进度 → status 事件 ──
+    # executor 节点同步执行于线程池（contextvars 随 copy_context 复制到节点线程），
+    # 内核 emit 的步骤文案经线程安全队列回到本协程，在事件循环间隙转发为 status 事件。
+    # 回调绑定在本请求协程的 context 副本上，请求结束随 context 一并回收，
+    # 不会跨请求泄漏（每次调用本函数都是新的协程上下文）。
+    progress_q: asyncio.Queue = asyncio.Queue()
+    _loop = asyncio.get_running_loop()
+
+    def _on_skill_progress(text: str) -> None:
+        try:
+            _loop.call_soon_threadsafe(progress_q.put_nowait, text)
+        except Exception:  # noqa: BLE001 —— 事件循环已关闭等极端情况，放弃即可
+            pass
+
+    _progress_token = bind_skill_progress(_on_skill_progress)
 
     # 注意：不能 asyncio.wait_for(astream_events(...))，因为 wait_for 返回 coroutine 不是 async iterator。
     # 正确做法：先拿到 async iterator，再对每次 __anext__ 单独 wait_for 以控制两次事件间的超时。
@@ -306,6 +322,11 @@ async def run_invoke_stream(
 
     try:
         while True:
+            # 事件间隙转发技能内核进度：emit 发生在节点线程，经队列回到本协程
+            while not progress_q.empty():
+                line = _stage_event(progress_q.get_nowait())
+                if line:
+                    yield line
             # 两个事件之间允许的最长等待（LLM 卡住则超时）
             event = await asyncio.wait_for(events.__anext__(), timeout=effective_timeout)
             event_type = event.get("event")

@@ -563,9 +563,12 @@
     const line = document.createElement("div");
     line.className = "status-line";
     line.innerHTML =
-      `<span class="dots"><span></span><span></span><span></span></span>
-       <span class="stage">${HINTS[0]}</span>
-       <span class="elapsed"></span>`;
+      `<div class="status-main">
+         <span class="dots"><span></span><span></span><span></span></span>
+         <span class="stage">${HINTS[0]}</span>
+         <span class="elapsed"></span>
+       </div>
+       <div class="stage-history"></div>`;
     bubble.after(line);
     const tick = () => {
       const sec = Math.floor((Date.now() - t0) / 1000);
@@ -725,8 +728,23 @@
             heartbeat.poke();
             if (!scheduled) { scheduled = true; requestAnimationFrame(paint); }
           } else if (evt.type === "status" && evt.stage && !stageFaded) {
+            // 真实步骤推进：旧阶段收进已完成列表（✓，最多留 3 条），显示新阶段文案
             const st = statusLine && statusLine.querySelector(".stage");
-            if (st) { st.textContent = evt.stage; st.dataset.live = "1"; }
+            if (st && st.textContent !== evt.stage) {
+              if (st.dataset.live === "1") {
+                const hist = statusLine.querySelector(".stage-history");
+                if (hist) {
+                  const item = document.createElement("div");
+                  item.className = "stage-done";
+                  item.innerHTML =
+                    `<span class="tick">✓</span><span>${esc(st.textContent)}</span>`;
+                  hist.appendChild(item);
+                  while (hist.children.length > 3) hist.removeChild(hist.firstChild);
+                }
+              }
+              st.textContent = evt.stage;
+              st.dataset.live = "1";
+            }
           } else if (evt.type === "done") {
             finalized = true;
             full = evt.output || full;
@@ -807,8 +825,7 @@
     span.className = "chip" + (kind === "artifact" ? " artifact" : "");
     const icon = kind === "artifact" ? "📊" : "📄";
     span.innerHTML =
-      `${icon} <span class="chip-name">${esc(f.filename || f.file_id)}</span>
-       <a href="/ui/api/files/${esc(f.file_id)}/download" title="下载">下载</a>`;
+      `${icon} <span class="chip-name">${esc(f.filename || f.file_id)}</span>`;
     // 已上传文档在发送时自动携带，无需手动引用
     const del = document.createElement("button");
     del.className = "del";
