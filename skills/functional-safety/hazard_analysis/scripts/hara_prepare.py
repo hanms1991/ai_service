@@ -546,7 +546,7 @@ def _retrieve_function_failure_modes(retrieve, domain: str, func_name: str,
         )
         return []
     result: list[dict] = []
-    seen_words: set[str] = set()
+    seen_keys: set[str] = set()
     for c in chunks:
         if not isinstance(c, dict):
             continue
@@ -557,13 +557,20 @@ def _retrieve_function_failure_modes(retrieve, domain: str, func_name: str,
         if meta_func and meta_func not in func_name and func_name not in meta_func:
             continue
         word = str(meta.get("failure_type") or "").strip()
-        if not word or word in seen_words:
+        if not word:
             continue
         fid = str(meta.get("failure_id") or "").strip()
         texts = _fm_original_texts(str(c.get("content") or ""))
         if not texts[0] and not texts[1]:
             continue
-        seen_words.add(word)
+        # 必须按 failure_id 去重：同一失效词在历史项目中可能对应多个失效模式
+        # （如 EPB 的"丢失"含「接合驻车制动器功能丧失」「释放驻车制动器功能
+        # 丧失」两条，"非预期"含三条）。若按失效词去重，同词条目只剩一条，
+        # 后处理会把多个 hazop_item 的表现/危害覆盖成同一份内容。
+        key = fid or f"{word}:{str(c.get('content') or '')[:80]}"
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
         result.append({
             "word": word,
             "failure_id": fid,
@@ -572,6 +579,10 @@ def _retrieve_function_failure_modes(retrieve, domain: str, func_name: str,
             "chunk": c,
         })
     return result
+
+
+# 备注文本中引用的历史失效模式 ID（如 #CB_MF_0008_01）
+_FM_ID_RE = re.compile(r"([A-Za-z]{1,5}_MF_\d+(?:_\d+)?)")
 
 
 def _name_norm(text: str) -> str:
@@ -628,6 +639,79 @@ def _dedupe_function_features(plan: dict) -> int:
             kept.append(feat)
         fn["features"] = kept
     return merged
+
+
+def _match_item_failure(item: dict, fm_index: dict[str, dict], *,
+                        retrieve, domain: str, func_name: str,
+                        fetch_cache: dict) -> tuple[dict | None, str]:
+    """为一个 hazop_item 匹配唯一对应的知识库失效模式。
+
+    同一失效词可能对应多个历史失效模式（如 EPB 的"丢失"有 2 条、"非预期"
+    有 3 条），仅凭 word 无法消歧。按可靠性依次尝试：
+      1. source.ref_id 显式指向（规划层被要求逐条填写）；
+      2. ref_id 不在本次召回集合时，按 ref 直查知识库取原文（合成记录）；
+      3. source_note 中恰好引用一个失效模式 ID；
+      4. 该失效词在知识库中只有唯一候选；
+      5. 同词多候选时，用条目已有文本与候选原文做相似度消歧。
+    均不满足返回 (None, "ambiguous"/"missing")，调用方不得强行覆盖。
+    """
+    src = item.get("source") if isinstance(item.get("source"), dict) else {}
+    ref = str(src.get("ref_id") or "").strip()
+    word = str(item.get("word") or "").strip()
+
+    # 1. ref_id 直配（fm_index 已按功能隔离，ref 是最权威的逐字信号）
+    if ref and ref in fm_index:
+        return fm_index[ref], "ref"
+    # 2. ref_id 直查兜底（召回 top_k 截断未带入该分块时）
+    if ref and ref not in fm_index:
+        texts = _fetch_fm_originals(
+            retrieve, domain, ref, func_name, word, fetch_cache
+        )
+        if texts:
+            return {
+                "word": word,
+                "failure_id": ref,
+                "malfunction_behavior": texts[0],
+                "vehicle_hazard": texts[1],
+                "chunk": {},
+                "_synthesized": True,
+            }, "ref_query"
+    # 3. source_note 中恰好引用一个同失效词的 MF ID
+    note = str(item.get("source_note") or "")
+    note_hits = []
+    for mid in dict.fromkeys(_FM_ID_RE.findall(note)):
+        cand = fm_index.get(mid)
+        if cand is not None and (
+            not word or not cand.get("word")
+            or str(cand["word"]).strip() == word
+        ):
+            note_hits.append(cand)
+    if len(note_hits) == 1:
+        return note_hits[0], "note"
+    # 4/5. 按失效词
+    cands = [
+        fm for fm in fm_index.values()
+        if word and str(fm.get("word") or "").strip() == word
+    ]
+    if len(cands) == 1:
+        return cands[0], "word"
+    if len(cands) > 1:
+        cur = (str(item.get("malfunction_behavior") or "")
+               + str(item.get("vehicle_hazard") or "")).strip()
+        if cur:
+            best, best_score = None, 0.0
+            for fm in cands:
+                score = max(
+                    _scene_sim(cur, fm["malfunction_behavior"]),
+                    _scene_sim(cur, fm["vehicle_hazard"]),
+                    _scene_sim(cur, fm["malfunction_behavior"] + fm["vehicle_hazard"]),
+                )
+                if score > best_score:
+                    best, best_score = fm, score
+            if best is not None and best_score >= 0.45:
+                return best, f"text@{best_score:.2f}"
+        return None, "ambiguous"
+    return None, "missing"
 
 
 def fix_plan_items(ctx) -> dict:
@@ -712,42 +796,67 @@ def fix_plan_items(ctx) -> dict:
                 func_name, covered,
             )
 
-    # 第0步：对每个功能检索知识库全部历史失效模式（一次检索覆盖11失效词）
+    # 第0步：对每个功能检索知识库全部历史失效模式，按 failure_id 建索引
+    # （同一失效词可能对应多个历史失效模式，绝不能按词归并）
     fm_by_func: dict[str, dict[str, dict]] = {}
     for func_name in functions.values():
         if not func_name:
             continue
         fms = _retrieve_function_failure_modes(retrieve, domain, func_name)
-        fm_by_func[func_name] = {fm["word"]: fm for fm in fms}
+        index: dict[str, dict] = {}
+        for i, fm in enumerate(fms):
+            index[fm.get("failure_id") or f"__noid_{i}"] = fm
+        fm_by_func[func_name] = index
         logger.info(
-            "[hara_prepare] 知识库失效模式检索：%s 命中 %d 个失效",
-            func_name, len(fms),
+            "[hara_prepare] 知识库失效模式检索：%s 命中 %d 个失效（按 failure_id 去重）",
+            func_name, len(index),
         )
 
     union_cache: dict[tuple[str, str], list[dict]] = {}
-    covered_pairs: set[tuple[str, str]] = set()
+    covered_pairs: set[tuple[str, str]] = set()  # (fid, 知识库失效模式键)
+    fm_fetch_cache: dict[str, tuple[str, str] | None] = {}
 
     # 第1步：失效模式原文覆盖（reused/缺省条目：知识库有则强制用原文，一字不差；
     # adapted=LLM 有意改编，保留其文本不覆盖，与 HARA 事件层 _materialize 的
-    # full/adapted 语义对齐；改编条目同样计入 covered_pairs，第1.5步不再重复追加）
+    # full/adapted 语义对齐）。匹配必须精确到具体历史失效模式：ref_id 优先，
+    # 同一失效词对应多个知识库条目时禁止"按词"取一条强行覆盖全部条目。
     for item in items:
         if not isinstance(item, dict):
             continue
         fid = str(item.get("fid") or "").strip()
         word = str(item.get("word") or "").strip()
         func_name = functions.get(fid, "")
-        fm = fm_by_func.get(func_name, {}).get(word)
-        if not fm:
-            continue
+        fm_index = fm_by_func.get(func_name, {})
         src = item.get("source") if isinstance(item.get("source"), dict) else {}
-        if str(src.get("type") or "").strip().lower() == "adapted":
-            covered_pairs.add((fid, word))
+        is_adapted = str(src.get("type") or "").strip().lower() == "adapted"
+
+        fm, how = _match_item_failure(
+            item, fm_index,
+            retrieve=retrieve, domain=domain, func_name=func_name,
+            fetch_cache=fm_fetch_cache,
+        )
+        if is_adapted:
+            # 改编条目不覆盖文本，但其参照的历史条目不允许在第1.5步重复追加
+            ref_key = str(src.get("ref_id") or "").strip()
+            if not ref_key and fm is not None and fm.get("failure_id"):
+                ref_key = fm["failure_id"]
+            if ref_key:
+                covered_pairs.add((fid, ref_key))
+            continue
+        if fm is None:
+            if how == "ambiguous":
+                logger.warning(
+                    "[hara_prepare] 失效模式消歧失败，保留规划原文（fid=%s，word=%s，"
+                    "ref_id=%s）：同失效词存在多个知识库条目且无可靠匹配信号",
+                    fid, word, str(src.get("ref_id") or "").strip(),
+                )
             continue
         item["malfunction_behavior"] = fm["malfunction_behavior"]
         item["vehicle_hazard"] = fm["vehicle_hazard"]
         src["type"] = "reused"
-        src["ref_id"] = fm["failure_id"]
-        if not str(src.get("project") or "").strip():
+        if fm.get("failure_id"):
+            src["ref_id"] = fm["failure_id"]
+        if not str(src.get("project") or "").strip() and not fm.get("_synthesized"):
             src_file = str(
                 (((fm["chunk"].get("meta") or {}).get("source") or {}).get("file"))
                 or ""
@@ -759,16 +868,16 @@ def fix_plan_items(ctx) -> dict:
         m = matrix_by_fid.get(fid)
         if m is not None:
             sel = m.get("selections") if isinstance(m.get("selections"), dict) else {}
-            sel[word] = True
+            sel[str(fm.get("word") or word)] = True
             m["selections"] = sel
-        covered_pairs.add((fid, word))
+        if fm.get("failure_id"):
+            covered_pairs.add((fid, fm["failure_id"]))
         stats["fm_covered"] += 1
 
-    # 第1.5步：补全知识库有但 LLM 未生成的失效模式（宁多勿漏）
+    # 第1.5步：补全知识库有但 LLM 未生成的失效模式（按 failure_id 逐条判定，宁多勿漏）
     for fid, func_name in functions.items():
-        fms = fm_by_func.get(func_name, {})
-        for word, fm in fms.items():
-            if (fid, word) in covered_pairs:
+        for key, fm in fm_by_func.get(func_name, {}).items():
+            if (fid, key) in covered_pairs or fm.get("_synthesized"):
                 continue
             src_file = str(
                 (((fm["chunk"].get("meta") or {}).get("source") or {}).get("file"))
@@ -776,7 +885,7 @@ def fix_plan_items(ctx) -> dict:
             ).strip()
             items.append({
                 "fid": fid,
-                "word": word,
+                "word": fm["word"],
                 "malfunction_behavior": fm["malfunction_behavior"],
                 "vehicle_hazard": fm["vehicle_hazard"],
                 "scenarios": [],
@@ -791,9 +900,9 @@ def fix_plan_items(ctx) -> dict:
             m = matrix_by_fid.get(fid)
             if m is not None:
                 sel = m.get("selections") if isinstance(m.get("selections"), dict) else {}
-                sel[word] = True
+                sel[fm["word"]] = True
                 m["selections"] = sel
-            covered_pairs.add((fid, word))
+            covered_pairs.add((fid, key))
             stats["fm_appended"] += 1
 
     # 第2步：场景历史骨架（对所有 hazop_items 含追加的，宁多勿漏）
