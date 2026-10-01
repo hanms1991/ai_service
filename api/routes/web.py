@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Request, UploadFile
@@ -288,7 +289,12 @@ async def conv_chat(conv_id: str, body: ChatBody, user: dict = Depends(require_w
                     evt = {}
                 etype = evt.get("type")
                 if etype == "done":
-                    done_parts.append(str(evt.get("output") or ""))
+                    out = str(evt.get("output") or "")
+                    done_parts.append(out)
+                    cleaned = _strip_backend_meta(out)
+                    if cleaned != out:
+                        evt["output"] = cleaned
+                        line = json.dumps(evt, ensure_ascii=False) + "\n"
                 elif etype == "token":
                     token_parts.append(str(evt.get("content") or ""))
                 elif etype == "error":
@@ -300,7 +306,9 @@ async def conv_chat(conv_id: str, body: ChatBody, user: dict = Depends(require_w
             stopped = True
             # 停止路径无法再向客户端推送事件：shield 内完成「产物登记+消息落库」，
             # 刷新历史时产物卡片仍会随消息带出
-            final_text = ("".join(done_parts) or "".join(token_parts)).strip()
+            final_text = _strip_backend_meta(
+                ("".join(done_parts) or "".join(token_parts)).strip()
+            )
             final_text = (final_text + "\n\n（用户已停止生成，以上为已输出的部分内容）"
                           if final_text else "（用户已停止生成）")
             try:
@@ -319,7 +327,9 @@ async def conv_chat(conv_id: str, body: ChatBody, user: dict = Depends(require_w
 
         # 正常/错误路径（连接仍存活）：先落库并登记交付物，再推送 artifacts 事件，
         # 前端把产物卡片渲染在助手回复气泡下方
-        raw_text = ("".join(done_parts) or "".join(token_parts)).strip()
+        raw_text = _strip_backend_meta(
+            ("".join(done_parts) or "".join(token_parts)).strip()
+        )
         is_error = bool(error_obj and not raw_text)
         final_text = raw_text or (
             f"[{error_obj.get('code', 'ERROR')}] {error_obj.get('message', '执行失败')}"
@@ -346,6 +356,15 @@ def _ndjson_response(generator):
         media_type="application/x-ndjson; charset=utf-8",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# 技能交付摘要里的后台信息行（文件 ID / 下载方式·API Key）——web 端产物已以
+# 可点击卡片挂在消息气泡下，正文无需暴露接口细节；对外 /api/v1 契约不受影响
+_WEB_BACKEND_META_RE = re.compile(r"^(文件 ID|下载方式)：.*$", re.MULTILINE)
+
+
+def _strip_backend_meta(text: str) -> str:
+    return _WEB_BACKEND_META_RE.sub("", text)
 
 
 # ────────────────────────────────────────────────────────────────────
