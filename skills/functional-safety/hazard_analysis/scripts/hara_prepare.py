@@ -1266,7 +1266,8 @@ def _review_one(ev: dict, candidates: dict[str, dict],
 
 
 def review_events(ctx) -> dict:
-    """评审钩子：物化 → 疑点检测（source 标注 + 安全目标缺口）→ 复核 LLM → 应用 → 再物化。
+    """评审钩子：物化 → 疑点检测（source 标注 + 安全目标缺口）→ 确定性传播/
+    复核 LLM → 应用 → 再物化/再传播。
 
     第一步物化（纯代码，仅在有历史召回时）：reused 事件全字段按知识库事件块
     原文回填、adapted 事件覆盖场景原文与安全目标组——沿用内容以库原文为准，
@@ -1275,11 +1276,13 @@ def review_events(ctx) -> dict:
       A. source 标注疑点（漏标沿用/虚引 ID/评级与所引不一致/场景与所引不符），
          仅在本切片有历史召回时检测；
       B. 安全目标缺口（与历史召回无关，始终检测）：按 S/E/C 矩阵确定性反算
-         ASIL≥A 的显著事件，若 sg_text/safe_state/ftti 缺失即疑似评级层遗漏，
-         连同同切片邻近事件（同危害机理应共用同一目标文字）回炉 LLM 补全一次；
+         ASIL≥A 的显著事件，若 sg_text/safe_state/ftti 缺失，**先在同一失效
+         单元内确定性传播**——同单元显著事件本应共用同一安全目标，兄弟事件
+         已有完整三件套时直接继承，零 LLM 开销；仅整个单元都无安全目标时，
+         才连同邻近事件回炉 LLM 补全一次；
     改不改、怎么改由复核 LLM 决定。sg_gap 类只允许白名单回填安全目标三字段，
     防止复核顺带改动 S/E/C；source 类保持整事件合并。物化/复核失败均软降级
-    保留原结果；补全后仍缺失的，由渲染器标黄并在交付摘要中提示人工补全。
+    保留原结果；补全/传播后仍缺失的，由渲染器标黄并在交付摘要中提示人工补全。
     """
     events = ctx.events if isinstance(ctx.events, list) else []
     if not events:
@@ -1360,14 +1363,50 @@ def review_events(ctx) -> dict:
                 })
 
     # B 类：安全目标缺口（ASIL≥A 的显著事件缺 sg_text/safe_state/ftti）
-    sg_gap_indexes: set[int] = set()
     _SG_FIELDS = ("sg_text", "safe_state", "ftti")
     _SG_LABEL = {"sg_text": "安全目标", "safe_state": "安全状态", "ftti": "FTTI"}
+
+    def _significant(ev: dict) -> bool:
+        return isinstance(ev, dict) and _event_asil(ev) not in (None, "QM")
+
+    def _propagate_sg() -> int:
+        """同失效单元内确定性传播安全目标三件套，返回补齐的事件数。
+
+        评级切片即一个 hazop_item（同一功能异常表现/整车危害），其下所有
+        ASIL≥A 事件按方法论必须共用**完全相同**的安全目标（渲染器也按目标
+        文字合并整车安全目标）。因此单元内任一显著事件已挂接完整三件套时，
+        其余缺口无需再问 LLM，直接继承；只填空字段，不覆盖已有内容。
+        """
+        trio = None
+        for ev in events:
+            if not _significant(ev):
+                continue
+            vals = tuple(str(ev.get(k) or "").strip() for k in _SG_FIELDS)
+            if all(vals):
+                trio = vals
+                break
+        if trio is None:
+            return 0
+        filled = 0
+        for ev in events:
+            if not _significant(ev):
+                continue
+            changed = False
+            for k, v in zip(_SG_FIELDS, trio):
+                if v and not str(ev.get(k) or "").strip():
+                    ev[k] = v
+                    changed = True
+            if changed:
+                filled += 1
+        return filled
+
+    # 先确定性传播：同单元兄弟事件已有完整安全目标时直接补齐，不消耗 LLM 调用
+    sg_propagated = _propagate_sg()
+
+    # 传播后仍缺的缺口才回炉 LLM（典型为整个单元都没挂安全目标）
+    sg_gap_indexes: set[int] = set()
     for i, ev in enumerate(events):
-        if not isinstance(ev, dict):
-            continue
-        asil = _event_asil(ev)
-        if asil is None or asil == "QM":
+        if not _significant(ev):
             continue
         missing = [
             _SG_LABEL[k] for k in _SG_FIELDS
@@ -1376,6 +1415,7 @@ def review_events(ctx) -> dict:
         if not missing:
             continue
         sg_gap_indexes.add(i)
+        asil = _event_asil(ev)
         suspects.append({
             "index": i, "kind": "sg_gap",
             "issues": [
@@ -1394,9 +1434,10 @@ def review_events(ctx) -> dict:
 
     ctx.logger.info(
         "[hara_prepare] 评级评审（%s/%s）：%d 条事件，source 标注疑点 %d 条，"
-        "安全目标缺口 %d 条",
+        "安全目标缺口 %d 条（单元内确定性传播补齐 %d 条，待回炉 %d 条）",
         fid or "?", word, len(events),
-        len(suspects) - len(sg_gap_indexes), len(sg_gap_indexes),
+        len(suspects) - len(sg_gap_indexes),
+        sg_propagated + len(sg_gap_indexes), sg_propagated, len(sg_gap_indexes),
     )
     if not suspects:
         return {"events": events, "usage": {}}
@@ -1480,18 +1521,21 @@ def review_events(ctx) -> dict:
             applied += 1
 
     mat_count2 = _materialize_all()  # 复核改判后按库原文再校正一遍
-    # 复核+再物化后仍缺安全目标的显著事件：留给渲染器标黄与交付摘要人工提示
-    sg_still = 0
-    for i in sg_gap_indexes:
-        ev = events[i] if i < len(events) else {}
-        if isinstance(ev, dict) and _event_asil(ev) not in (None, "QM") and any(
+    # LLM 补出的安全目标（或再物化从历史回填的）在单元内再传播一轮，
+    # 覆盖未被模型逐条回填的同单元缺口
+    sg_propagated2 = _propagate_sg()
+    # 复核+传播+再物化后仍缺安全目标的显著事件：留给渲染器标黄与摘要人工提示
+    sg_still = sum(
+        1 for ev in events
+        if _significant(ev) and any(
             not str(ev.get(k) or "").strip() for k in _SG_FIELDS
-        ):
-            sg_still += 1
+        )
+    )
     ctx.logger.info(
         "[hara_prepare] 评级复核（%s/%s）：疑似 %d 条（安全目标缺口 %d），"
-        "模型回填 %d 条（其中安全目标补全 %d 条，仍缺 %d 条），复核后再物化 %d 条",
+        "模型回填 %d 条（其中安全目标 %d 条），回炉后单元内再传播 %d 条，"
+        "仍缺 %d 条，复核后再物化 %d 条",
         fid or "?", word, len(suspects), len(sg_gap_indexes),
-        applied, sg_filled, sg_still, mat_count2,
+        applied, sg_filled, sg_propagated2, sg_still, mat_count2,
     )
     return {"events": events, "usage": usage}
