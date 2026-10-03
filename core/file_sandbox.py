@@ -4,7 +4,7 @@
 - 所有文件落在 UPLOAD_DIR（默认 data/uploads）下，按 file_id 分子目录隔离；
 - file_id 由服务端生成（uuid4 hex），不接受用户传入路径，从根本上杜绝路径穿越；
 - 扩展名白名单 + 单文件大小上限（均可经环境变量配置）；
-- 显式拒绝 Office 宏格式（.docm/.xlsm/.pptm）与旧版二进制格式（.doc/.xls/.ppt）。
+- 显式拒绝 Office 宏格式（.docm/.xlsm/.pptm）；旧版二进制 .doc 已支持读取。
 
 存储布局：
     <UPLOAD_DIR>/<file_id>/
@@ -30,15 +30,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # 允许上传/读取的文档扩展名（小写、含点）
 ALLOWED_EXTENSIONS: frozenset[str] = frozenset({
-    ".docx", ".xlsx", ".pptx", ".pdf",
+    ".docx", ".doc", ".xlsx", ".pptx", ".pdf",
     ".txt", ".md", ".csv", ".json", ".html", ".htm",
 })
 
 # 显式拒绝（给出明确报错，而不是落到"不支持的扩展名"）：
 # - 宏格式：可能携带恶意 VBA
-# - 旧版二进制 Office：markitdown 不支持，避免上传后无法读取
+# - 旧版二进制 Office 中仅 .doc 支持读取；.xls/.ppt 暂不支持
 _BLOCKED_EXTENSIONS: frozenset[str] = frozenset({
-    ".docm", ".xlsm", ".pptm", ".doc", ".xls", ".ppt",
+    ".docm", ".xlsm", ".pptm", ".xls", ".ppt",
     ".exe", ".dll", ".bat", ".cmd", ".ps1", ".sh", ".msi",
 })
 

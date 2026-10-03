@@ -7,10 +7,11 @@
     再依据所加载技能（如 hazard_analysis）完成分析。
 
 支持格式由 core.file_sandbox.ALLOWED_EXTENSIONS 决定：
-    docx / xlsx / pptx / pdf / txt / md / csv / json / html
+    docx / doc / xlsx / pptx / pdf / txt / md / csv / json / html
 
 注意：
-    - 转换基于 Microsoft markitdown，本地执行，不外发文件；
+    - .docx 等基于 markitdown，本地执行，不外发文件；
+    - .doc（旧版二进制 OLE2）基于 olefile 直接提取正文文本；
     - 返回文本按 READ_DOC_MAX_CHARS（默认 6 万字符）截断，避免撑爆上下文；
     - 工具不抛异常给 LLM，错误以结构化字符串返回，便于 Agent 自行纠偏。
 """
@@ -34,6 +35,62 @@ logger = logging.getLogger("tools.read_document")
 
 def _max_chars() -> int:
     return int(os.getenv("READ_DOC_MAX_CHARS", "60000"))
+
+
+def _doc_to_text(path: str) -> str:
+    """从旧版二进制 .doc（OLE2）提取正文文本。
+
+    基于 olefile 读取 WordDocument 流，用 FIB（文件信息块）定位正文：
+      - fcMin（偏移 0x18）：正文在 WordDocument 流中的起始位置；
+      - ccpText（偏移 0x4C）：正文字符数；
+    Word 97+ 的 .doc 正文为 UTF-16LE（2 字节/字符）。若解码异常则回退为
+    扫描可打印的 UTF-16LE 文本段，保证尽可能拿到内容。
+    """
+    import re
+    import struct
+
+    import olefile
+
+    ole = olefile.OleFileIO(path)
+    try:
+        word = ole.openstream("WordDocument").read()
+    finally:
+        ole.close()
+
+    if len(word) < 0x50:
+        return ""
+
+    fc_min = struct.unpack_from("<I", word, 0x18)[0]
+    ccp_text = struct.unpack_from("<I", word, 0x4C)[0]
+
+    text = ""
+    if fc_min < len(word) and ccp_text > 0:
+        # UTF-16LE：2 字节/字符
+        end = min(fc_min + ccp_text * 2, len(word))
+        raw = word[fc_min:end]
+        try:
+            text = raw.decode("utf-16-le", errors="ignore")
+        except Exception:  # noqa: BLE001
+            text = ""
+
+    # 兜底：FIB 取值异常或解码后几乎全是乱码时，扫描可打印 UTF-16LE 文本段
+    if not text or sum(c.isprintable() for c in text) < max(len(text) * 0.3, 1):
+        # 把整个流按 UTF-16LE 解码，过滤控制字符后取非空行
+        try:
+            full = word.decode("utf-16-le", errors="ignore")
+        except Exception:  # noqa: BLE001
+            full = ""
+        full = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", full)
+        lines = [ln.strip() for ln in full.splitlines()
+                 if any(c.isprintable() for c in ln)]
+        text = "\n".join(lines)
+
+    # 清理控制字符，保留换行/制表
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _prepare_convert_path(path: str, ext: str) -> tuple[str, str | None]:
@@ -91,31 +148,41 @@ def read_document(file_id: str) -> str:
     except Exception as e:  # noqa: BLE001 - 工具层兜底，避免异常冒泡打断 Agent 循环
         return f"[读取失败] 文件定位异常：{e}"
 
-    # markitdown 为可选重依赖，惰性导入，缺失时给出可操作提示
-    try:
-        from markitdown import MarkItDown
-    except ImportError:
-        return (
-            "[读取失败] 文档解析依赖 markitdown 未安装，"
-            "请执行 pip install 'markitdown[docx,xlsx,pptx,pdf]' 后重启服务。"
-        )
-
-    try:
-        convert_path, tmp_path = _prepare_convert_path(str(path), meta.ext)
+    # .doc（旧版二进制）走 olefile 解析，不依赖 markitdown
+    if meta.ext.lower() == ".doc":
         try:
-            result = MarkItDown().convert(convert_path)
-            text = (getattr(result, "text_content", None) or "").strip()
-        finally:
-            if tmp_path:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-    except Exception as e:  # noqa: BLE001
-        return (
-            f"[读取失败] 文件 {meta.original_name!r}（{meta.ext}）解析失败：{e}。"
-            "该文件可能已损坏、加密，或内容为扫描件图片（暂不支持 OCR）。"
-        )
+            text = _doc_to_text(str(path)).strip()
+        except Exception as e:  # noqa: BLE001
+            return (
+                f"[读取失败] 文件 {meta.original_name!r}（{meta.ext}）解析失败：{e}。"
+                "该 .doc 文件可能已损坏或加密；建议另存为 .docx 后重新上传。"
+            )
+    else:
+        # markitdown 为可选重依赖，惰性导入，缺失时给出可操作提示
+        try:
+            from markitdown import MarkItDown
+        except ImportError:
+            return (
+                "[读取失败] 文档解析依赖 markitdown 未安装，"
+                "请执行 pip install 'markitdown[docx,xlsx,pptx,pdf]' 后重启服务。"
+            )
+
+        try:
+            convert_path, tmp_path = _prepare_convert_path(str(path), meta.ext)
+            try:
+                result = MarkItDown().convert(convert_path)
+                text = (getattr(result, "text_content", None) or "").strip()
+            finally:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+        except Exception as e:  # noqa: BLE001
+            return (
+                f"[读取失败] 文件 {meta.original_name!r}（{meta.ext}）解析失败：{e}。"
+                "该文件可能已损坏、加密，或内容为扫描件图片（暂不支持 OCR）。"
+            )
 
     if not text:
         return (
