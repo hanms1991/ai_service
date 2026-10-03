@@ -132,6 +132,39 @@ async def scenes(_: dict = Depends(require_web_user)) -> dict:
     return {"scenes": items}
 
 
+@router.get("/models")
+async def models_list(_: dict = Depends(require_web_user)) -> dict:
+    """可用 LLM 预设列表与当前选中项。"""
+    from core import llm
+
+    return {
+        "models": llm.list_models(),
+        "current": llm.get_current_model_name(),
+    }
+
+
+class ModelSwitchBody(BaseModel):
+    name: str
+
+
+@router.post("/models/current")
+async def models_switch(
+    body: ModelSwitchBody, _: dict = Depends(require_web_user)
+) -> dict:
+    """切换当前生效的 LLM 预设（全局生效，影响所有后续请求）。"""
+    from core import llm
+
+    try:
+        name = llm.set_current_model(body.name)
+    except KeyError:
+        raise ApiError(code="MODEL_NOT_FOUND", message=f"未知模型预设: {body.name}",
+                       http_status=404)
+    except ValueError:
+        raise ApiError(code="MODEL_DISABLED", message=f"模型预设 {body.name} 已禁用",
+                       http_status=400)
+    return {"current": name}
+
+
 # ────────────────────────────────────────────────────────────────────
 # 会话 CRUD
 # ────────────────────────────────────────────────────────────────────

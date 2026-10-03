@@ -7,6 +7,8 @@
     conversations: [],
     currentId: null,
     scenes: [],
+    models: [],
+    currentModel: "",
     sending: false,
     abortCtrl: null,
     elapsedTimer: null,
@@ -995,6 +997,34 @@
         ? `${s.scene} · ${s.description}` : s.scene;
       sel.appendChild(opt);
     });
+
+    // ── LLM 模型预设下拉 ──
+    const md = await api("/ui/api/models").catch(() => ({ models: [], current: "" }));
+    state.models = md.models || [];
+    const msel = $("model-select");
+    state.models.forEach((m) => {
+      const opt = document.createElement("option");
+      opt.value = m.name;
+      opt.textContent = m.label || m.model;
+      msel.appendChild(opt);
+    });
+    if (md.current) msel.value = md.current;
+    msel.addEventListener("change", async () => {
+      const name = msel.value;
+      const prev = state.currentModel;
+      try {
+        const r = await api("/ui/api/models/current", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        });
+        state.currentModel = r.current || name;
+      } catch (e) {
+        msel.value = prev || md.current || "";
+        alert(`切换模型失败：${e.message || e}`);
+      }
+    });
+    state.currentModel = md.current || "";
 
     $("btn-new").onclick = () => {
       if (state.sending) stopSend(true);

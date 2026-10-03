@@ -1,0 +1,38 @@
+[
+  {
+    "name": "glm",
+    "label": "GLM-5.3-Flash",
+    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+    "model": "glm-5.3-flash",
+    "api_key_env": "LLM_API_KEY_GLM",
+    "temperature": 1,
+    "enabled": true
+  },
+  {
+    "name": "deepseek",
+    "label": "DeepSeek-Flash",
+    "base_url": "https://api.deepseek.com/v1",
+    "model": "deepseek-flash",
+    "api_key_env": "LLM_API_KEY_DEEPSEEK",
+    "temperature": 0.7,
+    "enabled": true
+  },
+  {
+    "name": "kimi",
+    "label": "Kimi-K3",
+    "base_url": "https://api.moonshot.cn/v1",
+    "model": "kimi-k3",
+    "api_key_env": "LLM_API_KEY_KIMI",
+    "temperature": 1,
+    "enabled": false
+  },
+  {
+    "name": "qwen-local",
+    "label": "Qwen3.8-27B(本地vLLM)",
+    "base_url": "http://192.168.64.3:9000/v1",
+    "model": "/data/vLLM_models/Qwen3.8-27B-FP8",
+    "api_key_env": "LLM_API_KEY_QWEN_LOCAL",
+    "temperature": 0.7,
+    "enabled": true
+  }
+]

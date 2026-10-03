@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AutoAgent</title>
-  <link rel="stylesheet" href="style.css?v=20261002a" />
+  <link rel="stylesheet" href="style.css?v=20261003a" />
 </head>
 <body>
   <div class="layout">
@@ -26,9 +26,13 @@
     <main class="main">
       <div class="topbar">
         <span class="topbar-title" id="topbar-title"></span>
-        <select class="scene-select" id="scene-select" title="功能场景（默认智能编排）">
-          <option value="">智能编排</option>
-        </select>
+        <div class="topbar-controls">
+          <select class="model-select" id="model-select" title="切换 LLM 模型（全局生效）">
+          </select>
+          <select class="scene-select" id="scene-select" title="功能场景（默认智能编排）">
+            <option value="">智能编排</option>
+          </select>
+        </div>
       </div>
 
       <div class="messages" id="messages">
@@ -55,6 +59,6 @@
       </div>
     </main>
   </div>
-  <script src="app.js?v=20261002a"></script>
+  <script src="app.js?v=20261003a"></script>
 </body>
 </html>
