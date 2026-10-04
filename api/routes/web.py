@@ -81,7 +81,10 @@ class PinBody(BaseModel):
 
 class ChatBody(BaseModel):
     message: str
-    scene: str | None = ""
+    # None=本次请求未携带场景（回退会话记忆的场景，保持会话连续性）；
+    # ""=前端显式选择「智能编排」（清空场景，不得回退成旧场景）；
+    # 非空串=切换到指定场景。三态必须区分，故默认值是 None 而不是 ""。
+    scene: str | None = None
     # 本次发送携带的上传文档 file_id 列表（前端自动填入，用户不可见）
     file_ids: list[str] | None = None
 
@@ -198,8 +201,17 @@ async def conv_pin(conv_id: str, body: PinBody, user: dict = Depends(require_web
 
 @router.delete("/conversations/{conv_id}")
 async def conv_delete(conv_id: str, user: dict = Depends(require_web_user)) -> dict:
-    if not web_store.delete_conversation(user["id"], conv_id):
+    # 删除会话并清理其关联文件（用户附件/产物），避免文件行残留为无主 upload，
+    # 在之后的新会话待发送暂存区"复活"。
+    removed_file_ids = web_store.delete_conversation_collect_files(user["id"], conv_id)
+    if removed_file_ids is None:
         raise ApiError(code="CONV_NOT_FOUND", message="会话不存在", http_status=404)
+    for fid in removed_file_ids:
+        try:
+            delete_file(fid)
+        except UploadedFileNotFound:
+            # DB 行已删，沙箱文件缺失不影响删除结果
+            pass
     return {"ok": True}
 
 
@@ -238,8 +250,13 @@ async def conv_chat(conv_id: str, body: ChatBody, user: dict = Depends(require_w
     if not message:
         raise ApiError(code="MESSAGE_EMPTY", message="消息不能为空", http_status=400)
 
-    # 场景：以本次请求为准（允许切换），并回写会话
-    scene = (body.scene or conv.get("scene") or "").strip()
+    # 场景：以本次请求为准（允许切换），并回写会话。
+    # 注意区分两种"空"：body.scene 为 None（调用方未传该字段）时回退会话记忆；
+    # 空串 "" 是前端显式选择「智能编排」，必须尊重，不能被 or 回退成旧场景。
+    if body.scene is None:
+        scene = (conv.get("scene") or "").strip()
+    else:
+        scene = body.scene.strip()
     if scene != (conv.get("scene") or ""):
         web_store.set_scene(user["id"], conv_id, scene)
 
@@ -302,8 +319,14 @@ async def conv_chat(conv_id: str, body: ChatBody, user: dict = Depends(require_w
             （低并发内网工具，沙箱前后快照差分足够可靠；停止时产物也可能已渲染完。）
             """
             after_metas = {m.file_id: m for m in list_files()}
+            # 双重排除，保证只登记"本次执行真正新产出"的交付物：
+            #   1) 沙箱执行前已存在的 file_id；
+            #   2) web_files 已登记的 file_id（用户上传的附件等）。
+            # 第二重排除防止用户上传文档被沙箱差分误判为新产物，进而被
+            # 重登记为 artifact、洗掉消息附件关联。
+            registered_ids = web_store.list_registered_file_ids()
             new_files: list[dict[str, str]] = []
-            for fid in set(after_metas) - before_ids:
+            for fid in set(after_metas) - before_ids - registered_ids:
                 meta = after_metas[fid]
                 web_store.register_file(
                     user["id"], fid, "artifact",

@@ -96,13 +96,64 @@ def set_scene(user_id: int, conv_id: str, scene: str) -> None:
         )
 
 
-def delete_conversation(user_id: int, conv_id: str) -> bool:
+def delete_conversation_collect_files(user_id: int, conv_id: str) -> list[str] | None:
+    """删除会话，并返回应一并从文件沙箱物理删除的 file_id 列表。
+
+    会话不存在或不归属该用户时返回 None（调用方据此返回 404）。
+
+    清理候选（两类并集）：
+      1. 经 message_files 关联到本会话消息的文件（用户上传附件、助手产物）；
+      2. web_files.conversation_id 直接登记为本会话的产物（含未关联消息的孤儿产物）。
+    仅当删除会话后该文件不再被任何消息引用时才删 web_files 行，避免跨会话共享误删；
+    全局待发送暂存区（kind=upload、从未随消息发送、无会话归属）不受影响，
+    因此不会因删除会话而把历史待发文件"冲"回暂存区造成附件复活。
+
+    注意：messages/message_files 的级联删除依赖外键，get_db() 已开启
+    PRAGMA foreign_keys=ON，必须在同一连接内完成候选收集与删除。
+    """
+    removable: list[str] = []
     with get_db() as conn:
-        cur = conn.execute(
+        owned = conn.execute(
+            "SELECT 1 FROM conversations WHERE id = ? AND user_id = ?",
+            (conv_id, user_id),
+        ).fetchone()
+        if not owned:
+            return None
+
+        rows = conn.execute(
+            "SELECT DISTINCT fid FROM ("
+            "  SELECT mf.file_id AS fid FROM message_files mf "
+            "  JOIN messages m ON m.id = mf.message_id "
+            "  WHERE m.conversation_id = ? "
+            "  UNION "
+            "  SELECT file_id AS fid FROM web_files "
+            "  WHERE conversation_id = ? AND user_id = ?"
+            ")",
+            (conv_id, conv_id, user_id),
+        ).fetchall()
+        candidates = [r["fid"] for r in rows]
+
+        # 级联删除本会话消息及 message_files 关联
+        conn.execute(
             "DELETE FROM conversations WHERE id = ? AND user_id = ?",
             (conv_id, user_id),
         )
-    return cur.rowcount > 0
+
+        # 删除会话后仍有其他消息引用的文件保留；其余连同归属行一并清理
+        for fid in candidates:
+            remaining = conn.execute(
+                "SELECT 1 FROM message_files WHERE file_id = ? LIMIT 1",
+                (fid,),
+            ).fetchone()
+            if remaining:
+                continue
+            cur = conn.execute(
+                "DELETE FROM web_files WHERE file_id = ? AND user_id = ?",
+                (fid, user_id),
+            )
+            if cur.rowcount > 0:
+                removable.append(fid)
+    return removable
 
 
 def set_first_title(user_id: int, conv_id: str, text: str) -> None:
@@ -219,12 +270,28 @@ def register_file(
     conversation_id: str | None = None,
     filename: str = "",
 ) -> None:
+    # 必须用 ON CONFLICT DO UPDATE（原地更新）而非 INSERT OR REPLACE：
+    # REPLACE 在主键冲突时是"先删旧行再插新行"，会触发 message_files 的
+    # ON DELETE CASCADE 把既有消息附件关联全部洗掉，导致文件在判定上退回
+    # "未发送"状态而在待发送暂存区复活。
+    # 冲突时不更新 user_id，归属以首次登记为准，防止跨用户重登记劫持归属。
     with get_db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO web_files(file_id, user_id, kind, conversation_id, filename) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO web_files(file_id, user_id, kind, conversation_id, filename) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(file_id) DO UPDATE SET "
+            "kind = excluded.kind, "
+            "conversation_id = excluded.conversation_id, "
+            "filename = excluded.filename",
             (file_id, user_id, kind, conversation_id, filename),
         )
+
+
+def list_registered_file_ids() -> set[str]:
+    """返回所有已在 web_files 登记的 file_id（产物快照差分去重用）。"""
+    with get_db() as conn:
+        rows = conn.execute("SELECT file_id FROM web_files").fetchall()
+    return {r["file_id"] for r in rows}
 
 
 def owns_file(user_id: int, file_id: str) -> bool:
