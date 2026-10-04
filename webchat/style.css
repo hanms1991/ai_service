@@ -303,6 +303,26 @@ textarea#input {
 .hint { max-width: 820px; margin: 6px auto 0; text-align: center;
   font-size: 12px; color: var(--text-3); }
 
+/* ── 工具模式提示条（选中具体功能场景时显示在输入框上方） ─────── */
+.scene-banner {
+  max-width: 820px; margin: 0 auto 8px;
+  display: flex; align-items: center; gap: 8px;
+  background: #fff7e8; border: 1px solid #ffe1a8; border-radius: 10px;
+  padding: 8px 12px; font-size: 12.5px; line-height: 1.5; color: #8a5a00;
+}
+.scene-banner-dot {
+  width: 7px; height: 7px; border-radius: 50%; background: #e8a33d;
+  flex-shrink: 0;
+}
+.scene-banner-text { flex: 1; }
+.scene-banner-text strong { font-weight: 600; }
+.scene-banner-exit {
+  border: none; background: rgba(232,163,61,.14); color: #8a5a00;
+  border-radius: 6px; padding: 3px 10px; font-size: 12px;
+  flex-shrink: 0; cursor: pointer; white-space: nowrap;
+}
+.scene-banner-exit:hover { background: rgba(232,163,61,.28); }
+
 /* ── 消息流中的附件卡片气泡（文件随消息一起发送） ─────────────── */
 .msg-row.attach-row { margin-bottom: 6px; }
 .file-bubble {

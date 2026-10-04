@@ -13,9 +13,9 @@ class SupervisorState(TypedDict):
 
     messages:  对话历史（add_messages 自动累加，Checkpointer 跨轮持久化）
     route:     intent_router 的分类结果（"chat" | "task"）
-    scene:     场景码（前端按钮 hint，空字符串表示无 hint）
-    hint_agent: 场景码解析出的 agent 名（hint，非强制）
-    hint_skill: 场景码解析出的 skill 名（hint，非强制）
+    scene:     场景码（用户显式选定的工具模式，空字符串表示智能编排）
+    hint_agent: 场景码解析出的 agent 名（Planner 场景锁定用）
+    hint_skill: 场景码解析出的 skill 名（Planner 场景锁定用，禁止改道其他技能）
     plan:      planner 产出的步骤列表（dict 形式）
     step_index: 当前执行到第几步
     results:   {output_key: result_content} 已完成步骤的输出

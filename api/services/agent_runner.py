@@ -157,8 +157,10 @@ async def run_invoke(
         "callbacks": [logger],
     }
 
-    # ── scene 作为 hint：解析后传给 Planner，不再直达技能 ──
-    # 前端按钮选中的 scene 只是意图倾向，最终是否执行对应技能由 Planner 判断
+    # ── scene 解析：用户显式选定的「工具模式」 ──
+    # - DIRECT_SCENE_WHITELIST 中的后端 API 场景：直接 execute_skill_v2 直达；
+    # - 其余场景：作为强锁定 hint 传给 Planner，Planner 场景锁定校验禁止改道其他技能
+    #   （用户消息是该工具的加工素材，不是新任务）。
     hint_agent = ""
     hint_skill = ""
     effective_timeout = timeout_seconds or _DEFAULT_SYNC_TIMEOUT
@@ -256,7 +258,8 @@ async def run_invoke_stream(
         if size > REFERENCE_DATA_MAX_BYTES:
             raise reference_data_too_large(size, REFERENCE_DATA_MAX_BYTES)
 
-    # ── scene 作为 hint 解析 ──
+    # ── scene 解析：用户显式选定的「工具模式」，作为强锁定 hint 传给 Planner ──
+    # （Planner 场景锁定校验禁止改道其他技能；白名单场景在同步入口直达，不走本流式路径）
     hint_agent = ""
     hint_skill = ""
     effective_timeout = timeout_seconds or _DEFAULT_SYNC_TIMEOUT

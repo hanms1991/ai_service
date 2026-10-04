@@ -81,7 +81,10 @@ class PinBody(BaseModel):
 
 class ChatBody(BaseModel):
     message: str
-    scene: str | None = ""
+    # None=本次请求未携带场景（回退会话记忆的场景，保持会话连续性）；
+    # ""=前端显式选择「智能编排」（清空场景，不得回退成旧场景）；
+    # 非空串=切换到指定场景。三态必须区分，故默认值是 None 而不是 ""。
+    scene: str | None = None
     # 本次发送携带的上传文档 file_id 列表（前端自动填入，用户不可见）
     file_ids: list[str] | None = None
 
@@ -238,8 +241,13 @@ async def conv_chat(conv_id: str, body: ChatBody, user: dict = Depends(require_w
     if not message:
         raise ApiError(code="MESSAGE_EMPTY", message="消息不能为空", http_status=400)
 
-    # 场景：以本次请求为准（允许切换），并回写会话
-    scene = (body.scene or conv.get("scene") or "").strip()
+    # 场景：以本次请求为准（允许切换），并回写会话。
+    # 注意区分两种"空"：body.scene 为 None（调用方未传该字段）时回退会话记忆；
+    # 空串 "" 是前端显式选择「智能编排」，必须尊重，不能被 or 回退成旧场景。
+    if body.scene is None:
+        scene = (conv.get("scene") or "").strip()
+    else:
+        scene = body.scene.strip()
     if scene != (conv.get("scene") or ""):
         web_store.set_scene(user["id"], conv_id, scene)
 

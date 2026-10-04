@@ -402,6 +402,27 @@
     renderChips();
   }
 
+  // ── 工具模式提示条：选中具体功能场景时，提示"发送内容将作为该工具素材" ──
+  function shortSceneLabel(sceneCode) {
+    const sc = state.scenes.find((s) => s.scene === sceneCode);
+    if (!sc) return sceneCode;
+    // 场景描述可能很长（含括号里的流程说明），取首个括号前的短语并限长
+    let label = sc.description || sc.scene;
+    label = label.split(/[（(]/)[0].trim() || sc.scene;
+    return label.length > 28 ? label.slice(0, 28) + "…" : label;
+  }
+
+  function updateSceneHint() {
+    const val = $("scene-select").value;
+    const banner = $("scene-banner");
+    if (!val) { banner.classList.add("hidden"); return; }
+    $("scene-banner-text").innerHTML =
+      `当前为<strong>「${esc(shortSceneLabel(val))}」</strong>工具模式：` +
+      "你发送的内容将作为该工具的加工素材，不会按内容改做其他功能；" +
+      "纯寒暄问候仍可正常对话。";
+    banner.classList.remove("hidden");
+  }
+
   async function selectConv(id) {
     if (state.sending) stopSend(true); // 离开当前会话时取消正在进行的流
     state.currentId = id;
@@ -409,6 +430,7 @@
     const conv = state.conversations.find((c) => c.id === id);
     $("topbar-title").textContent = conv ? conv.title : "";
     $("scene-select").value = (conv && conv.scene) || "";
+    updateSceneHint();
 
     const msgD = await api(`/ui/api/conversations/${id}/messages`);
     const msgs = $("messages");
@@ -996,6 +1018,15 @@
       opt.textContent = s.description && s.description !== s.scene
         ? `${s.scene} · ${s.description}` : s.scene;
       sel.appendChild(opt);
+    });
+    // 手动切换场景下拉 → 同步工具模式提示条
+    sel.addEventListener("change", updateSceneHint);
+    updateSceneHint();
+    // 提示条上的「切回智能编排」快捷按钮
+    $("scene-banner-exit").addEventListener("click", () => {
+      sel.value = "";
+      updateSceneHint();
+      $("input").focus();
     });
 
     // ── LLM 模型预设下拉 ──
