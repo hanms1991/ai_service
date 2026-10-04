@@ -22,6 +22,8 @@ COPY core/ core/
 COPY skills/ skills/
 COPY tools/ tools/
 COPY playground/ playground/
+COPY webchat/ webchat/
+COPY llm_presets.json .
 
 # 运行时数据目录（生产环境由 docker-compose 卷挂载覆盖）
 RUN mkdir -p data logs
