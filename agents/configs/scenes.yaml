@@ -35,14 +35,14 @@ scenes:
     description: 基于 PRD 生成结构化用例规格（UC：主事件流/备选流/异常流/前置后置条件 + PRD 追溯）
     agent: requirement_agent
     skill: uc_generate
-    response_format: text
+    response_format: json
     timeout_seconds: 600
 
   FROM_UC_CREATE_UC_DIAGRAM:
     description: 基于用例规格生成 Mermaid 用例图（参与者/系统边界/include/extend 关系）
     agent: requirement_agent
     skill: uc_diagram_generate
-    response_format: text
+    response_format: json
     timeout_seconds: 300
 
   FROM_UC_CREATE_FR:

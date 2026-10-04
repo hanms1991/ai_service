@@ -1,0 +1,21 @@
+# 天枢业务后端接入配置
+#
+# 天枢后端是业务侧统一后端，Agent 通过它完成：
+#   - UC 模板查询（GET /v1/agent/uc-template）
+#   - 后续扩展：架构生成模板、需求追溯查询等
+#
+# 与 auto-kb（knowledge.yaml）同构：独立 HTTP 客户端模块（core/tianshu_client.py），
+# 在技能 prepare 钩子或执行内核中确定性调用，不注册为 LangChain tool。
+#
+# 降级策略：服务不可达/未配置/鉴权失败时，UC 模板查询回退到内置默认模板，
+# 不阻断技能执行（模板字段当前稳定，降级不影响产出结构）。
+
+tianshu_backend:
+  # 天枢业务后端基地址（不含路径）。
+  # 三种写法同 knowledge.yaml：字面值 / ${ENV} / 裸环境变量名。
+  # 留空 = 天枢后端功能整体关闭，相关调用走内置默认值。
+  base_url: TIANSHU_BACKEND_BASE_URL
+  # Agent → 天枢后端的内部回调凭证（请求头 X-Agent-Internal-Key）。
+  # 从该环境变量读取，不落代码；与天枢后端配置的 AGENT_CALLBACK_KEY 一致。
+  callback_key_env: TIANSHU_AGENT_CALLBACK_KEY
+  timeout_seconds: 10

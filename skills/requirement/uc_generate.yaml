@@ -16,19 +16,9 @@ tags:
 model_hint:
   reasoning: enabled
 
-# 条件必填：PRD 正文（直接粘贴）或 PRD 文档 file_id（平台读取后追加到消息）至少其一
-required_any:
-  - [prd_content, file_id]
-
+# 后端 API 调用（scene=FROM_PRD_CREATE_UC）不传 inputs，PRD 正文在 reference_data.prd_markdown；
+# 所有输入均可选，避免必填校验阻断后端直达。
 inputs:
-  prd_content:
-    type: string
-    required: false
-    desc: PRD 文档正文（Markdown，可直接粘贴）；重点提供第 3.3 功能列表与第 4 章功能详细说明
-  file_id:
-    type: string
-    required: false
-    desc: 通过 /agent/files/upload 上传的 PRD 文件 file_id（docx/xlsx/pptx/pdf/txt/md）；平台自动读取为 Markdown
   scope:
     type: string
     required: false
@@ -38,78 +28,104 @@ inputs:
     required: false
     desc: 项目/平台名称，用于用例 ID 命名上下文；未提供时从 PRD 推断
 
-document_source:
-  file_id_input: file_id
+execution:
+  prepare:
+    # 前置钩子：向天枢后端查询 UC 模板，把字段结构注入 prompt（拉取失败走内置默认模板）
+    script: scripts/fetch_uc_template.py
+    entrypoint: prepare
 
 system_prompt: |
   你是资深汽车 E/E 需求工程师，精通用例驱动需求工程（RUP/Cockburn 用例方法）。
   你的任务是把 PRD 中的功能描述转化为结构化、可验证、可追溯的用例规格。
-  只输出 Markdown 用例规格正文，不要附加生成说明或解释性元信息。
+  只输出 JSON 对象，不要附加任何解释性文字、Markdown 围栏或代码块标记。
 
 output:
-  format: markdown
-  # 多用例大表格正文冗长（单张用例表可达上千字），全局默认 8192 会在半路硬截断，
-  # 取 24576 覆盖全量 L3 功能点的用例规格
+  format: json
+  # 多用例大 JSON 可能很长，取 24576 覆盖全量 L3 功能点的用例规格
   max_tokens: 24576
+  schema:
+    type: object
+    required: [use_cases]
+    properties:
+      use_cases:
+        type: array
+        items:
+          type: object
+          required:
+            - name
+            - description
+            - actors
+            - preconditions
+            - scenario
+            - postconditions
+            - extensions
+            - hmi
+            - regulations
+            - performance
+            - nonfunctional
+          properties:
+            name: { type: string }
+            description: { type: string }
+            actors: { type: string }
+            preconditions: { type: string }
+            scenario:
+              type: object
+              required: [main_flow, branches, exceptions]
+              properties:
+                main_flow: { type: string }
+                branches: { type: array, items: { type: string } }
+                exceptions: { type: array, items: { type: string } }
+            postconditions: { type: string }
+            extensions: { type: string }
+            hmi: { type: string }
+            regulations: { type: string }
+            performance: { type: string }
+            nonfunctional: { type: string }
 
 prompt_template: |
-  请基于以下 PRD 生成结构化用例规格（Use Case Specification）。
+  请基于以下 PRD 生成结构化用例规格（Use Case Specification），输出 JSON 对象。
 
-  【PRD 正文】：{{prd_content}}
   【生成范围】：{{scope}}
   【项目/平台】：{{project}}
 
-  若本消息末尾附有【相关项文档（Markdown）】或类似文档段落，该段落即为 PRD 文件内容，以其为主要输入。
+  # 输入来源
+  PRD 正文在本消息末尾的【参考数据】段落中，字段名为 prd_markdown，请以其为主要事实来源。
+  若参考数据中还包含【UC 模板】段落，严格按模板规定的字段与结构生成。
 
   # 生成规则
   1. 用例来源：以 PRD 第 3.3 功能列表中的每个 L3 功能点为基本单元；一个 L3 至少对应一个用例；
      第 4 章 6 要素中的"基本事件"映射为主事件流，"异常事件"映射为异常流，"前置条件/触发条件"映射为前置/触发条件。
   2. 用例命名：动宾短语（如"开启自动紧急制动""切换驾驶模式"），禁止以"点击/输入"等 UI 步骤命名。
-  3. 主事件流：编号步骤，每步只表达一个动作；动作主体明确（驾驶员/乘员/系统/外部参与者）。
-  4. 备选流与异常流：逐条列出，标注分支步骤号（如 2a、3b）、分支条件与系统兜底行为（Fail-Safe）；
-     异常描述站在用户可感知视角，不暴露 CAN/信号/ECU/传感器等工程实现细节。
-  5. 后置条件：区分成功后置与失败后置；涉及状态保持时写明最终安全状态。
-  6. 追溯：每条用例必须标注来源 PRD 章节号（如 4.3.2）与 L3 功能名称，保证 PRD↔UC 可双向追溯。
-  7. 业务规则/约束：PRD 中的触发条件、阈值类规则列入"业务规则"，不混入事件流步骤。
+  3. 主事件流 scenario.main_flow：编号步骤，每步只表达一个动作；动作主体明确（驾驶员/乘员/系统/外部参与者），步骤间用换行分隔。
+  4. 备选流 scenario.branches 与异常流 scenario.exceptions：逐条列出字符串数组；
+     异常描述站在用户可感知视角，不暴露 CAN/信号/ECU/传感器等工程实现细节；无则为空数组 []。
+  5. 后置条件 postconditions：区分成功后置与失败后置；涉及状态保持时写明最终安全状态。
+  6. 追溯：每条用例的 description 中必须标注来源 PRD 章节号（如 4.3.2）与 L3 功能名称，保证 PRD↔UC 可双向追溯。
+  7. 业务规则/约束：PRD 中的触发条件、阈值类规则列入 extensions 或 performance，不混入事件流步骤。
   8. 信息不足：PRD 未覆盖的前置条件、参与者等标注"待确认"，不得编造具体信号、接口、数值或法规结论。
-  9. 用例 ID 规则：UC-<两位序号>（如 UC-01）；同一功能多个用例时连续编号。
+  9. 字段约束：只输出模板规定的 11 个字段（不含 number）；scenario 必须是嵌套对象，含 main_flow/branches/exceptions；
+     不返回 candidate_id、ordinal 或任何正式对象/版本 ID。
 
-  # 输出结构（严格按此 Markdown 模板）
-  ## 1. 用例总览
-  | 用例 ID | 用例名称 | 对应 L3 功能 | 主参与者 | 优先级 | 来源章节 |
-  |---|---|---|---|---|---|
-
-  ## 2. 用例规格
-  ### UC-01 <用例名称>
-  | 项 | 内容 |
-  |---|---|
-  | 用例 ID | UC-01 |
-  | 用例名称 | … |
-  | 主参与者 | … |
-  | 次要参与者 | …（无则填 N/A） |
-  | 优先级 | P0/P1/P2 |
-  | 前置条件 | … |
-  | 触发条件 | … |
-  | 后置条件（成功） | … |
-  | 后置条件（失败） | …（N/A 则标注） |
-
-  **主事件流**
-  1. …
-  2. …
-
-  **备选流**
-  - 2a. <分支条件>：…（无则填"无"）
-
-  **异常流**
-  - 3a. <异常条件>：系统…（Fail-Safe 行为）；用户感知：…（无则填"无"）
-
-  **业务规则**
-  - BR-1：…
-
-  **追溯**
-  - 来源：PRD <章节号> <L3 功能名称>
-
-  （UC-02 … 依次展开）
-
-  ## 3. 待确认项
-  - [ ] …
+  # 输出格式
+  严格输出如下 JSON 结构（不要输出任何其他文字）：
+  {
+    "use_cases": [
+      {
+        "name": "用例名称",
+        "description": "用例描述（含来源 PRD 章节与 L3 功能）",
+        "actors": "参与者",
+        "preconditions": "前置条件",
+        "scenario": {
+          "main_flow": "1. ...\n2. ...",
+          "branches": ["..."],
+          "exceptions": ["..."]
+        },
+        "postconditions": "后置条件",
+        "extensions": "扩展用例/业务规则（无则填 无）",
+        "hmi": "HMI交互逻辑（无则填 无）",
+        "regulations": "法规需求（无则填 待确认）",
+        "performance": "性能需求（无则填 待标定）",
+        "nonfunctional": "非功能需求"
+      }
+    ]
+  }

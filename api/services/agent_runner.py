@@ -78,6 +78,15 @@ def _new_thread_id() -> str:
     return f"conv-{uuid.uuid4().hex[:12]}"
 
 
+# ── scene 直达白名单：这些场景由后端 API 明确发起，输入在 reference_data 中，
+# 直接执行对应技能并返回 structured，不经 Planner 编排。
+# 其他场景（含用户对话）仍走 Planner 智能编排。
+DIRECT_SCENE_WHITELIST = frozenset({
+    "FROM_PRD_CREATE_UC",
+    "FROM_UC_CREATE_UC_DIAGRAM",
+})
+
+
 def _make_llm_logger(trace_id: str):
     """为本次请求构造 LLM 日志回调，trace_id 写入日志。"""
     from core.logging import LLMInteractionLogger
@@ -170,6 +179,30 @@ async def run_invoke(
         effective_timeout = (
             timeout_seconds or binding.timeout_seconds or _DEFAULT_SYNC_TIMEOUT
         )
+
+        # ── scene 直达（白名单）：后端 API 明确发起的场景，直接执行技能返回 structured ──
+        if hint_skill and scene in DIRECT_SCENE_WHITELIST:
+            try:
+                result = await _execute_skill_v2_async(
+                    hint_agent,
+                    hint_skill,
+                    inputs or {},
+                    reference_data=reference_data,
+                    runnable_config=runnable_config,
+                )
+            except ValueError as e:
+                # reference_data 超限 / 结构化输出校验失败 / 渲染失败
+                raise skill_output_invalid(f"技能 {hint_skill} 输出无效：{e}") from e
+            return InvokeResponse(
+                thread_id=thread_id,
+                task_id=task_id,
+                mode="direct",
+                scene=scene,
+                output=result.text,
+                structured=result.structured,
+                usage=result.usage,
+                trace_id=trace_id,
+            )
 
     # 所有请求统一走 Planner 智能编排（intent_router → planner → executor）
     # Planner 从用户 message 中提取技能参数；提取不到则对话式追问

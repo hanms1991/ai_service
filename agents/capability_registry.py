@@ -837,8 +837,11 @@ def _run_renderer_summary(
 class PrepareContext:
     """prepare 钩子运行上下文（稳定契约：只增字段、不改既有字段语义）。
 
-    数据：skill_cfg/inputs/rendered/doc_raw/doc_block/runnable_config；
+    数据：skill_cfg/inputs/rendered/doc_raw/doc_block/runnable_config/reference_data；
     能力：模型构造、阶段提示装配、json 阶段调用、token 计量、知识库检索/格式化。
+
+    回调能力字段对普通（非 map_reduce）技能的 prepare 钩子可选，传 None 即可；
+    map_reduce 技能的 prepare 钩子会用到全部字段。
     """
 
     skill_cfg: dict
@@ -848,12 +851,13 @@ class PrepareContext:
     doc_block: str
     runnable_config: Any
     logger: logging.Logger
-    bind_json_model: Callable[[Any], Any]
-    build_stage_prompt: Callable[[Any], str]
-    invoke_json_stage: Callable[..., Any]
-    extract_usage: Callable[[Any], dict]
-    retrieve_knowledge: Callable[..., list]
-    format_knowledge_layered_block: Callable[..., str]
+    reference_data: dict[str, Any] | None = None
+    bind_json_model: Callable[[Any], Any] | None = None
+    build_stage_prompt: Callable[[Any], str] | None = None
+    invoke_json_stage: Callable[..., Any] | None = None
+    extract_usage: Callable[[Any], dict] | None = None
+    retrieve_knowledge: Callable[..., list] | None = None
+    format_knowledge_layered_block: Callable[..., str] | None = None
 
 
 _prepare_cache: dict[str, Any] = {}
@@ -1150,6 +1154,37 @@ def _execute_skill_core(
     # ── 外部 reference_data 注入（API 后台预取资料） ──
     ref_block = _build_reference_block(reference_data)
 
+    # ── 技能侧 prepare 钩子（可选）：自定义前置加工，如拉取远端模板、解析文档结构等 ──
+    # 与 map_reduce 路径对称；钩子失败软降级，不阻断技能执行。
+    prepare_supplement = ""
+    if (skill_cfg.get("execution") or {}).get("prepare"):
+        try:
+            prepare_ctx = PrepareContext(
+                skill_cfg=skill_cfg,
+                inputs=inputs or {},
+                rendered=rendered,
+                doc_raw=doc_raw,
+                doc_block=doc_block,
+                runnable_config=runnable_config,
+                logger=logger,
+                reference_data=reference_data,
+            )
+            hook_result = _run_prepare_hook(prepare_ctx) or {}
+            prepare_supplement = str(hook_result.get("doc_supplement") or "")
+            if prepare_supplement:
+                logger.info(
+                    "[capability_registry] 技能 %s prepare 钩子注入补充段 %d 字符",
+                    skill_cfg.get("name"), len(prepare_supplement),
+                )
+        except Exception as exc:  # noqa: BLE001 —— 前置钩子失败必须软降级
+            logger.warning(
+                "[capability_registry] 技能 %s prepare 钩子失败，忽略补充段：%s",
+                skill_cfg.get("name"), exc,
+            )
+    prepare_supplement_block = (
+        f"\n\n{prepare_supplement.strip()}\n" if prepare_supplement else ""
+    )
+
     # ── 输出 JSON Schema 说明与示例段落 ──
     output_cfg = skill_cfg.get("output", {}) or {}
     output_format = output_cfg.get("format", "plain_text")
@@ -1158,7 +1193,14 @@ def _execute_skill_core(
         _build_schema_example_block(skill_cfg) if output_format == "json" else ""
     )
 
-    user_message = rendered + doc_block + kb_block + ref_block + schema_example_block
+    user_message = (
+        rendered
+        + doc_block
+        + kb_block
+        + ref_block
+        + prepare_supplement_block
+        + schema_example_block
+    )
 
     # ── model_hint：叠加 skill 的推理开关/档位等 ──
     llm = _build_model_with_hint(
