@@ -474,6 +474,9 @@ def _write_safety_goals(wb, sg_left, vh_goals):
       右区「整车安全目标」          F-J：整车安全目标ID/ASIL/整车安全目标/安全状态/FTTI
       K=备注（服务右区整车目标的来源标注）
     数据从 R3 起。
+
+    合并对应关系可视化：左侧行按所属整车目标分组连续排列，右侧 F..K 跨行
+    合并对齐其来源行——同一整车目标由哪几条左侧安全目标合并而来一目了然。
     """
     ws = wb["整车安全目标"]
 
@@ -483,19 +486,41 @@ def _write_safety_goals(wb, sg_left, vh_goals):
             for cell in row:
                 cell.value = None
 
-    r = 3
+    # 按 vh_goal 分组左侧行（以 text 作为合并键，与 _write_hara 中 vh_goals_map 一致），
+    # 使每条整车目标的来源行连续排列，便于右侧跨行合并对齐
+    text_to_vh = {g["text"]: g for g in vh_goals}
+    groups: dict[str, list] = OrderedDict()
+    for g in vh_goals:
+        groups[g["vh_id"]] = []
     for row in sg_left:
-        vals = [row["sg_id"], row["asil"], row["text"], row["safe_state"], row["ftti"]]
-        for c, v in enumerate(vals, 1):
-            _style(ws.cell(row=r, column=c, value=v), center=(c in (1, 2, 5)))
-        r += 1
+        g = text_to_vh.get(row["text"])
+        if g:
+            groups[g["vh_id"]].append(row)
 
     r = 3
     for g in vh_goals:
-        vals = [g["vh_id"], g["asil"], g["text"], g["safe_state"], g["ftti"], g["remark"]]
-        for c, v in enumerate(vals, 6):  # F..K
-            _style(ws.cell(row=r, column=c, value=v), center=(c in (6, 7, 10)))
-        r += 1
+        members = groups[g["vh_id"]]
+        if not members:
+            continue
+        start = r
+        # 左区：逐条写入来源安全目标
+        for row in members:
+            vals = [row["sg_id"], row["asil"], row["text"], row["safe_state"], row["ftti"]]
+            for c, v in enumerate(vals, 1):
+                _style(ws.cell(row=r, column=c, value=v), center=(c in (1, 2, 5)))
+            r += 1
+        end = r - 1
+        # 右区 F..K：先对整个待合并区域补样式（边框/对齐），避免合并后只有
+        # 左上角带边框；再将值写入顶部行；多成员时跨行合并
+        for rr in range(start, end + 1):
+            for c in (6, 7, 8, 9, 10, 11):
+                _style(ws.cell(row=rr, column=c), center=(c in (6, 7, 10)))
+        right_vals = [g["vh_id"], g["asil"], g["text"], g["safe_state"], g["ftti"], g["remark"]]
+        for c, v in enumerate(right_vals, 6):  # F..K
+            _style(ws.cell(row=start, column=c, value=v), center=(c in (6, 7, 10)))
+        if end > start:
+            for col_letter in ("F", "G", "H", "I", "J", "K"):
+                _merge(ws, f"{col_letter}{start}:{col_letter}{end}")
 
 
 # ════════════════════════════════════════════════════════════════
