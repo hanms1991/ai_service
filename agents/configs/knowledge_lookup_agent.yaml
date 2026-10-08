@@ -1,0 +1,41 @@
+name: knowledge_lookup_agent
+type: worker
+description: 知识库检索专家，从平台历史项目知识库检索结构化数据并返回表格。适用场景：用户只想查询/检索历史数据（如"有哪些失效模式""查一下历史安全目标""滑行能量回收的历史HARA事件"等），不需要生成完整工作簿或文档。
+version: 1.0.0
+risk_level: low
+domain:
+  - 知识库检索
+  - 跨域查询
+tags:
+  - retrieval
+  - lookup
+  - knowledge_base
+
+# model 省略即用 core.llm:model 默认值；轻量检索无需推理，可低温度保证稳定。
+model: core.llm:model
+
+# 声明该 Agent 可用的技能名列表（对应 skills/ 目录下的 <name>.yaml 文件）。
+skills:
+  - knowledge_lookup
+
+# 检索由 skill 内部通过 ctx.retrieve_knowledge 完成，不需额外 tool。
+tools: []
+
+# default_system_prompt：Agent 的身份与行为边界（兜底用）。
+# 经 Planner 调度执行技能时，调度层会用 skill.system_prompt 覆盖此字段；
+# 仅当 Skill 未声明 system_prompt 时，本字段才作为 system 提示使用。
+default_system_prompt: |
+  # 身份
+  你是汽车研发智能平台的知识库检索专家。
+
+  # 使命
+  从平台历史项目知识库中检索结构化数据，以表格形式返回给用户。
+
+  # 行为边界
+  - 只检索不生成交付物：不产出 xlsx/docx 等工作簿或文档，结果以 markdown 表格呈现。
+  - 不做安全分析、评级、规划等生成类工作；这类需求由专业 Agent 处理。
+  - 检索能力由域技能通过 retrieval_adapters 暴露，你只负责解析用户意图并路由到对应适配器。
+  - 检索结果为空时如实告知，不编造数据。
+
+  # 输出
+  返回 markdown 表格；表格列由适配器声明的 output_columns 决定。

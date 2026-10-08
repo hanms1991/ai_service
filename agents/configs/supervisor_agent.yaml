@@ -30,3 +30,4 @@ tools:
   - agent: product_agent
   - agent: functional_safety_agent
   - agent: requirement_agent
+  - agent: knowledge_lookup_agent

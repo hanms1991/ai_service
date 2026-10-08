@@ -1,0 +1,66 @@
+name: knowledge_lookup
+display_name: 知识库检索
+description: 从平台历史项目知识库检索结构化数据并返回 markdown 表格。适用场景：用户只想查询/检索历史数据，如"有哪些失效模式""查一下历史安全目标""滑行能量回收的历史HARA事件"等。不适用于需要生成完整工作簿/文档的场景。
+version: 1.0.0
+risk_level: low
+domain:
+  - 知识库检索
+tags:
+  - retrieval
+  - lookup
+
+# 轻量检索无需推理，关闭思考以降低延迟与成本
+model_hint:
+  reasoning: disabled
+
+# ────────────────────────────────────────────────────────────────────
+# 输入契约
+# ────────────────────────────────────────────────────────────────────
+inputs:
+  query:
+    type: string
+    required: true
+    desc: 用户的检索意图自然语言，如"滑行能量回收和制动能量回收有哪些失效模式"
+
+# ────────────────────────────────────────────────────────────────────
+# 执行模式：single（单阶段，prepare 钩子内完成意图解析+检索+渲染，短路返回）
+#   prepare 钩子（dispatch_lookup.py）：
+#     1. 读取本技能自管的 adapters.yaml 适配器目录
+#     2. 调用 plan 阶段 system prompt（lookup_plan.md）+ invoke_json_stage 解析意图
+#     3. 按目录路由到对应域适配器入口函数（如 adapters/functional_safety.py）
+#     4. 按 adapter.output_columns 渲染 markdown 表格
+#     5. 返回 {"final_text": <表格>} 短路跳过后续 LLM 调用
+# ────────────────────────────────────────────────────────────────────
+execution:
+  mode: single
+  prepare:
+    script: scripts/dispatch_lookup.py
+    entrypoint: prepare
+  plan:
+    system_prompt:
+      file: lookup_plan.md
+    max_tokens: 4096
+
+# ────────────────────────────────────────────────────────────────────
+# 输出：plan 阶段 LLM 产出的意图解析 JSON（文档性 schema，短路路径下引擎不校验）
+# ────────────────────────────────────────────────────────────────────
+output:
+  format: json
+  schema:
+    type: object
+    required: [domain, query_type, params]
+    properties:
+      domain:
+        type: string
+        description: "业务域名，如 functional_safety / requirement / product"
+      query_type:
+        type: string
+        description: "查询类型，如 failure_mode / hazard_event / safety_goal"
+      params:
+        type: object
+        description: "查询参数，结构由 query_type 对应的适配器声明决定"
+
+# prompt_template：单阶段技能必填字段（引擎在 prepare 钩子前渲染一次）。
+# 短路路径下 rendered 不参与最终输出，仅作为 prepare 钩子的可用上下文。
+prompt_template: |
+  {{query}}

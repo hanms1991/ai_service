@@ -1218,8 +1218,36 @@ def _execute_skill_core(
 
     # ── 技能侧 prepare 钩子（可选）：自定义前置加工，如拉取远端模板、解析文档结构等 ──
     # 与 map_reduce 路径对称；钩子失败软降级，不阻断技能执行。
+    # 轻量检索类技能（如 knowledge_lookup）可在钩子内完成「调 LLM 解析意图 →
+    # 路由域适配器检索 → 渲染表格」全流程，返回 final_text 短路跳过后续 LLM 调用。
     prepare_supplement = ""
+    prepare_final_text: str | None = None
+    prepare_usage: dict[str, Any] = {}
     if (skill_cfg.get("execution") or {}).get("prepare"):
+        # 懒加载检索/格式化/模型回调：仅声明 prepare 钩子的技能可能需要
+        # （单阶段技能原本不传这些回调，为支持检索类 prepare 钩子而补齐，
+        #   与 map_reduce 路径保持对称；不声明 prepare 的技能不受影响）
+        try:
+            from core.kb_client import (
+                format_knowledge_layered_block,
+                retrieve_knowledge,
+            )
+        except Exception:  # noqa: BLE001 —— 回调加载失败时 prepare 钩子软降级
+            format_knowledge_layered_block = None  # type: ignore[assignment]
+            retrieve_knowledge = None  # type: ignore[assignment]
+        base_llm_for_hook = _build_model_with_hint(
+            _resolve_model(agent_cfg.get("model")), skill_cfg.get("model_hint")
+        )
+
+        def _bind_json_model_for_hook(max_tokens: Any) -> Any:
+            bind_kwargs: dict[str, Any] = {
+                "response_format": {"type": "json_object"},
+                "timeout": SKILL_LLM_TIMEOUT_SECONDS,
+            }
+            if isinstance(max_tokens, int) and max_tokens > 0:
+                bind_kwargs["max_tokens"] = max_tokens
+            return base_llm_for_hook.bind(**bind_kwargs)
+
         try:
             prepare_ctx = PrepareContext(
                 skill_cfg=skill_cfg,
@@ -1230,9 +1258,25 @@ def _execute_skill_core(
                 runnable_config=runnable_config,
                 logger=logger,
                 reference_data=reference_data,
+                bind_json_model=_bind_json_model_for_hook,
+                build_stage_prompt=lambda stage_cfg: _build_stage_system_prompt(
+                    skill_cfg, stage_cfg
+                ),
+                invoke_json_stage=_invoke_json_stage,
+                extract_usage=_extract_usage,
+                retrieve_knowledge=retrieve_knowledge,
+                format_knowledge_layered_block=format_knowledge_layered_block,
             )
             hook_result = _run_prepare_hook(prepare_ctx) or {}
             prepare_supplement = str(hook_result.get("doc_supplement") or "")
+            # 短路：prepare 钩子返回 final_text 时跳过后续 LLM 调用，
+            # 直接以该文本作为技能最终输出（轻量检索类技能走此路径）
+            ft = hook_result.get("final_text")
+            if isinstance(ft, str) and ft.strip():
+                prepare_final_text = ft
+            hu = hook_result.get("usage") or {}
+            if isinstance(hu, dict):
+                prepare_usage = dict(hu)
             if prepare_supplement:
                 logger.info(
                     "[capability_registry] 技能 %s prepare 钩子注入补充段 %d 字符",
@@ -1246,6 +1290,14 @@ def _execute_skill_core(
     prepare_supplement_block = (
         f"\n\n{prepare_supplement.strip()}\n" if prepare_supplement else ""
     )
+
+    # 短路返回：prepare 钩子已产出最终文本（如知识库检索表格），不再调 LLM
+    if prepare_final_text is not None:
+        logger.info(
+            "[capability_registry] 技能 %s prepare 钩子短路返回（%d 字符）",
+            skill_cfg.get("name"), len(prepare_final_text),
+        )
+        return SkillResult(text=prepare_final_text, usage=prepare_usage)
 
     # ── 输出 JSON Schema 说明与示例段落 ──
     output_cfg = skill_cfg.get("output", {}) or {}

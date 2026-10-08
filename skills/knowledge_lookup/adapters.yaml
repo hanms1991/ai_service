@@ -1,0 +1,15 @@
+# 知识库检索适配器声明（knowledge_lookup 技能自管，不侵入域技能）
+# 新增域/查询类型 = 加一行声明 + 加一个适配器模块，不改其他文件
+adapters:
+  - domain: functional_safety
+    query_type: failure_mode
+    module: scripts/adapters/functional_safety.py
+    function: query_failure_modes
+    kb_domain: 功能安全
+    params:
+      - name: functions
+        type: array
+        required: true
+        desc: 功能名列表，如 ["滑行能量回收", "制动能量回收"]
+    description: 按功能名检索历史失效模式（含失效词、失效行为、整车危害）
+    output_columns: [功能, 失效词, 失效行为, 整车危害]
