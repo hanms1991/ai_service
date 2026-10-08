@@ -145,7 +145,16 @@ def _skill_base_dir(skill_cfg: dict) -> Path:
 def _validate_skill(cfg: dict, path: Path) -> None:
     """校验技能 yaml 的必填字段与命名一致性。"""
     required = ["name", "display_name", "description", "inputs", "prompt_template"]
-    missing = [k for k in required if not cfg.get(k)]
+    # inputs 允许空映射：inputs: {} 表示无入参技能（输入走 reference_data，
+    # 如后端直达的 FR 生成/子系统分配），故 inputs 只判是否声明，其余字段必须非空
+    missing = []
+    for key in required:
+        value = cfg.get(key)
+        if key == "inputs":
+            if value is None:
+                missing.append(key)
+        elif not value:
+            missing.append(key)
     if missing:
         raise ValueError(f"技能配置 {path} 缺少必填字段: {', '.join(missing)}")
     if cfg["name"] != path.stem:
