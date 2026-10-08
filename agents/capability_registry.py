@@ -911,6 +911,59 @@ def _run_prepare_hook(ctx: PrepareContext) -> dict | None:
     return result if isinstance(result, dict) else {}
 
 
+# ── 技能后置钩子（execution.postprocess）：与 prepare 对称，LLM 输出清洗/业务校验 ──
+# guard 脚本用于剥未知字段、规整结构、校验引用完整性等；失败抛 ValueError → SKILL_OUTPUT_INVALID
+
+@dataclass
+class PostprocessContext:
+    """postprocess 钩子运行上下文（与 PrepareContext 对称，用于 LLM 输出后处理）。
+
+    数据：skill_cfg/structured（schema 校验后的 LLM 输出）/reference_data/inputs/logger。
+    钩子 postprocess(ctx) -> dict：返回 {"structured": <cleaned>} 覆盖原输出；
+    返回 None 或不声明 → 保留原输出。
+    钩子抛 ValueError → 视为输出校验失败，向上抛为 SKILL_OUTPUT_INVALID；
+    其他异常 → 软降级保留原输出。
+    """
+
+    skill_cfg: dict
+    structured: dict | list | None
+    reference_data: dict[str, Any] | None = None
+    inputs: dict[str, Any] | None = None
+    logger: logging.Logger | None = None
+
+
+_postprocess_cache: dict[str, Any] = {}
+
+
+def _run_postprocess_hook(ctx: PostprocessContext) -> dict | None:
+    """加载并执行技能声明的 execution.postprocess 脚本；未声明返回 None。
+
+    约定入口 postprocess(ctx) -> dict，引擎解释约定键：
+      - structured：清洗后的结构化输出（覆盖原 structured）；
+    其余键透传忽略。
+
+    钩子抛 ValueError 视为校验失败，由调用方转为 SKILL_OUTPUT_INVALID；
+    其他异常软降级保留原输出。
+    """
+    postprocess_cfg = (ctx.skill_cfg.get("execution") or {}).get("postprocess") or {}
+    script_rel = postprocess_cfg.get("script")
+    if not script_rel:
+        return None
+
+    module = _load_skill_script_module(
+        ctx.skill_cfg, script_rel, _postprocess_cache, "skill_postprocess"
+    )
+    entrypoint = postprocess_cfg.get("entrypoint", "postprocess")
+    fn = getattr(module, entrypoint, None)
+    if not callable(fn):
+        raise AttributeError(
+            f"postprocess 脚本 {script_rel} 不存在入口 {entrypoint!r}"
+        )
+
+    result = fn(ctx)
+    return result if isinstance(result, dict) else None
+
+
 @dataclass
 class MapSliceContext:
     """map_reduce 每切片检索钩子上下文（稳定契约：只增字段）。
@@ -1273,6 +1326,31 @@ def _execute_skill_core(
 
     structured = _validate_structured_output(raw_text, output_schema)
     usage = _extract_usage(response)
+
+    # ── 技能侧 postprocess 钩子（可选）：清洗 LLM 输出 / 业务规则校验 ──
+    # 与 prepare 钩子对称；guard 脚本抛 ValueError → SKILL_OUTPUT_INVALID（HTTP 422）
+    if (skill_cfg.get("execution") or {}).get("postprocess"):
+        postprocess_ctx = PostprocessContext(
+            skill_cfg=skill_cfg,
+            structured=structured,
+            reference_data=reference_data,
+            inputs=inputs or {},
+            logger=logger,
+        )
+        try:
+            pp_result = _run_postprocess_hook(postprocess_ctx)
+            if pp_result and "structured" in pp_result:
+                structured = pp_result["structured"]
+                # 同步 raw_text，保证 text/structured 一致（无 renderer 时 text 即 JSON 串）
+                raw_text = json.dumps(structured, ensure_ascii=False, indent=2)
+        except ValueError:
+            # guard 校验失败：向上抛为 SKILL_OUTPUT_INVALID（由 agent_runner 捕获转换）
+            raise
+        except Exception as exc:  # noqa: BLE001 —— 非校验异常软降级保留原输出
+            logger.warning(
+                "[capability_registry] 技能 %s postprocess 钩子失败，保留原输出：%s",
+                skill_cfg.get("name"), exc,
+            )
 
     result = SkillResult(text=raw_text, structured=structured, usage=usage)
 
@@ -1957,8 +2035,10 @@ def execute_skill(
 # 5B. 技能执行 v2（对外 API 使用：返回结构化结果 + usage + reference_data 注入）
 # ════════════════════════════════════════════════════════════════
 
-# reference_data 注入阈值：50KB（硬阈值，超限直接报错，不做摘要降级）
-REFERENCE_DATA_MAX_BYTES = 50 * 1024
+# reference_data 注入阈值：默认 512KB，可通过 AGENT_REFERENCE_DATA_MAX_KB 环境变量覆盖。
+# 后端直连场景可能携带 100 条 UC/FR 快照，50KB 不够，故放宽到 512KB。
+_REFERENCE_DATA_MAX_KB = int(os.getenv("AGENT_REFERENCE_DATA_MAX_KB", "512"))
+REFERENCE_DATA_MAX_BYTES = _REFERENCE_DATA_MAX_KB * 1024
 
 
 @dataclass

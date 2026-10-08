@@ -46,18 +46,18 @@ scenes:
     timeout_seconds: 300
 
   FROM_UC_CREATE_FR:
-    description: 基于用例生成功能需求（FR：原子可验证需求 + ASIL 标注 + 验证方法 + UC 追溯）
+    description: 基于用例生成功能需求（FR：原子可验证需求 + 验收准则 + UC 追溯，输出结构化 JSON 由后端落库）
     agent: requirement_agent
     skill: fr_generate
-    response_format: text
-    timeout_seconds: 600
+    response_format: json
+    timeout_seconds: 300       # 后端 AGENT_TIMEOUT_SECONDS 硬上限 300s
 
   FROM_FR_CREATE_SS_ASSIGNMENT:
-    description: 功能需求分配到子系统（FR→SS 分配矩阵：主责/协作子系统、分配类型、接口依赖）
+    description: 功能需求分配到子系统（FR→SS 分配矩阵：目标子系统/分配理由/未匹配说明，输出结构化 JSON 由后端落库）
     agent: requirement_agent
     skill: ss_assignment_generate
-    response_format: text
-    timeout_seconds: 600
+    response_format: json
+    timeout_seconds: 300       # 后端 AGENT_TIMEOUT_SECONDS 硬上限 300s
 
   FROM_SS_ASSIGNMENT_CREATE_REQ_DIAGRAM:
     description: 基于分配结果生成 Mermaid 子系统需求图（FR→子系统分配/协作/接口追溯关系）

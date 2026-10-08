@@ -1,7 +1,7 @@
 name: fr_generate
 display_name: 功能需求生成（UC → FR）
-description: 基于用例规格提炼功能需求（FR），输出原子、无歧义、可验证、可追溯的功能需求条目，含 ASIL/QS 标注建议、验证方法与验收准则，并保持 UC→FR 追溯。
-version: 1.0.0
+description: 基于用例规格提炼功能需求（FR），输出原子、无歧义、可验证、可追溯的功能需求条目，含验收准则与 UC 追溯关系，结构化 JSON 由后端落库。
+version: 2.0.0
 risk_level: medium
 domain:
   - 需求工程
@@ -14,49 +14,63 @@ tags:
   - ISO 26262
   - 需求工程
 
-model_hint:
-  reasoning: enabled
+# 后端 API 调用（scene=FROM_UC_CREATE_FR）不传 inputs，UC 正文在 reference_data.sources[].content；
+# 所有输入均可选，避免必填校验阻断后端直达。
+inputs: {}
 
-required_any:
-  - [uc_content, file_id]
-
-inputs:
-  uc_content:
-    type: string
-    required: false
-    desc: 用例规格正文（Markdown，uc_generate 的输出或既有 UC 文档）
-  file_id:
-    type: string
-    required: false
-    desc: 通过 /agent/files/upload 上传的用例文件 file_id；平台自动读取为 Markdown
-  fr_prefix:
-    type: string
-    required: false
-    desc: 需求 ID 前缀（项目/系统缩写），如 EPS、BCM；未提供时从用例内容推断，无法推断用 FR
-  safety_scope:
-    type: string
-    required: false
-    desc: 功能安全相关说明（相关项 ASIL 等级、已知安全目标）；未提供时按用例内容初步判定并标注"待安全团队确认"
-
-document_source:
-  file_id_input: file_id
+execution:
+  postprocess:
+    # 后置钩子：剥未知字段、校验 UC 引用完整性、数量 1-100，失败抛 ValueError → SKILL_OUTPUT_INVALID
+    script: scripts/fr_guard.py
+    entrypoint: postprocess
 
 system_prompt: |
   你是资深汽车 E/E 需求工程师，精通 ASPICE SYS.2/SWE.1 与 ISO 26262 需求编写规范。
   你的任务是把用例规格转化为原子、可验证、可追溯的功能需求（Functional Requirement）。
-  只输出 Markdown 需求正文，不要附加生成说明。
+  只输出 JSON 对象，不要附加任何解释性文字、Markdown 围栏或代码块标记。
 
 output:
-  format: markdown
+  format: json
+  # 100 条 FR 大 JSON 可能很长，取 24576 覆盖全量 UC 的 FR 提炼
+  max_tokens: 24576
+  schema:
+    type: object
+    required: [functional_requirements]
+    properties:
+      functional_requirements:
+        type: array
+        items:
+          type: object
+          required:
+            - kind
+            - description
+            - sources
+          properties:
+            kind: { type: string }
+            description: { type: string }
+            acceptance_criteria: { type: string }
+            sources:
+              type: array
+              items:
+                type: object
+                required:
+                  - uc_id
+                  - uc_revision_id
+                properties:
+                  uc_id: { type: string }
+                  uc_revision_id: { type: string }
 
 prompt_template: |
-  请基于以下用例规格生成功能需求（Functional Requirements）。
+  请基于以下用例规格生成功能需求（Functional Requirements），输出 JSON 对象。
 
-  【用例规格】：{{uc_content}}
-  【需求 ID 前缀】：{{fr_prefix}}
-  【安全相关说明】：{{safety_scope}}
-
-  若消息末尾附有文档段落（用例文件内容），以其为主要输入。
+  # 输入来源
+  UC 正文在本消息末尾的【参考数据】段落中，字段名为 sources，是数组。
+  每个元素含：
+  - artifact_id：UC 的唯一标识（输出 sources[].uc_id 时必须用此值，不得编造）
+  - revision_id：UC 的修订版本标识（输出 sources[].uc_revision_id 时必须用此值，不得编造）
+  - number：UC 编号（如 UC-001，仅供你理解上下文，不出现在输出中）
+  - content：UC 正文对象，含 name/description/actors/preconditions/main_flow/branches/exceptions/
+             postconditions/extensions/hmi/regulations/performance/nonfunctional 等字段
 
   # 需求编写规则
   1. 原子性：一条需求只陈述一个可验证行为；需要"和/并/同时/以及"连接多个动作时拆成多条。
@@ -69,25 +83,35 @@ prompt_template: |
      允许使用条件从句，但禁止"快速/尽量/友好/良好"等不可验证表述。
   4. 黑盒视角：FR 描述系统外部可观测行为，可提及人机交互与车辆级效果；
      禁止写 CAN/LIN 信号、ECU 内部诊断、具体硬件选型与软件实现方案（这些留待技术需求阶段）。
-  5. 安全标注：依据异常流影响初判 ASIL 等级（QM/A/B/C/D）；证据不足时填"待安全团队确认"，不得臆断。
-  6. 验证方法：每条需求给出至少一种验证方法（评审 R / 分析 A / 测试 T / 演示 I）与可执行的验收准则。
-  7. 优先级：P0（安全/法规相关或基础必备）/P1/P2。
-  8. ID 规则：<前缀>-FR-<三位序号>（如 EPS-FR-001），按用例顺序连续编号。
-  9. 不编造信号名、接口、数值阈值、法规条款；用例中未给出的量化指标，验收准则写定性判据并在备注标注"指标待定义"。
+  5. 验收准则：每条需求给出可执行的验收准则；没有可靠量化依据时写定性判据，不要编造阈值数值。
+  6. 不编造信号名、接口、数值阈值、法规条款；UC 中未给出的量化指标，验收准则写定性判据。
+  7. 追溯关系：每条 FR 的 sources 必须精确引用输入 UC 的 artifact_id 和 revision_id；
+     同一 FR 内 uc_id 不得重复；单条 FR 可引用多个 UC；同一 UC 可支撑多条 FR。
+  8. 数量：1~100 条，按 UC 内容决定，不固定数量，不把一个 UC 的分支/异常机械地当成固定 FR 数量。
 
-  # 输出结构
-  ## 1. 功能需求清单
-  | 需求 ID | 需求描述 | 来源用例 | 类型 | 优先级 | ASIL/QS | 验证方法 | 验收准则 | 备注 |
-  |---|---|---|---|---|---|---|---|---|
-  | EPS-FR-001 | 系统应在…时… | UC-01 主步骤 3 | 正常行为 | P0 | QM | T | 在…条件下，系统… | |
-  | EPS-FR-002 | 当无法判断…时，系统应保持… | UC-01 异常流 3a | 安全/Fail-Safe | P0 | 待安全团队确认 | T+A | … | |
+  # 输出格式
+  严格输出如下 JSON 结构（不要输出任何其他文字）：
+  {
+    "functional_requirements": [
+      {
+        "kind": "FR",
+        "description": "系统应在……时……",
+        "acceptance_criteria": "在……条件下，系统……",
+        "sources": [
+          {
+            "uc_id": "输入UC的artifact_id",
+            "uc_revision_id": "输入UC的revision_id"
+          }
+        ]
+      }
+    ]
+  }
 
-  需求类型取值：正常行为 / 安全(Fail-Safe) / 业务规则 / 状态管理 / 提示交互。
-
-  ## 2. 追溯矩阵
-  | 用例 ID | 派生需求 ID |
-  |---|---|
-
-  ## 3. 待确认项
-  - [ ] 待量化指标（阈值/时序/精度）：…
-  - [ ] ASIL 待安全团队确认项：…
+  # 禁止事项
+  - 不返回 artifact_id、FR 编号、正式修订 ID、状态、创建时间等数据库字段；
+  - 不返回 candidate_id；
+  - 不使用 Agent 自己随机生成的 UUID 作为业务对象 ID；
+  - 不引用请求中不存在的 UC 或修订版本；
+  - 不返回空的 functional_requirements 数组作为成功结果；
+  - 不在 structured 中添加 summary、warnings 等未约定字段；
+  - 不在 FR 或来源对象中添加 kind/description/acceptance_criteria/sources 以外的字段。

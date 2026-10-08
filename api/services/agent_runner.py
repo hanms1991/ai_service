@@ -84,6 +84,8 @@ def _new_thread_id() -> str:
 DIRECT_SCENE_WHITELIST = frozenset({
     "FROM_PRD_CREATE_UC",
     "FROM_UC_CREATE_UC_DIAGRAM",
+    "FROM_UC_CREATE_FR",
+    "FROM_FR_CREATE_SS_ASSIGNMENT",
 })
 
 

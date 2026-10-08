@@ -1,7 +1,7 @@
 name: ss_assignment_generate
 display_name: 子系统分配生成（FR → SS 分配）
-description: 基于功能需求（FR）与候选子系统/架构说明，生成功能需求到子系统的分配矩阵，含分配类型（新增/复用/修改）、分配理由、接口依赖与子系统职责汇总。
-version: 1.0.0
+description: 基于功能需求（FR）与候选子系统目录，生成 FR 到子系统的分配建议，含目标子系统、分配理由与未匹配说明，结构化 JSON 由后端落库。
+version: 2.0.0
 risk_level: medium
 domain:
   - 需求工程
@@ -13,82 +13,116 @@ tags:
   - ASPICE
   - 系统架构
 
-model_hint:
-  reasoning: enabled
+# 后端 API 调用（scene=FROM_FR_CREATE_SS_ASSIGNMENT）不传 inputs，
+# FR 正文在 reference_data.sources[].content，子系统目录在 reference_data.subsystems[]。
+inputs: {}
 
-required_any:
-  - [fr_content, file_id]
-
-inputs:
-  fr_content:
-    type: string
-    required: false
-    desc: 功能需求正文（Markdown，fr_generate 的输出或既有 FR 清单）
-  file_id:
-    type: string
-    required: false
-    desc: 通过 /agent/files/upload 上传的功能需求文件 file_id；平台自动读取为 Markdown
-  subsystem_context:
-    type: string
-    required: false
-    desc: 候选子系统清单与职责边界/架构说明，如"转向 EPS、制动 IBS、车身 BCM、座舱 HUT…"；未提供时按功能域常识推断并标注"待架构评审确认"
-  project:
-    type: string
-    required: false
-    desc: 项目/平台名称，用于分配上下文
-
-document_source:
-  file_id_input: file_id
+execution:
+  postprocess:
+    # 后置钩子：剥未知字段、校验 FR 覆盖完整性、subsystem 引用合法性、unmatched_reason 规则
+    script: scripts/ss_assignment_guard.py
+    entrypoint: postprocess
 
 system_prompt: |
   你是资深汽车 E/E 系统架构师，精通功能需求向子系统的分配（ASPICE SYS.3）与 EE 架构分层。
-  你的任务是把功能需求合理、可追溯地分配到子系统，并显式标注跨子系统协作与接口依赖。
-  只输出 Markdown 分配结果正文，不要附加生成说明。
+  你的任务是把功能需求合理、可追溯地分配到子系统，并显式标注分配理由。
+  只输出 JSON 对象，不要附加任何解释性文字、Markdown 围栏或代码块标记。
 
 output:
-  format: markdown
+  format: json
+  # 100 条 FR 分配建议的大 JSON，取 24576 覆盖全量
+  max_tokens: 24576
+  schema:
+    type: object
+    required: [assignments]
+    properties:
+      assignments:
+        type: array
+        items:
+          type: object
+          required:
+            - fr_id
+            - fr_revision_id
+            - targets
+            - unmatched_reason
+          properties:
+            fr_id: { type: string }
+            fr_revision_id: { type: string }
+            targets:
+              type: array
+              items:
+                type: object
+                required:
+                  - subsystem_id
+                properties:
+                  subsystem_id: { type: string }
+                  rationale: { type: string }
+            note: { type: string }
+            unmatched_reason: { type: string }
 
 prompt_template: |
-  请基于以下功能需求完成子系统分配（Subsystem Assignment）。
+  请基于以下功能需求完成子系统分配（Subsystem Assignment），输出 JSON 对象。
 
-  【功能需求】：{{fr_content}}
-  【候选子系统/架构说明】：{{subsystem_context}}
-  【项目/平台】：{{project}}
+  # 输入来源
+  所有输入数据在本消息末尾的【参考数据】段落中，是 JSON 对象，含两个关键字段：
 
-  若消息末尾附有文档段落（功能需求文件内容），以其为主要输入。
+  1. sources：FR 快照数组，每个元素含：
+     - artifact_id：FR 的唯一标识（输出 assignments[].fr_id 时必须用此值，不得编造）
+     - revision_id：FR 的修订版本标识（输出 assignments[].fr_revision_id 时必须用此值，不得编造）
+     - number：FR 编号（如 FR-001，仅供你理解上下文，不出现在输出中）
+     - content：FR 正文对象，含 kind/description/acceptance_criteria/sources 等字段
+
+  2. subsystems：可分配子系统目录数组，每个元素含：
+     - subsystem_id：子系统唯一标识（输出 targets[].subsystem_id 时必须用此值，不得编造）
+     - name：子系统名称
+     - description：子系统职责描述
+     - design_version_id：目录版本标识（仅供理解，不出现在输出中）
 
   # 分配规则
-  1. 每条 FR 必须有一个主责子系统（单一主责，避免责任不清）；需要多个子系统协作时，
-     主责子系统承担编排/决策职责，协作子系统列入"协作子系统"并说明各自职责。
-  2. 分配依据：功能域归属、子系统现有职责边界、执行器/传感器归属、实时性与 ASIL 等级匹配；
-     在"分配理由"中用一句话给出依据。
-  3. 分配类型：
-     - 新增：该子系统需新建此能力；
-     - 复用：子系统现有能力可直接满足（注明可复用的既有功能，未知则写"既有能力（待核实）"）；
-     - 修改：需扩展/变更子系统既有能力（注明变更点）。
-  4. ASIL 继承：继承 FR 的 ASIL/QS 标注；安全相关 FR 不得分配给无相应 ASIL 开发能力的子系统，
-     无法判断时在备注标注"ASIL 能力待确认"。
-  5. 接口依赖：识别每条跨子系统 FR 的接口需求方向（如 EPS → HUT：助力状态），
-     仅描述接口的业务语义与方向，不定义具体信号/协议（信号级接口在技术需求阶段定义）。
-  6. 候选子系统未提供时：按汽车 EE 功能域常识推断（动力/底盘/车身/座舱/智驾/网联…），
-     并在子系统名称后统一标注"（待架构评审确认）"。
-  7. 不编造既有功能清单、供应商能力或具体接口协议；信息不足处显式标注"待确认"。
+  1. 覆盖完整性：每一条输入 FR 必须在 assignments 中出现，且只能出现一次；
+     不允许遗漏任何 FR，不允许重复 FR。fr_id + fr_revision_id 必须精确匹配输入来源。
+  2. 主责与协作：一条 FR 可分配给多个子系统；在 rationale 中说明每个子系统的职责匹配依据
+     （不仅重复子系统名，要说清楚为什么这个子系统适合承担该需求）。
+  3. 分配依据：功能域归属、子系统现有职责边界、执行器/传感器归属、实时性与安全等级匹配。
+  4. 黑盒视角：分配理由描述业务语义和职责匹配，不定义具体信号/协议
+     （信号级接口在技术需求阶段定义）。
+  5. 子系统来源：subsystem_id 必须来自输入 subsystems 目录，不得创建、命名或补充新的子系统。
+  6. 不编造既有功能清单、供应商能力或具体接口协议；信息不足处显式标注。
 
-  # 输出结构
-  ## 1. 子系统清单
-  | 子系统缩写 | 子系统名称 | 职责边界概述 | 信息来源 |
-  |---|---|---|---|
+  # 未匹配处理
+  - 如果提供的子系统目录中没有合适的目标，仍必须为该 FR 返回一条 assignment：
+    targets 为空数组 []，unmatched_reason 填写具体原因（非空）；
+    这是合法的业务结果，不是执行失败。
+  - 有匹配目标时，unmatched_reason 填空字符串 ""。
+  - note 填写整体协作说明，无则空字符串 ""。
 
-  ## 2. 需求分配矩阵
-  | 需求 ID | 需求摘要 | 主责子系统 | 协作子系统（职责） | 分配类型 | 分配理由 | ASIL/QS | 接口依赖（方向：语义） | 备注 |
-  |---|---|---|---|---|---|---|---|---|
+  # 输出格式
+  严格输出如下 JSON 结构（不要输出任何其他文字）：
+  {
+    "assignments": [
+      {
+        "fr_id": "输入FR的artifact_id",
+        "fr_revision_id": "输入FR的revision_id",
+        "targets": [
+          {
+            "subsystem_id": "输入subsystems的subsystem_id",
+            "rationale": "该子系统负责……，适合承担此需求因为……"
+          }
+        ],
+        "note": "整体协作说明",
+        "unmatched_reason": ""
+      }
+    ]
+  }
 
-  ## 3. 子系统职责汇总
-  ### <子系统名称>
-  - 承接需求：<FR ID 列表>
-  - 新增/修改能力：…
-  - 对外接口：…
-
-  ## 4. 待确认项
-  - [ ] 待架构评审确认的分配：…
-  - [ ] 待定义接口：…
+  # 禁止事项
+  - 不返回 allocation 正式对象 ID、正式修订 ID、状态或时间字段；
+  - 不返回 candidate_id；
+  - 不使用 Agent 自己随机生成的 UUID 作为业务对象 ID；
+  - 不引用请求中不存在的 FR、修订版本或子系统；
+  - 不返回空的 assignments 数组作为成功结果；
+  - 不在 structured 中添加 summary、warnings 等未约定字段；
+  - 不在 assignment 或 target 对象中添加 fr_id/fr_revision_id/targets/note/unmatched_reason
+    及 subsystem_id/rationale 以外的字段；
+  - 不把一条 FR 拆成多条 assignment；
+  - 不偷偷只返回前 100 条而遗漏剩余 FR（输入超 100 条时应在 unmatched_reason 中说明边界问题）。
