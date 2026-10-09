@@ -4,6 +4,12 @@ adapters:
   - domain: functional_safety
     query_type: failure_mode
     kb_domain: 功能安全
+    description: 按功能名检索历史失效模式
+    params:
+      - name: functions
+        desc: 要检索的功能名称列表
+        required: true
+        type: array
     retrieval:
       query_template: "{value} 失效模式"
       iterate_param: functions
@@ -29,6 +35,12 @@ adapters:
   - domain: functional_safety
     query_type: safety_goal
     kb_domain: 功能安全
+    description: 按功能名检索历史安全目标
+    params:
+      - name: functions
+        desc: 要检索的功能名称列表
+        required: false
+        type: array
     retrieval:
       query: "安全目标"
       layer: safety_goal
