@@ -65,3 +65,33 @@ adapters:
     summary_columns: [整车安全目标ID, ASIL, 来源]
     output_columns: [整车安全目标ID, ASIL, 来源, 内容]
     render_format: tiered
+
+  - domain: functional_safety
+    query_type: hara_event
+    kb_domain: 功能安全
+    description: 按功能名检索历史 HARA 事件
+    params:
+      - name: functions
+        desc: 要检索的功能名称列表
+        required: true
+        type: array
+    retrieval:
+      query_template: "{value} HARA 事件"
+      iterate_param: functions
+      layer: hara_event
+      top_k: 20
+      keywords_template: "{value}"
+    filter:
+      match_any:
+        - field: meta.func
+        - field: content
+    extract:
+      meta:
+        事件编号: hzrd_id
+        功能: func
+        来源: source.file
+    dedup_by: 事件编号
+    raw_content_field: 内容
+    summary_columns: [功能, 事件编号, 来源]
+    output_columns: [功能, 事件编号, 来源, 内容]
+    render_format: tiered

@@ -66,6 +66,34 @@ def _load_doc_extractor():
     return _DOC_EXTRACTOR
 
 
+# 跨技能复用：knowledge_lookup 的检索服务模块（惰性加载，路径跨技能目录）
+_RETRIEVAL_SERVICE = None
+
+
+def _load_retrieval_service():
+    """惰性加载 knowledge_lookup/scripts/retrieval_service.py。
+
+    复用其声明式适配器引擎（retrieve/retrieve_raw），统一检索逻辑与过滤配置，
+    避免本技能硬编码检索参数。跨技能目录用 importlib 按绝对路径加载。
+    """
+    global _RETRIEVAL_SERVICE
+    if _RETRIEVAL_SERVICE is None:
+        # hara_prepare.py 在 skills/functional-safety/hazard_analysis/scripts/
+        # retrieval_service.py 在 skills/knowledge_lookup/scripts/
+        # 需四层 parent 回到 skills/ 目录
+        svc_path = (
+            Path(__file__).resolve().parent.parent.parent.parent  # skills/
+            / "knowledge_lookup" / "scripts" / "retrieval_service.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "knowledge_lookup_retrieval_service", svc_path
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _RETRIEVAL_SERVICE = module
+    return _RETRIEVAL_SERVICE
+
+
 def _build_doc_supplement(ctx) -> str:
     """从上传的原始 DOCX 确定性抽取功能清单，返回注入识别/规划层的权威段落。
 
@@ -204,18 +232,20 @@ def _chunk_key(chunk: dict) -> str:
     )
 
 
-def _fan_out_retrieve(retrieve, domain: str, queries: list[str], *,
+def _fan_out_retrieve(ctx, domain: str, queries: list[str], *,
                       top_k: int, threshold, layer: str | None,
                       workers: int) -> list[list]:
-    """并发多路检索，保持与 queries 相同的返回顺序；单路异常降级为空列表。"""
+    """并发多路检索，保持与 queries 相同的返回顺序；单路异常降级为空列表。
+
+    单路走 retrieval_service.retrieve_raw，统一日志/异常降级。
+    """
+    svc = _load_retrieval_service()
+
     def _one(q: str) -> list:
-        try:
-            return retrieve(
-                domain, q, top_k=top_k, score_threshold=threshold, layer=layer,
-            )
-        except Exception as exc:  # noqa: BLE001 —— 单路失败不影响并集
-            logger.warning("[hara_prepare] event 召回单路降级（q=%r）：%s", q[:40], exc)
-            return []
+        return svc.retrieve_raw(
+            domain, q, layer=layer, top_k=top_k,
+            score_threshold=threshold, ctx=ctx,
+        )
 
     if len(queries) <= 1:
         return [_one(queries[0])] if queries else []
@@ -223,7 +253,7 @@ def _fan_out_retrieve(retrieve, domain: str, queries: list[str], *,
         return list(pool.map(_one, queries))
 
 
-def _retrieve_event_union(retrieve, domain: str, func_name: str, word: str,
+def _retrieve_event_union(ctx, domain: str, func_name: str, word: str,
                           desc: str, kb_cfg: dict) -> list[dict]:
     """按「功能+失效词」锚定多路召回并集：同功能优先、按 hzrd_id 去重、封顶 cap。"""
     facets = [str(f) for f in (kb_cfg.get("map_event_facets") or _DEFAULT_EVENT_FACETS)]
@@ -234,7 +264,7 @@ def _retrieve_event_union(retrieve, domain: str, func_name: str, word: str,
 
     specs = _event_query_specs(func_name, word, desc, facets)
     batches = _fan_out_retrieve(
-        retrieve, domain, specs,
+        ctx, domain, specs,
         top_k=min(top_k, 20), threshold=threshold,
         layer="hara_event", workers=workers,
     )
@@ -309,6 +339,15 @@ def _targeted_layered_retrieval(ctx, skill_cfg: dict, identify_info: dict) -> st
             merged.append(c)
             added += 1
         return added
+
+    # 显式检索安全目标（替代/补充 q1 综合召回，更精准）
+    svc = _load_retrieval_service()
+    sg_records, _ = svc.retrieve(
+        domain="functional_safety", query_type="safety_goal",
+        params={}, ctx=ctx,
+    )
+    for r in sg_records:
+        _ingest([{"content": str(r.get("内容") or ""), "meta": {"layer": "safety_goal"}}])
 
     for fname in identify_info["functions"]:
         base_query = f"{item_name} {fname}".strip()
@@ -392,7 +431,7 @@ def retrieve_map(ctx) -> list[dict]:
             break
     desc = str(unit.get("malfunction_behavior") or "").strip()
     chunks = _retrieve_event_union(
-        ctx.retrieve_knowledge, domain, func_name, word, desc[:120], kb_cfg,
+        ctx, domain, func_name, word, desc[:120], kb_cfg,
     )
     logger.info(
         "[hara_prepare] 评级切片（%s/%s）event 钩子召回 %d 块",
@@ -525,21 +564,23 @@ def _retrieve_function_list(retrieve, domain: str, func_name: str,
     return None
 
 
-def _retrieve_function_failure_modes(retrieve, domain: str, func_name: str,
-                                     top_k: int = 20) -> list[dict]:
+def _retrieve_function_failure_modes(ctx, func_name: str) -> list[dict]:
     """按功能名检索知识库中该功能的全部历史失效模式（确定性提取）。
 
     返回列表：[{word, failure_id, malfunction_behavior, vehicle_hazard, chunk}]。
-    用于规划后处理阶段直接以知识库原文生成/覆盖 hazop_items，
-    避免 LLM 遗漏或改写历史失效模式。
+    通过 retrieval_service 复用 knowledge_lookup 的声明式适配器引擎，过滤逻辑
+    同时检查 meta.func 和 content（修复原硬编码只检查 meta.func 导致的遗漏 bug）。
     """
     if not func_name:
         return []
+    svc = _load_retrieval_service()
     try:
-        chunks = retrieve(
-            domain, f"{func_name} 失效模式",
-            top_k=top_k, layer="failure_mode",
-        ) or []
+        records, _ = svc.retrieve(
+            domain="functional_safety",
+            query_type="failure_mode",
+            params={"functions": [func_name]},
+            ctx=ctx,
+        )
     except Exception as exc:  # noqa: BLE001 —— 检索失败降级为空
         logger.warning(
             "[hara_prepare] 失效模式检索降级（func=%s）：%s", func_name, exc,
@@ -547,27 +588,17 @@ def _retrieve_function_failure_modes(retrieve, domain: str, func_name: str,
         return []
     result: list[dict] = []
     seen_keys: set[str] = set()
-    for c in chunks:
-        if not isinstance(c, dict):
-            continue
-        meta = c.get("meta") or {}
-        # 功能名双向包含匹配：LLM 生成的 vehicle_function 可能带"功能(EPB)"等后缀，
-        # 知识库 meta.func 通常是纯功能名，故用包含关系而非精确相等
-        meta_func = str(meta.get("func") or "").strip()
-        if meta_func and meta_func not in func_name and func_name not in meta_func:
-            continue
-        word = str(meta.get("failure_type") or "").strip()
+    for r in records:
+        word = str(r.get("失效词") or "").strip()
         if not word:
             continue
-        fid = str(meta.get("failure_id") or "").strip()
-        texts = _fm_original_texts(str(c.get("content") or ""))
+        fid = str(r.get("失效模式编号") or "").strip()
+        content = str(r.get("内容") or "")
+        texts = _fm_original_texts(content)
         if not texts[0] and not texts[1]:
             continue
-        # 必须按 failure_id 去重：同一失效词在历史项目中可能对应多个失效模式
-        # （如 EPB 的"丢失"含「接合驻车制动器功能丧失」「释放驻车制动器功能
-        # 丧失」两条，"非预期"含三条）。若按失效词去重，同词条目只剩一条，
-        # 后处理会把多个 hazop_item 的表现/危害覆盖成同一份内容。
-        key = fid or f"{word}:{str(c.get('content') or '')[:80]}"
+        # 适配器已按"失效模式编号"去重，此处做二次保险
+        key = fid or f"{word}:{content[:80]}"
         if key in seen_keys:
             continue
         seen_keys.add(key)
@@ -576,7 +607,7 @@ def _retrieve_function_failure_modes(retrieve, domain: str, func_name: str,
             "failure_id": fid,
             "malfunction_behavior": texts[0],
             "vehicle_hazard": texts[1],
-            "chunk": c,
+            "chunk": {"content": content, "meta": {"func": str(r.get("功能") or "")}},
         })
     return result
 
@@ -802,7 +833,7 @@ def fix_plan_items(ctx) -> dict:
     for func_name in functions.values():
         if not func_name:
             continue
-        fms = _retrieve_function_failure_modes(retrieve, domain, func_name)
+        fms = _retrieve_function_failure_modes(ctx, func_name)
         index: dict[str, dict] = {}
         for i, fm in enumerate(fms):
             index[fm.get("failure_id") or f"__noid_{i}"] = fm
@@ -918,7 +949,7 @@ def fix_plan_items(ctx) -> dict:
         if key not in union_cache:
             try:
                 union_cache[key] = _retrieve_event_union(
-                    retrieve, domain, func_name, word, "", kb_cfg,
+                    ctx, domain, func_name, word, "", kb_cfg,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
