@@ -304,117 +304,163 @@ def _parse_fm_desc(chunk: dict) -> str:
 # ── 功能级精准检索 ─────────────────────────────────────────────────
 
 def _targeted_layered_retrieval(ctx, skill_cfg: dict, identify_info: dict) -> str:
-    """按识别出的每个整车功能精准检索，合并去重后四层分组。
+    """按识别出的每个整车功能四路检索结构化候选，序列化为候选 JSON 字符串。
 
-    每功能：
-      q1 = "<相关项名> <整车功能名>"  综合召回（功能清单/安全目标等）
-      q2 = "<整车功能名> 失效模式"    专项召回 failure_mode 层（历史失效清单）
-      q3+ = 以 q2 命中的每个历史失效为单位，多路并集召回其全部历史 HARA 事件
-            （prepare_event_recall=false 时关闭 q3+）
+    四路均通过 retrieval_service.retrieve() 走声明式适配器：
+      function_list → 历史功能清单候选（含 features 解析）
+      failure_mode → 历史失效模式候选（含 mb/vh 短文本）
+      hara_event → 历史 HARA 事件候选（含 S/E/C/安全目标解析）
+      safety_goal → 历史安全目标候选
+
+    每条候选只取 ref_id + 短关键字段，长文本不进候选（物化时取原文）。
+    返回 JSON 字符串供规划层 LLM 逐条判断沿用/改编/新增。
     """
     kb_cfg = skill_cfg.get("knowledge") or {}
     domain = str(kb_cfg.get("domain") or "").strip()
     if not domain:
         return ""
-    layers = [str(x) for x in (kb_cfg.get("layers") or _DEFAULT_LAYERS)]
-    func_top_k = int(kb_cfg.get("identify_func_top_k", 10) or 10)
-    fm_top_k = int(kb_cfg.get("identify_fm_top_k", 10) or 10)
-    event_recall = bool(kb_cfg.get("prepare_event_recall", True))
-    item_name = identify_info.get("item_name") or ""
-
-    seen: set[str] = set()
-    merged: list[dict] = []
-
-    def _ingest(chunks) -> int:
-        if not isinstance(chunks, list):
-            return 0
-        added = 0
-        for c in chunks:
-            if not isinstance(c, dict):
-                continue
-            key = _chunk_key(c)
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(c)
-            added += 1
-        return added
-
-    # 显式检索安全目标（替代/补充 q1 综合召回，更精准）
-    svc = _load_retrieval_service()
-    sg_records, _ = svc.retrieve(
-        domain="functional_safety", query_type="safety_goal",
-        params={}, ctx=ctx,
-    )
-    for r in sg_records:
-        _ingest([{"content": str(r.get("内容") or ""), "meta": {"layer": "safety_goal"}}])
-
-    for fname in identify_info["functions"]:
-        base_query = f"{item_name} {fname}".strip()
-        _ingest(ctx.retrieve_knowledge(
-            domain, base_query,
-            top_k=func_top_k, score_threshold=kb_cfg.get("score_threshold"),
-        ))
-        fm_chunks = ctx.retrieve_knowledge(
-            domain, f"{fname} 失效模式",
-            top_k=fm_top_k, score_threshold=kb_cfg.get("score_threshold"),
-            layer="failure_mode",
-        )
-        _ingest(fm_chunks)
-
-        # 该功能在历史项目中的失效清单（meta.func 精确同名、确有事件分块）
-        hist_failures: list[tuple[str, str]] = []
-        if event_recall and isinstance(fm_chunks, list):
-            fm_seen: set[str] = set()
-            for c in fm_chunks:
-                meta = c.get("meta") or {}
-                fid = str(meta.get("failure_id") or "").strip()
-                word = str(meta.get("failure_type") or "").strip()
-                if (
-                    str(meta.get("func") or "").strip() == fname
-                    and meta.get("has_events") and word and fid
-                    and fid not in fm_seen
-                ):
-                    fm_seen.add(fid)
-                    hist_failures.append((word, _parse_fm_desc(c)))
-            for word, desc in hist_failures:
-                _ingest(_retrieve_event_union(
-                    ctx.retrieve_knowledge, domain, fname, word, desc, kb_cfg,
-                ))
-            logger.info(
-                "[hara_prepare] %s 历史失效 %d 个：%s",
-                fname, len(hist_failures), [w for w, _ in hist_failures],
-            )
-
-    layer_counts: dict[str, int] = {}
-    for c in merged:
-        ln = str((c.get("meta") or {}).get("layer") or "未标注")
-        layer_counts[ln] = layer_counts.get(ln, 0) + 1
-    logger.info(
-        "[hara_prepare] 功能级精准检索：%d 个功能，去重后 %d 块，层分布=%s",
-        len(identify_info["functions"]), len(merged), layer_counts,
-    )
-    if not merged:
+    functions = identify_info.get("functions") or []
+    if not functions:
         return ""
-    # 规划层需承载每功能全部历史 HARA 事件，默认 2 万字篇幅上限会截断，
-    # 故由技能契约 knowledge.layered_block_max_chars 覆盖（未配置走 kb_client 默认值）
-    fmt_kwargs = {}
-    block_max = kb_cfg.get("layered_block_max_chars")
-    chunk_max = kb_cfg.get("layered_chunk_max_chars")
-    if block_max:
-        fmt_kwargs["max_total_chars"] = int(block_max)
-    if chunk_max:
-        fmt_kwargs["max_chunk_chars"] = int(chunk_max)
-    return ctx.format_knowledge_layered_block(merged, layers, domain, **fmt_kwargs)
+
+    svc = _load_retrieval_service()
+    params = {"functions": functions}
+
+    # 四路检索（每路独立异常降级为空数组）
+    cand_funcs = _retrieve_function_candidates(svc, params, ctx)
+    cand_fms = _retrieve_failure_mode_candidates(svc, params, ctx)
+    cand_events = _retrieve_event_candidates(svc, params, ctx)
+    cand_sgs = _retrieve_safety_goal_candidates(svc, ctx)
+
+    if not any([cand_funcs, cand_fms, cand_events, cand_sgs]):
+        return ""
+
+    logger.info(
+        "[hara_prepare] 四路结构化候选：功能清单 %d 条，失效模式 %d 条，"
+        "HARA 事件 %d 条，安全目标 %d 条",
+        len(cand_funcs), len(cand_fms), len(cand_events), len(cand_sgs),
+    )
+    return json.dumps({
+        "function_list": cand_funcs,
+        "failure_mode": cand_fms,
+        "hara_event": cand_events,
+        "safety_goal": cand_sgs,
+    }, ensure_ascii=False)
+
+
+def _retrieve_function_candidates(svc, params, ctx):
+    """检索功能清单候选，返回 [{ref_id, func, features}]。"""
+    try:
+        records, _ = svc.retrieve(
+            domain="functional_safety", query_type="function_list",
+            params=params, ctx=ctx,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[hara_prepare] 功能清单候选检索降级：%s", exc)
+        return []
+    result = []
+    for r in records:
+        content = str(r.get("内容") or "")
+        parsed = _parse_function_list_chunk(content)
+        if not parsed.get("features"):
+            continue
+        result.append({
+            "ref_id": str(r.get("功能编号") or ""),
+            "func": str(r.get("功能") or parsed.get("name") or ""),
+            "features": parsed["features"],
+        })
+    return result
+
+
+def _retrieve_failure_mode_candidates(svc, params, ctx):
+    """检索失效模式候选，返回 [{ref_id, func, word, mb, vh}]。"""
+    try:
+        records, _ = svc.retrieve(
+            domain="functional_safety", query_type="failure_mode",
+            params=params, ctx=ctx,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[hara_prepare] 失效模式候选检索降级：%s", exc)
+        return []
+    result = []
+    for r in records:
+        word = str(r.get("失效词") or "").strip()
+        if not word:
+            continue
+        content = str(r.get("内容") or "")
+        mb, vh = _fm_original_texts(content)
+        result.append({
+            "ref_id": str(r.get("失效模式编号") or ""),
+            "func": str(r.get("功能") or ""),
+            "word": word,
+            "mb": mb[:80],
+            "vh": vh[:80],
+        })
+    return result
+
+
+# HARA 事件分块正文中的失效词行
+_EVENT_WORD_RE = re.compile(r"失效模式：(.+)")
+
+
+def _retrieve_event_candidates(svc, params, ctx):
+    """检索 HARA 事件候选，返回 [{ref_id, func, word, scene, S, E, C, asil, sg_text}]。"""
+    try:
+        records, _ = svc.retrieve(
+            domain="functional_safety", query_type="hara_event",
+            params=params, ctx=ctx,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[hara_prepare] HARA 事件候选检索降级：%s", exc)
+        return []
+    result = []
+    for r in records:
+        content = str(r.get("内容") or "")
+        ev = _parse_event_assessment(content)
+        m = _EVENT_WORD_RE.search(content)
+        word = m.group(1).strip() if m else ""
+        result.append({
+            "ref_id": str(r.get("事件编号") or ""),
+            "func": str(r.get("功能") or ""),
+            "word": word,
+            "scene": (ev.get("scene") or "")[:60],
+            "S": ev.get("S"),
+            "E": ev.get("E"),
+            "C": ev.get("C"),
+            "asil": ev.get("asil") or "",
+            "sg_text": (ev.get("sg_text") or "")[:60],
+        })
+    return result
+
+
+def _retrieve_safety_goal_candidates(svc, ctx):
+    """检索安全目标候选，返回 [{ref_id, asil, text}]。"""
+    try:
+        records, _ = svc.retrieve(
+            domain="functional_safety", query_type="safety_goal",
+            params={}, ctx=ctx,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[hara_prepare] 安全目标候选检索降级：%s", exc)
+        return []
+    result = []
+    for r in records:
+        result.append({
+            "ref_id": str(r.get("整车安全目标ID") or ""),
+            "asil": str(r.get("ASIL") or ""),
+            "text": str(r.get("内容") or "")[:80],
+        })
+    return result
 
 
 # ── 评级层（map）每切片历史事件召回钩子 ────────────────────────────
 
 def retrieve_map(ctx) -> list[dict]:
-    """评级切片历史 HARA 事件召回：功能名+失效词锚定的多路并集。
+    """评级切片历史 HARA 事件召回：按功能名检索并过滤失效词，包装为结构化候选 chunk。
 
     引擎侧 MapSliceContext 提供 unit（当前切片）/plan_parsed（fid→功能名）/
-    skill_cfg/retrieve_knowledge；返回原始分块列表（空列表即零命中）。
+    skill_cfg/retrieve_knowledge；返回 chunk 列表（content 字段放结构化候选文本，
+    meta 保留 ref_id/S/E/C 等供 review_events 物化时按 ref_id 查回）。
     """
     unit = ctx.unit if isinstance(ctx.unit, dict) else {}
     kb_cfg = ctx.skill_cfg.get("knowledge") or {}
@@ -429,12 +475,59 @@ def retrieve_map(ctx) -> list[dict]:
         if isinstance(fn, dict) and str(fn.get("fid") or "").strip() == fid:
             func_name = str(fn.get("vehicle_function") or "").strip()
             break
-    desc = str(unit.get("malfunction_behavior") or "").strip()
-    chunks = _retrieve_event_union(
-        ctx, domain, func_name, word, desc[:120], kb_cfg,
-    )
+    if not func_name:
+        return []
+
+    svc = _load_retrieval_service()
+    try:
+        records, _ = svc.retrieve(
+            domain="functional_safety", query_type="hara_event",
+            params={"functions": [func_name]}, ctx=ctx,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[hara_prepare] 评级切片（%s/%s）检索降级：%s", fid or "?", word, exc,
+        )
+        return []
+
+    chunks: list[dict] = []
+    for r in records:
+        content = str(r.get("内容") or "")
+        ev = _parse_event_assessment(content)
+        # 过滤：失效词匹配（适配器按功能名检索，需二次过滤失效词）
+        m = _EVENT_WORD_RE.search(content)
+        c_word = m.group(1).strip() if m else ""
+        if c_word and c_word != word:
+            continue
+        ref_id = str(r.get("事件编号") or "").strip()
+        # content 字段放结构化候选文本（format_knowledge_block 只渲染 content/score）
+        lines = [
+            f"事件编号: {ref_id}",
+            f"运行场景: {ev.get('scene', '')}",
+            f"S={ev.get('S')} E={ev.get('E')} C={ev.get('C')} ASIL={ev.get('asil', '')}",
+            f"安全目标: {ev.get('sg_text', '')}",
+        ]
+        chunks.append({
+            "content": "\n".join(lines),
+            "score": 1.0,
+            "meta": {
+                "hzrd_id": ref_id,
+                "func": str(r.get("功能") or ""),
+                "failure_type": c_word,
+                "scene": ev.get("scene", ""),
+                "S": ev.get("S"),
+                "E": ev.get("E"),
+                "C": ev.get("C"),
+                "asil": ev.get("asil", ""),
+                "sg_text": ev.get("sg_text", ""),
+                "safe_state": ev.get("safe_state", ""),
+                "ftti": ev.get("ftti", ""),
+                "source": {"file": str(r.get("来源") or "")},
+            },
+        })
+
     logger.info(
-        "[hara_prepare] 评级切片（%s/%s）event 钩子召回 %d 块",
+        "[hara_prepare] 评级切片（%s/%s）event 钩子召回 %d 块（结构化候选）",
         fid or "?", word, len(chunks),
     )
     return chunks
@@ -746,24 +839,15 @@ def _match_item_failure(item: dict, fm_index: dict[str, dict], *,
 
 
 def fix_plan_items(ctx) -> dict:
-    """规划后处理钩子（纯代码，不调 LLM）：知识库内容一律以原文为准，LLM 只补差。
+    """规划后处理钩子（纯代码，不调 LLM）：按 ref_id 物化回填 reused/adapted 条目。
 
-    核心原则：沿用（reused）= 100% 全字段从知识库取，LLM 不生成任何内容；
-    改编（adapted）= 部分字段从知识库取、部分由 LLM 修改；新增（new）= LLM 全量生成。
-    适用于功能清单 / 失效模式 / HARA 事件 / 安全目标 四层数据。
+    核心原则：LLM 在候选清单驱动下已判断沿用/改编/新增并标注 ref_id；
+    本钩子只做物化回填——按 ref_id 从知识库取原文回填 reused 条目的空字段。
+    不再做功能清单覆盖/失效强制追加/场景骨架对齐（已前置到 prepare 候选检索）。
 
-    第-1步 功能清单覆盖：对每个功能检索知识库 function_list 层，按 feature_list_id
-    匹配并覆盖 Feature 描述（do_hara 判断保留 LLM 输出，因需依据当前相关项定义）；
-    第0步 失效模式确定性提取：对每个功能按功能名检索知识库 failure_mode 层，
-    获取该功能全部历史失效模式（malfunction_behavior/vehicle_hazard 原文）；
-    第1步 失效模式原文覆盖：LLM 生成的 hazop_items 中，凡知识库已有的失效
-    （按 fid+word 匹配），强制用知识库原文逐字覆盖 malfunction_behavior /
-    vehicle_hazard，并置 source.type=reused、ref_id=知识库 ID——杜绝 LLM
-    改写/编造沿用条目内容；
-    第1.5步 失效模式补全：知识库有但 LLM 未生成的失效模式，追加为新的
-    hazop_item（原文取自知识库，source=reused）——杜绝 LLM 遗漏历史失效；
-    第2步 场景历史骨架：对所有 hazop_items（含追加的）执行场景对齐与历史
-    事件补录（宁多勿漏，实质同场景去重）。
+    第-2步 Feature 去重：归并重复 Feature（不依赖知识库）；
+    第0步 失效模式物化：reused/adapted 条目按 ref_id 回填 mb/vh 原文；
+    第1步 场景物化：带 history_ref 的场景按 ref_id 回填 scene_text 原文。
     """
     plan = ctx.plan_parsed if isinstance(ctx.plan_parsed, dict) else {}
     items = plan.get("hazop_items")
@@ -776,242 +860,149 @@ def fix_plan_items(ctx) -> dict:
     if deduped:
         logger.info("[hara_prepare] 规划后处理：归并重复 Feature %d 条", deduped)
     stats = {
-        "func_covered": 0, "fm_covered": 0, "fm_appended": 0,
-        "scene_aligned": 0, "scene_appended": 0, "features_deduped": deduped,
+        "features_deduped": deduped,
+        "fm_materialized": 0,
+        "scene_materialized": 0,
+        "ref_invalid": 0,
     }
     kb_cfg = ctx.skill_cfg.get("knowledge") or {}
     domain = str(kb_cfg.get("domain") or "").strip()
-    retrieve = ctx.retrieve_knowledge
-    if not domain or retrieve is None:
+    if not domain:
         return stats
     fn_list = plan.get("functions") or []
     functions = {
         str(fn.get("fid") or "").strip(): str(fn.get("vehicle_function") or "").strip()
         for fn in fn_list if isinstance(fn, dict)
     }
-    matrix_by_fid = {
-        str(m.get("fid") or "").strip(): m
-        for m in (plan.get("malfunction_matrix") or []) if isinstance(m, dict)
-    }
 
-    # 第-1步：功能清单覆盖（Feature 描述从知识库取，do_hara 保留 LLM 判断）
-    for fn in fn_list:
-        if not isinstance(fn, dict):
-            continue
-        func_name = str(fn.get("vehicle_function") or "").strip()
-        if not func_name:
-            continue
-        kb_func = _retrieve_function_list(retrieve, domain, func_name)
-        if not kb_func:
-            continue
-        kb_feats = {
-            str(f.get("feature_list_id") or "").strip(): f
-            for f in (kb_func.get("features") or []) if isinstance(f, dict)
-        }
-        lfeats = fn.get("features")
-        if not isinstance(lfeats, list):
-            continue
-        covered = 0
-        for lf in lfeats:
-            if not isinstance(lf, dict):
-                continue
-            fid2 = str(lf.get("feature_list_id") or "").strip()
-            kb_f = kb_feats.get(fid2)
-            if kb_f and str(kb_f.get("description") or "").strip():
-                lf["description"] = kb_f["description"]
-                covered += 1
-        if covered:
-            stats["func_covered"] += covered
-            logger.info(
-                "[hara_prepare] 功能清单覆盖：%s 命中 %d 个 Feature 描述",
-                func_name, covered,
-            )
-
-    # 第0步：对每个功能检索知识库全部历史失效模式，按 failure_id 建索引
-    # （同一失效词可能对应多个历史失效模式，绝不能按词归并）
-    fm_by_func: dict[str, dict[str, dict]] = {}
-    for func_name in functions.values():
-        if not func_name:
-            continue
-        fms = _retrieve_function_failure_modes(ctx, func_name)
-        index: dict[str, dict] = {}
-        for i, fm in enumerate(fms):
-            index[fm.get("failure_id") or f"__noid_{i}"] = fm
-        fm_by_func[func_name] = index
-        logger.info(
-            "[hara_prepare] 知识库失效模式检索：%s 命中 %d 个失效（按 failure_id 去重）",
-            func_name, len(index),
-        )
-
-    union_cache: dict[tuple[str, str], list[dict]] = {}
-    covered_pairs: set[tuple[str, str]] = set()  # (fid, 知识库失效模式键)
+    svc = _load_retrieval_service()
+    fm_cache: dict[str, dict[str, dict]] = {}  # func_name → {ref_id: record}
+    ev_cache: dict[str, dict[str, dict]] = {}  # func_name → {hzrd_id: record}
     fm_fetch_cache: dict[str, tuple[str, str] | None] = {}
 
-    # 第1步：失效模式原文覆盖（reused/缺省条目：知识库有则强制用原文，一字不差；
-    # adapted=LLM 有意改编，保留其文本不覆盖，与 HARA 事件层 _materialize 的
-    # full/adapted 语义对齐）。匹配必须精确到具体历史失效模式：ref_id 优先，
-    # 同一失效词对应多个知识库条目时禁止"按词"取一条强行覆盖全部条目。
+    # 第0步：失效模式物化回填（reused/adapted 条目按 ref_id 回填 mb/vh 原文）
     for item in items:
         if not isinstance(item, dict):
             continue
-        fid = str(item.get("fid") or "").strip()
-        word = str(item.get("word") or "").strip()
-        func_name = functions.get(fid, "")
-        fm_index = fm_by_func.get(func_name, {})
         src = item.get("source") if isinstance(item.get("source"), dict) else {}
-        is_adapted = str(src.get("type") or "").strip().lower() == "adapted"
-
-        fm, how = _match_item_failure(
-            item, fm_index,
-            retrieve=retrieve, domain=domain, func_name=func_name,
-            fetch_cache=fm_fetch_cache,
-        )
-        if is_adapted:
-            # 改编条目不覆盖文本，但其参照的历史条目不允许在第1.5步重复追加
-            ref_key = str(src.get("ref_id") or "").strip()
-            if not ref_key and fm is not None and fm.get("failure_id"):
-                ref_key = fm["failure_id"]
-            if ref_key:
-                covered_pairs.add((fid, ref_key))
+        src_type = str(src.get("type") or "").strip().lower()
+        ref_id = str(src.get("ref_id") or "").strip()
+        if src_type not in ("reused", "adapted") or not ref_id:
             continue
-        if fm is None:
-            if how == "ambiguous":
+        fid = str(item.get("fid") or "").strip()
+        func_name = functions.get(fid, "")
+        if not func_name:
+            continue
+        if func_name not in fm_cache:
+            fm_cache[func_name] = _build_fm_index(svc, domain, func_name, ctx)
+        fm_record = fm_cache[func_name].get(ref_id)
+        if fm_record is None:
+            # 兜底直查（ref_id 可能在其他功能的 records 中，或适配器未命中）
+            texts = _fetch_fm_originals(
+                ctx.retrieve_knowledge, domain, ref_id, func_name,
+                str(item.get("word") or "").strip(), fm_fetch_cache,
+            )
+            if texts and (texts[0] or texts[1]):
+                item["malfunction_behavior"] = texts[0]
+                item["vehicle_hazard"] = texts[1]
+                stats["fm_materialized"] += 1
+            else:
+                stats["ref_invalid"] += 1
                 logger.warning(
-                    "[hara_prepare] 失效模式消歧失败，保留规划原文（fid=%s，word=%s，"
-                    "ref_id=%s）：同失效词存在多个知识库条目且无可靠匹配信号",
-                    fid, word, str(src.get("ref_id") or "").strip(),
+                    "[hara_prepare] 失效模式物化：ref_id %s 未命中知识库，保留 LLM 文本",
+                    ref_id,
                 )
             continue
-        item["malfunction_behavior"] = fm["malfunction_behavior"]
-        item["vehicle_hazard"] = fm["vehicle_hazard"]
-        src["type"] = "reused"
-        if fm.get("failure_id"):
-            src["ref_id"] = fm["failure_id"]
-        if not str(src.get("project") or "").strip() and not fm.get("_synthesized"):
-            src_file = str(
-                (((fm["chunk"].get("meta") or {}).get("source") or {}).get("file"))
-                or ""
-            ).strip()
-            if src_file:
-                src["project"] = src_file
-        item["source"] = src
-        # 同步失效矩阵：知识库命中的失效必须标记为选中
-        m = matrix_by_fid.get(fid)
-        if m is not None:
-            sel = m.get("selections") if isinstance(m.get("selections"), dict) else {}
-            sel[str(fm.get("word") or word)] = True
-            m["selections"] = sel
-        if fm.get("failure_id"):
-            covered_pairs.add((fid, fm["failure_id"]))
-        stats["fm_covered"] += 1
+        content = str(fm_record.get("内容") or "")
+        mb, vh = _fm_original_texts(content)
+        if mb or vh:
+            item["malfunction_behavior"] = mb
+            item["vehicle_hazard"] = vh
+            stats["fm_materialized"] += 1
+            if not str(src.get("project") or "").strip():
+                src_file = str(fm_record.get("来源") or "")
+                if src_file:
+                    src["project"] = src_file
+                    item["source"] = src
 
-    # 第1.5步：补全知识库有但 LLM 未生成的失效模式（按 failure_id 逐条判定，宁多勿漏）
-    for fid, func_name in functions.items():
-        for key, fm in fm_by_func.get(func_name, {}).items():
-            if (fid, key) in covered_pairs or fm.get("_synthesized"):
-                continue
-            src_file = str(
-                (((fm["chunk"].get("meta") or {}).get("source") or {}).get("file"))
-                or ""
-            ).strip()
-            items.append({
-                "fid": fid,
-                "word": fm["word"],
-                "malfunction_behavior": fm["malfunction_behavior"],
-                "vehicle_hazard": fm["vehicle_hazard"],
-                "scenarios": [],
-                "source": {
-                    "type": "reused",
-                    "project": src_file,
-                    "ref_id": fm["failure_id"],
-                },
-                "source_note": f"失效模式沿用知识库 {fm['failure_id']}",
-            })
-            # 同步失效矩阵：补全的失效必须标记为选中
-            m = matrix_by_fid.get(fid)
-            if m is not None:
-                sel = m.get("selections") if isinstance(m.get("selections"), dict) else {}
-                sel[fm["word"]] = True
-                m["selections"] = sel
-            covered_pairs.add((fid, key))
-            stats["fm_appended"] += 1
-
-    # 第2步：场景历史骨架（对所有 hazop_items 含追加的，宁多勿漏）
+    # 第1步：场景物化回填（带 history_ref 的场景按 ref_id 回填 scene_text 原文）
     for item in items:
         if not isinstance(item, dict):
             continue
         fid = str(item.get("fid") or "").strip()
-        word = str(item.get("word") or "").strip()
         func_name = functions.get(fid, "")
-        if not func_name or not word:
-            continue
-        key = (func_name, word)
-        if key not in union_cache:
-            try:
-                union_cache[key] = _retrieve_event_union(
-                    ctx, domain, func_name, word, "", kb_cfg,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "[hara_prepare] 场景骨架召回降级（%s/%s）：%s",
-                    func_name, word, exc,
-                )
-                union_cache[key] = []
-        by_id: dict[str, dict] = {}
-        for c in union_cache[key]:
-            if not isinstance(c, dict):
-                continue
-            meta = c.get("meta") or {}
-            # 只保留属于当前失效词的历史事件，避免同功能多失效切片重复沿用同一批事件
-            c_word = str(meta.get("failure_type") or "").strip()
-            if c_word and c_word != word:
-                continue
-            hid = str(meta.get("hzrd_id") or "").strip()
-            if hid:
-                by_id[hid] = c
-        if not by_id:
+        if not func_name:
             continue
         scenarios = item.get("scenarios")
         if not isinstance(scenarios, list):
-            scenarios = []
-        existing_norms = {
-            _scene_norm(str(sc.get("scene_text") or ""))
-            for sc in scenarios if isinstance(sc, dict)
-        }
-        used: set[str] = set()
+            continue
+        if func_name not in ev_cache:
+            ev_cache[func_name] = _build_event_index(svc, domain, func_name, ctx)
         for sc in scenarios:
             if not isinstance(sc, dict):
                 continue
             href = str(sc.get("history_ref") or "").strip()
             if not href:
                 continue
-            meta = (by_id.get(href) or {}).get("meta") or {}
-            scene_text = str(meta.get("scene") or "").strip()
+            ev_record = ev_cache[func_name].get(href)
+            if ev_record is None:
+                sc.pop("history_ref", None)  # 引用无效：剥离标记
+                stats["ref_invalid"] += 1
+                logger.warning(
+                    "[hara_prepare] 场景物化：history_ref %s 未命中知识库，剥离标记",
+                    href,
+                )
+                continue
+            content = str(ev_record.get("内容") or "")
+            ev = _parse_event_assessment(content)
+            scene_text = (ev.get("scene") or "").strip()
             if scene_text:
                 sc["scene_text"] = scene_text
-                used.add(href)
-                stats["scene_aligned"] += 1
-            else:
-                sc.pop("history_ref", None)  # 引用无效：剥离标记，避免误导评级层
-        for hid, c in by_id.items():
-            if hid in used:
-                continue
-            scene_text = str((c.get("meta") or {}).get("scene") or "").strip()
-            norm = _scene_norm(scene_text)
-            if not scene_text or norm in existing_norms:
-                continue
-            scenarios.append({"history_ref": hid, "scene_text": scene_text})
-            existing_norms.add(norm)
-            stats["scene_appended"] += 1
-        if scenarios:
-            item["scenarios"] = scenarios
+                stats["scene_materialized"] += 1
+
     logger.info(
-        "[hara_prepare] 规划后处理：功能 Feature 覆盖 %d 条，失效模式原文覆盖 %d 条，"
-        "知识库失效补全 %d 条，场景原文对齐 %d 条，历史场景补录 %d 条",
-        stats.get("func_covered", 0), stats["fm_covered"], stats.get("fm_appended", 0),
-        stats["scene_aligned"], stats["scene_appended"],
+        "[hara_prepare] 规划后处理：Feature 去重 %d 条，失效模式物化 %d 条，"
+        "场景物化 %d 条，ref_id 无效 %d 条",
+        stats["features_deduped"], stats["fm_materialized"],
+        stats["scene_materialized"], stats["ref_invalid"],
     )
     return stats
+
+
+def _build_fm_index(svc, domain: str, func_name: str, ctx) -> dict[str, dict]:
+    """构建该功能的失效模式 index：{failure_id: record}。"""
+    try:
+        records, _ = svc.retrieve(
+            domain="functional_safety", query_type="failure_mode",
+            params={"functions": [func_name]}, ctx=ctx,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[hara_prepare] 失效模式索引构建降级（func=%s）：%s", func_name, exc)
+        return {}
+    index: dict[str, dict] = {}
+    for r in records:
+        fid = str(r.get("失效模式编号") or "").strip()
+        if fid:
+            index[fid] = r
+    return index
+
+
+def _build_event_index(svc, domain: str, func_name: str, ctx) -> dict[str, dict]:
+    """构建该功能的 HARA 事件 index：{hzrd_id: record}。"""
+    try:
+        records, _ = svc.retrieve(
+            domain="functional_safety", query_type="hara_event",
+            params={"functions": [func_name]}, ctx=ctx,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[hara_prepare] 事件索引构建降级（func=%s）：%s", func_name, exc)
+        return {}
+    index: dict[str, dict] = {}
+    for r in records:
+        hid = str(r.get("事件编号") or "").strip()
+        if hid:
+            index[hid] = r
+    return index
 
 
 # ── 评级结果评审钩子：全量复核 source 标注，疑似项回炉 LLM 二次校验 ──
@@ -1297,23 +1288,18 @@ def _review_one(ev: dict, candidates: dict[str, dict],
 
 
 def review_events(ctx) -> dict:
-    """评审钩子：物化 → 疑点检测（source 标注 + 安全目标缺口）→ 确定性传播/
-    复核 LLM → 应用 → 再物化/再传播。
+    """评审钩子：物化回填 → 安全目标缺口检测 → 确定性传播/复核 LLM → 应用 → 再物化。
 
     第一步物化（纯代码，仅在有历史召回时）：reused 事件全字段按知识库事件块
-    原文回填、adapted 事件覆盖场景原文与安全目标组——沿用内容以库原文为准，
-    LLM 只补差；
-    第二步代码级检测两类疑点：
-      A. source 标注疑点（漏标沿用/虚引 ID/评级与所引不一致/场景与所引不符），
-         仅在本切片有历史召回时检测；
-      B. 安全目标缺口（与历史召回无关，始终检测）：按 S/E/C 矩阵确定性反算
-         ASIL≥A 的显著事件，若 sg_text/safe_state/ftti 缺失，**先在同一失效
-         单元内确定性传播**——同单元显著事件本应共用同一安全目标，兄弟事件
-         已有完整三件套时直接继承，零 LLM 开销；仅整个单元都无安全目标时，
-         才连同邻近事件回炉 LLM 补全一次；
-    改不改、怎么改由复核 LLM 决定。sg_gap 类只允许白名单回填安全目标三字段，
-    防止复核顺带改动 S/E/C；source 类保持整事件合并。物化/复核失败均软降级
-    保留原结果；补全/传播后仍缺失的，由渲染器标黄并在交付摘要中提示人工补全。
+    原文回填、adapted 事件覆盖场景原文与安全目标组——沿用内容以库原文为准；
+    第二步安全目标缺口检测（与历史召回无关，始终检测）：按 S/E/C 矩阵确定性
+    反算 ASIL≥A 的显著事件，若 sg_text/safe_state/ftti 缺失，**先在同一失效
+    单元内确定性传播**——同单元显著事件本应共用同一安全目标，兄弟事件
+    已有完整三件套时直接继承，零 LLM 开销；仅整个单元都无安全目标时，
+    才连同邻近事件回炉 LLM 补全一次。
+    sg_gap 类只允许白名单回填安全目标三字段，防止复核改动 S/E/C；
+    物化/复核失败均软降级保留原结果；补全/传播后仍缺失的，由渲染器标黄
+    并在交付摘要中提示人工补全。
     """
     events = ctx.events if isinstance(ctx.events, list) else []
     if not events:
@@ -1344,9 +1330,6 @@ def review_events(ctx) -> dict:
 
     map_cfg = (ctx.skill_cfg.get("execution") or {}).get("map") or {}
     review_cfg = map_cfg.get("review") or {}
-    threshold = float(
-        review_cfg.get("scene_sim_threshold") or _REVIEW_SCENE_SIM_DEFAULT
-    )
 
     def _materialize_all() -> int:
         """物化回填：reused 全字段 / adapted 场景+安全目标组；返回成功条数。"""
@@ -1381,19 +1364,8 @@ def review_events(ctx) -> dict:
     )
 
     suspects: list[dict] = []
-    # A 类：source 标注疑点（无历史召回时不检测，避免把"查无候选"误判为虚引）
-    if candidates:
-        for i, ev in enumerate(events):
-            if not isinstance(ev, dict):
-                continue
-            issues, matched = _review_one(ev, candidates, threshold)
-            if issues:
-                suspects.append({
-                    "index": i, "kind": "source_review",
-                    "issues": issues, "matched_history": matched,
-                })
 
-    # B 类：安全目标缺口（ASIL≥A 的显著事件缺 sg_text/safe_state/ftti）
+    # 安全目标缺口检测（ASIL≥A 的显著事件缺 sg_text/safe_state/ftti）
     _SG_FIELDS = ("sg_text", "safe_state", "ftti")
     _SG_LABEL = {"sg_text": "安全目标", "safe_state": "安全状态", "ftti": "FTTI"}
 
@@ -1464,10 +1436,9 @@ def review_events(ctx) -> dict:
         })
 
     ctx.logger.info(
-        "[hara_prepare] 评级评审（%s/%s）：%d 条事件，source 标注疑点 %d 条，"
-        "安全目标缺口 %d 条（单元内确定性传播补齐 %d 条，待回炉 %d 条）",
+        "[hara_prepare] 评级评审（%s/%s）：%d 条事件，安全目标缺口 %d 条"
+        "（单元内确定性传播补齐 %d 条，待回炉 %d 条）",
         fid or "?", word, len(events),
-        len(suspects) - len(sg_gap_indexes),
         sg_propagated + len(sg_gap_indexes), sg_propagated, len(sg_gap_indexes),
     )
     if not suspects:
@@ -1503,9 +1474,8 @@ def review_events(ctx) -> dict:
         "context_events": context_events,
     }
     user_message = (
-        "以下 HARA 事件经系统代码级校验存在疑点（suspects 中 kind 标明类型："
-        "source_review=source 标注疑点，sg_gap=显著事件缺少安全目标）。"
-        "请严格按系统提示词逐条复核，只对疑点事件输出修正后的完整事件"
+        "以下 HARA 事件经系统代码级校验发现安全目标缺口（suspects 中 kind=sg_gap："
+        "显著事件缺少安全目标）。请严格按系统提示词逐条补全安全目标三字段"
         "（index 必须与 suspects 一致，不得新增或遗漏）。\n"
         + json.dumps(payload, ensure_ascii=False, indent=1)
     )
@@ -1532,24 +1502,16 @@ def review_events(ctx) -> dict:
             fe = by_index.get(i)
             if not isinstance(fe, dict):
                 continue
-            if s.get("kind") == "sg_gap":
-                # 白名单回填：只接受非空安全目标三字段，杜绝复核改动 S/E/C
-                changed = False
-                for k in _SG_FIELDS:
-                    v = fe.get(k)
-                    if isinstance(v, str) and v.strip():
-                        events[i][k] = v.strip()
-                        changed = True
-                if changed:
-                    sg_filled += 1
-                    applied += 1
-                continue
-            merged = dict(events[i])          # 原事件兜底，防复核输出缺字段
-            for k, v in fe.items():
-                if k != "index":
-                    merged[k] = v
-            events[i] = merged
-            applied += 1
+            # 白名单回填：只接受非空安全目标三字段，杜绝复核改动 S/E/C
+            changed = False
+            for k in _SG_FIELDS:
+                v = fe.get(k)
+                if isinstance(v, str) and v.strip():
+                    events[i][k] = v.strip()
+                    changed = True
+            if changed:
+                sg_filled += 1
+                applied += 1
 
     mat_count2 = _materialize_all()  # 复核改判后按库原文再校正一遍
     # LLM 补出的安全目标（或再物化从历史回填的）在单元内再传播一轮，
