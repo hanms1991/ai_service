@@ -592,7 +592,7 @@ def _read_uploaded_document(skill_cfg: dict, inputs: dict[str, Any]) -> str:
 
     from tools.read_document import read_document
 
-    # 内部确定性读取：禁用回调，避免在 llm_trace.log 中以 TOOL_START/END 形式
+    # 内部确定性读取：禁用回调，避免在 per-thread 日志中以 TOOL_START/END 形式
     # 再回显一遍整份文档（该工具调用不是 LLM 决策，产物随后会注入用户消息）
     content = read_document.invoke(
         {"file_id": file_id}, config={"callbacks": []}

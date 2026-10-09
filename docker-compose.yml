@@ -19,7 +19,7 @@ services:
     volumes:
       # LangGraph 线程状态持久化（checkpoints.db）
       - ./data:/app/data
-      # LLM 交互日志（llm_trace.log）
+      # 日志目录（per-thread 日志 / kb_retrieval / skill_errors）
       - ./logs:/app/logs
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8300/healthz', timeout=5)"]

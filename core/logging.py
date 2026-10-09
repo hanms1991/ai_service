@@ -6,7 +6,7 @@
 用法：
     from core.logging import LLMInteractionLogger
 
-    logger = LLMInteractionLogger("logs/llm_trace.log")
+    logger = LLMInteractionLogger("logs/threads/{trace_id}.log", clear_on_init=False)
     agent.invoke(
         {"messages": [{"role": "user", "content": "..."}]},
         config={"callbacks": [logger]},
@@ -31,11 +31,14 @@ class LLMInteractionLogger(BaseCallbackHandler):
     文件写入完整内容，控制台输出超长时截断。
     """
 
-    def __init__(self, log_path: str | Path, *, verbose: bool = True, stream_chunk_size: int = 2000):
+    def __init__(self, log_path: str | Path, *, verbose: bool = True,
+                 stream_chunk_size: int = 2000, clear_on_init: bool = True):
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        # 每次实例化时清空文件，开始新的日志
-        self.log_path.write_text("", encoding="utf-8")
+        # clear_on_init=True 时清空文件（旧 llm_trace.log 行为）；
+        # per-thread 文件由 thread_logging.setup() 预创建，传 False 跳过清空
+        if clear_on_init:
+            self.log_path.write_text("", encoding="utf-8")
         self.verbose = verbose
         self._depth: dict[str, int] = {}  # run_id → 嵌套层级
         # 流式 token 缓冲：run_id → 累积文本

@@ -63,6 +63,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ── 2c. Web 端账号/会话库（/chat 轻量多用户页面） ──
     init_web_db()
 
+    # ── 2d. 清理过期 per-thread 日志（启动时一次性清理） ──
+    from core.thread_logging import cleanup_old
+    deleted = cleanup_old()
+    if deleted:
+        print(f"[lifespan] 清理过期 thread 日志：{deleted} 个文件")
+
     # ── 2b. 初始化 TaskStore + CallbackClient（M2） ──
     ttl_hours = int(os.getenv("TASK_RESULT_TTL_HOURS", "24"))
     task_store = TaskStore(ttl_seconds=ttl_hours * 3600)
@@ -165,16 +171,23 @@ async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """未捕获异常 → INTERNAL_ERROR + trace_id，避免裸栈外泄。"""
     trace_id = getattr(request.state, "trace_id", "") or ""
-    # 写入 llm_trace.log 便于排查
+    # 写入 per-thread 日志（trace_id 无对应文件时 fallback 到 skill_errors.log）
     import traceback
+    entry = (
+        f"\n[#trace_id={trace_id} INTERNAL_ERROR]\n"
+        f"{traceback.format_exc()}\n"
+    )
     try:
-        log_path = PROJECT_ROOT / "logs" / "llm_trace.log"
+        from core.thread_logging import write_to_thread_log
+        write_to_thread_log(trace_id, entry)
+    except Exception:
+        pass
+    # Fallback：per-thread 文件可能不存在（异常发生在 thread_log_scope 之前）
+    try:
+        log_path = PROJECT_ROOT / "logs" / "skill_errors.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as f:
-            f.write(
-                f"\n[#trace_id={trace_id} INTERNAL_ERROR]\n"
-                f"{traceback.format_exc()}\n"
-            )
+            f.write(entry)
     except Exception:
         pass
 

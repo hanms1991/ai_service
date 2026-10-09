@@ -43,7 +43,7 @@ def main() -> None:
     parser.add_argument(
         "--log",
         action="store_true",
-        help="是否启用 LLMInteractionLogger（写入 logs/llm_trace.log）",
+        help="是否启用 LLMInteractionLogger（写入 logs/diag_trace.log）",
     )
     args = parser.parse_args()
 
@@ -64,7 +64,7 @@ def main() -> None:
 
     runnable_config = None
     if args.log:
-        log_path = PROJECT_ROOT / "logs" / "llm_trace.log"
+        log_path = PROJECT_ROOT / "logs" / "diag_trace.log"
         logger = LLMInteractionLogger(log_path, verbose=True)
         runnable_config = {
             "configurable": {"thread_id": "diag-prd-direct"},

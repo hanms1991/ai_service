@@ -30,20 +30,26 @@ from agents.supervisor.state import SupervisorState
 _SKILL_ERROR_LOG = Path(__file__).resolve().parents[3] / "logs" / "skill_errors.log"
 
 
-def _log_skill_error(agent: str, skill: str, inputs: Any, exc: BaseException) -> None:
-    """把技能执行异常（含完整堆栈）追加写入 logs/skill_errors.log。"""
+def _log_skill_error(agent: str, skill: str, inputs: Any, exc: BaseException,
+                     trace_id: str = "") -> None:
+    """把技能执行异常（含完整堆栈）写入 logs/skill_errors.log + per-thread 日志。"""
     try:
         _SKILL_ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
         # inputs 中可能含 file_id 等可留痕信息；截断防止超大 body 刷屏
         inputs_repr = repr(inputs)
         if len(inputs_repr) > 500:
             inputs_repr = inputs_repr[:500] + "…(截断)"
+        entry = (
+            f"\n[{datetime.now().isoformat(timespec='seconds')}] "
+            f"{agent}/{skill} 失败：{type(exc).__name__}: {exc}\n"
+            f"inputs={inputs_repr}\n{traceback.format_exc()}"
+        )
         with open(_SKILL_ERROR_LOG, "a", encoding="utf-8") as f:
-            f.write(
-                f"\n[{datetime.now().isoformat(timespec='seconds')}] "
-                f"{agent}/{skill} 失败：{type(exc).__name__}: {exc}\n"
-                f"inputs={inputs_repr}\n{traceback.format_exc()}"
-            )
+            f.write(entry)
+        # 同时写入 per-thread 日志（trace_id 由 executor_node 从 config 注入）
+        if trace_id:
+            from core.thread_logging import write_to_thread_log
+            write_to_thread_log(trace_id, entry)
     except Exception:  # noqa: BLE001 - 日志失败绝不能影响主流程
         pass
 
@@ -64,6 +70,8 @@ def executor_node(
     """
     step_index = state["step_index"]
     plan = state["plan"]
+    # 从 runnable_config 注入 trace_id，用于 per-thread 日志（skill_errors 等）
+    trace_id = (config.get("configurable") or {}).get("trace_id", "")
 
     # 防御：计划已执行完毕
     if step_index >= len(plan):
@@ -170,7 +178,7 @@ def executor_node(
             except SkillInputError as e:
                 # file_id 文档不存在/已过期/无法解析：对话式提示用户重新上传或改用文字描述
                 print(f"[executor] 技能 {skill_name} 输入文档读取失败：{e}")
-                _log_skill_error(tool_name, skill_name, skill_inputs, e)
+                _log_skill_error(tool_name, skill_name, skill_inputs, e, trace_id)
                 display = skill_name
                 try:
                     skill_cfg = validate_binding(tool_name, skill_name)
@@ -187,7 +195,7 @@ def executor_node(
             except Exception as e:  # noqa: BLE001 - 执行链最后防线，避免请求 500
                 print(f"[executor] 技能 {skill_name} 执行失败：{type(e).__name__}: {e}")
                 traceback.print_exc()
-                _log_skill_error(tool_name, skill_name, skill_inputs, e)
+                _log_skill_error(tool_name, skill_name, skill_inputs, e, trace_id)
                 display = skill_name
                 try:
                     skill_cfg = validate_binding(tool_name, skill_name)

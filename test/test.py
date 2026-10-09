@@ -29,7 +29,7 @@ from core.logging import LLMInteractionLogger  # noqa: E402
 supervisor_agent = AGENTS["supervisor_agent"]
 
 # 创建 LLM 交互日志记录器，日志文件输出到项目根 logs/ 目录
-LOG_PATH = PROJECT_ROOT / "logs" / "llm_trace.log"
+LOG_PATH = PROJECT_ROOT / "logs" / "test_trace.log"
 llm_logger = LLMInteractionLogger(LOG_PATH, verbose=True)
 
 # 多轮记忆：同一个 thread_id 复用 MemorySaver 中的历史状态

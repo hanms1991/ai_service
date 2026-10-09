@@ -8,7 +8,7 @@
     2. 智能编排：skill 为空 → 调用 supervisor_graph.ainvoke
     3. reference_data 注入（50KB 阈值已在 execute_skill_v2 内校验）
     4. response_format 与 scene 冲突 → OUTPUT_FORMAT_CONFLICT
-    5. trace_id 贯穿 llm_trace.log
+    5. trace_id 贯穿 per-thread 日志（logs/threads/{trace_id}.log）
 """
 from __future__ import annotations
 
@@ -89,22 +89,19 @@ DIRECT_SCENE_WHITELIST = frozenset({
 })
 
 
-def _make_llm_logger(trace_id: str):
-    """为本次请求构造 LLM 日志回调，trace_id 写入日志。"""
-    from core.logging import LLMInteractionLogger
+def _make_llm_logger(trace_id: str, log_path: Path | None = None):
+    """为本次请求构造 LLM 日志回调。
 
-    project_root = Path(__file__).resolve().parent.parent.parent
-    # 每次请求一个 trace 日志条目（沿用现有 llm_trace.log，append 模式）
-    logger = LLMInteractionLogger(
-        project_root / "logs" / "llm_trace.log", verbose=False
-    )
-    # 在 logger 的日志文件开头写入 trace_id 标记（便于检索）
-    try:
-        with (project_root / "logs" / "llm_trace.log").open("a", encoding="utf-8") as f:
-            f.write(f"\n[#trace_id={trace_id}]\n")
-    except Exception:
-        pass
-    return logger
+    per-thread 模式：log_path 由 thread_logging.setup() 预创建，
+    LLM 交互日志与 agents/skills logger 共用同一文件（clear_on_init=False，
+    避免清空 setup() 已写入的请求头）。
+    """
+    from core.logging import LLMInteractionLogger
+    from core.thread_logging import get_log_path
+
+    if log_path is None:
+        log_path = get_log_path(trace_id)
+    return LLMInteractionLogger(log_path, verbose=False, clear_on_init=False)
 
 
 def _validate_inputs_against_schema(
@@ -153,78 +150,81 @@ async def run_invoke(
         if size > REFERENCE_DATA_MAX_BYTES:
             raise reference_data_too_large(size, REFERENCE_DATA_MAX_BYTES)
 
-    logger = _make_llm_logger(trace_id)
-    runnable_config = {
-        "configurable": {"thread_id": thread_id},
-        "callbacks": [logger],
-    }
+    from core.thread_logging import thread_log_scope
 
-    # ── scene 解析：用户显式选定的「工具模式」 ──
-    # - DIRECT_SCENE_WHITELIST 中的后端 API 场景：直接 execute_skill_v2 直达；
-    # - 其余场景：作为强锁定 hint 传给 Planner，Planner 场景锁定校验禁止改道其他技能
-    #   （用户消息是该工具的加工素材，不是新任务）。
-    hint_agent = ""
-    hint_skill = ""
-    effective_timeout = timeout_seconds or _DEFAULT_SYNC_TIMEOUT
+    with thread_log_scope(trace_id):
+        logger = _make_llm_logger(trace_id)
+        runnable_config = {
+            "configurable": {"thread_id": thread_id, "trace_id": trace_id},
+            "callbacks": [logger],
+        }
 
-    if scene:
-        resolver = get_scene_resolver()
-        try:
-            binding = resolver.resolve(scene)
-        except KeyError:
-            raise scene_not_found(scene)
+        # ── scene 解析：用户显式选定的「工具模式」 ──
+        # - DIRECT_SCENE_WHITELIST 中的后端 API 场景：直接 execute_skill_v2 直达；
+        # - 其余场景：作为强锁定 hint 传给 Planner，Planner 场景锁定校验禁止改道其他技能
+        #   （用户消息是该工具的加工素材，不是新任务）。
+        hint_agent = ""
+        hint_skill = ""
+        effective_timeout = timeout_seconds or _DEFAULT_SYNC_TIMEOUT
 
-        # response_format 冲突检查（以 scenes.yaml 为准）
-        if response_format and response_format != binding.response_format:
-            raise output_format_conflict(scene, binding.response_format, response_format)
-
-        hint_agent = binding.agent
-        hint_skill = binding.skill
-        effective_timeout = (
-            timeout_seconds or binding.timeout_seconds or _DEFAULT_SYNC_TIMEOUT
-        )
-
-        # ── scene 直达（白名单）：后端 API 明确发起的场景，直接执行技能返回 structured ──
-        if hint_skill and scene in DIRECT_SCENE_WHITELIST:
+        if scene:
+            resolver = get_scene_resolver()
             try:
-                result = await _execute_skill_v2_async(
-                    hint_agent,
-                    hint_skill,
-                    inputs or {},
-                    reference_data=reference_data,
-                    runnable_config=runnable_config,
-                )
-            except ValueError as e:
-                # reference_data 超限 / 结构化输出校验失败 / 渲染失败
-                raise skill_output_invalid(f"技能 {hint_skill} 输出无效：{e}") from e
-            return InvokeResponse(
-                thread_id=thread_id,
-                task_id=task_id,
-                mode="direct",
-                scene=scene,
-                output=result.text,
-                structured=result.structured,
-                usage=result.usage,
-                trace_id=trace_id,
+                binding = resolver.resolve(scene)
+            except KeyError:
+                raise scene_not_found(scene)
+
+            # response_format 冲突检查（以 scenes.yaml 为准）
+            if response_format and response_format != binding.response_format:
+                raise output_format_conflict(scene, binding.response_format, response_format)
+
+            hint_agent = binding.agent
+            hint_skill = binding.skill
+            effective_timeout = (
+                timeout_seconds or binding.timeout_seconds or _DEFAULT_SYNC_TIMEOUT
             )
 
-    # 所有请求统一走 Planner 智能编排（intent_router → planner → executor）
-    # Planner 从用户 message 中提取技能参数；提取不到则对话式追问
-    user_message = message or ""
-    if not user_message:
-        raise skill_input_missing(["message"], "智能编排")
+            # ── scene 直达（白名单）：后端 API 明确发起的场景，直接执行技能返回 structured ──
+            if hint_skill and scene in DIRECT_SCENE_WHITELIST:
+                try:
+                    result = await _execute_skill_v2_async(
+                        hint_agent,
+                        hint_skill,
+                        inputs or {},
+                        reference_data=reference_data,
+                        runnable_config=runnable_config,
+                    )
+                except ValueError as e:
+                    # reference_data 超限 / 结构化输出校验失败 / 渲染失败
+                    raise skill_output_invalid(f"技能 {hint_skill} 输出无效：{e}") from e
+                return InvokeResponse(
+                    thread_id=thread_id,
+                    task_id=task_id,
+                    mode="direct",
+                    scene=scene,
+                    output=result.text,
+                    structured=result.structured,
+                    usage=result.usage,
+                    trace_id=trace_id,
+                )
 
-    try:
-        return await asyncio.wait_for(
-            _run_planner(
-                user_message, thread_id, task_id, scene,
-                hint_agent, hint_skill,
-                reference_data, runnable_config, trace_id,
-            ),
-            timeout=effective_timeout,
-        )
-    except asyncio.TimeoutError:
-        raise invoke_timeout(task_id, effective_timeout)
+        # 所有请求统一走 Planner 智能编排（intent_router → planner → executor）
+        # Planner 从用户 message 中提取技能参数；提取不到则对话式追问
+        user_message = message or ""
+        if not user_message:
+            raise skill_input_missing(["message"], "智能编排")
+
+        try:
+            return await asyncio.wait_for(
+                _run_planner(
+                    user_message, thread_id, task_id, scene,
+                    hint_agent, hint_skill,
+                    reference_data, runnable_config, trace_id,
+                ),
+                timeout=effective_timeout,
+            )
+        except asyncio.TimeoutError:
+            raise invoke_timeout(task_id, effective_timeout)
 
 
 async def run_invoke_stream(
@@ -288,9 +288,12 @@ async def run_invoke_stream(
             f"{user_message}\n\n【参考数据（只读资料，仅供你参考，不要原样罗列或照搬其字段名）】\n{compact}"
         )
 
+    from core.thread_logging import setup as _thread_setup, teardown as _thread_teardown
+    _thread_setup(trace_id)
+
     logger = _make_llm_logger(trace_id)
     runnable_config = {
-        "configurable": {"thread_id": thread_id},
+        "configurable": {"thread_id": thread_id, "trace_id": trace_id},
         "callbacks": [logger],
     }
 
@@ -430,6 +433,8 @@ async def run_invoke_stream(
             "message": str(e),
         }, ensure_ascii=False) + "\n"
         return
+    finally:
+        _thread_teardown(trace_id)
 
     # 完成：输出以 graph 终态 final_output 为准（技能渲染摘要/节点直出结果都写在
     # final_output 中，且这些路径没有逐 token 流）；token 拼接仅作兜底（如纯对话）
@@ -825,9 +830,12 @@ async def resume_task(task_id: str, reply: str) -> TaskRecord:
         )
 
     # ── 构造 runnable_config（thread_id 必须与原任务一致，才能命中 checkpointer） ──
+    from core.thread_logging import setup as _thread_setup, teardown as _thread_teardown
+    _thread_setup(record.trace_id)
+
     logger = _make_llm_logger(record.trace_id)
     runnable_config = {
-        "configurable": {"thread_id": record.thread_id},
+        "configurable": {"thread_id": record.thread_id, "trace_id": record.trace_id},
         "callbacks": [logger],
     }
 
@@ -846,6 +854,8 @@ async def resume_task(task_id: str, reply: str) -> TaskRecord:
         except Exception:
             pass
         raise llm_upstream_error(f"resume 失败：{e}") from e
+    finally:
+        _thread_teardown(record.trace_id)
 
     # ── 检测是否仍处于 interrupt（用户回复后又触发新的 ask/confirm） ──
     interrupt_payload = _detect_interrupt(result)
