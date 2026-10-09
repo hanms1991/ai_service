@@ -191,14 +191,23 @@ def _invoke_declarative(adapter: dict, params: dict, ctx) -> tuple[list, dict, s
             if isinstance(vals, str):
                 vals = [vals]
             match_values = [str(v).strip() for v in vals if v]
+        # 迭代检索时按轮次分别匹配：本轮召回的块只用本轮迭代值过滤，避免
+        # A 功能的块因文本含 B 功能名而穿过 B 轮过滤（跨迭代污染）；
+        # 显式声明 match_value_from 时保持并集语义不变。
+        per_iteration = bool(iterate_param) and not filter_cfg.get("match_value_from")
         filtered = []
         for c in all_chunks:
             if not isinstance(c, dict):
                 continue
             meta = c.get("meta") or {}
             content = str(c.get("content") or "")
+            chunk_values = match_values
+            if per_iteration:
+                it_val = str(c.get("_iterate_value") or "").strip()
+                if it_val:
+                    chunk_values = [it_val]
             kept = False
-            for match_val in match_values:
+            for match_val in chunk_values:
                 if not match_val:
                     continue
                 for field_cfg in match_any:
@@ -253,6 +262,10 @@ def _invoke_declarative(adapter: dict, params: dict, ctx) -> tuple[list, dict, s
         deduped: list[dict] = []
         for r in records:
             val = str(r.get(dedup_field, "") or "")
+            # 无去重键的记录不参与去重：避免空键互相吞掉（如 meta 缺 failure_id 的旧数据）
+            if not val:
+                deduped.append(r)
+                continue
             if val in seen:
                 continue
             seen.add(val)

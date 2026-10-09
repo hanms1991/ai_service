@@ -15,13 +15,14 @@ adapters:
         - field: content
     extract:
       meta:
+        失效模式编号: failure_id
         失效词: failure_type
         来源: source.file
-    dedup_by: null
+    dedup_by: 失效模式编号
     attach_param_value_to: 功能
     raw_content_field: 内容
-    summary_columns: [功能, 失效词, 来源]
-    output_columns: [功能, 失效词, 来源, 内容]
+    summary_columns: [功能, 失效模式编号, 失效词, 来源]
+    output_columns: [功能, 失效模式编号, 失效词, 来源, 内容]
     render_format: tiered
 
   - domain: functional_safety
