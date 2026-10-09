@@ -159,7 +159,7 @@ def executor_node(
                 f"[executor] 技能 {skill_name} 缺少必填输入 {missing}，"
                 f"转为对话式澄清（Planner 预校验漏网兜底）"
             )
-            output = _self_handle(clarify_task, config)
+            output = _self_handle(clarify_task, config, history=state.get("messages", []))
         else:
             from agents.capability_registry import SkillInputError
 
@@ -183,7 +183,7 @@ def executor_node(
                     "请用户重新上传相关项定义文档（docx/xlsx/pdf），或直接用文字描述分析对象的"
                     "范围、功能与边界后重试。不要提及任何内部执行机制。"
                 )
-                output = _self_handle(clarify_task, config)
+                output = _self_handle(clarify_task, config, history=state.get("messages", []))
             except Exception as e:  # noqa: BLE001 - 执行链最后防线，避免请求 500
                 print(f"[executor] 技能 {skill_name} 执行失败：{type(e).__name__}: {e}")
                 traceback.print_exc()
@@ -201,13 +201,13 @@ def executor_node(
                     "2）用文字补充更明确的相关项范围/功能描述后重试。"
                     f"内部错误摘要（不要原样转述技术细节）：{str(e)[:200]}"
                 )
-                output = _self_handle(failure_task, config)
+                output = _self_handle(failure_task, config, history=state.get("messages", []))
     elif tool_name:
         # 指定了 tool 但未指定 skill：交给 worker agent 通用对话
         output = _call_worker(tool_name, resolved_input, config)
     else:
-        # tool 也为空：中枢自处理闲聊/通用问答
-        output = _self_handle(resolved_input, config)
+        # tool 也为空：中枢自处理闲聊/通用问答（传入对话历史承接多轮上下文）
+        output = _self_handle(resolved_input, config, history=state.get("messages", []))
 
     # 更新状态
     new_results = {**state.get("results", {}), output_key: output}

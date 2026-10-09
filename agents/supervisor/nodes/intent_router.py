@@ -118,7 +118,8 @@ def chat_node(state: SupervisorState, config=None) -> dict:
     messages = state.get("messages", [])
     user_msg = messages[-1].content if messages and hasattr(messages[-1], "content") else ""
 
-    output = _self_handle(user_msg, config)
+    # 传入完整对话历史以承接多轮上下文；user_msg 与末条历史同源，_self_handle 内部自动去重
+    output = _self_handle(user_msg, config, history=messages)
 
     return {
         "final_output": output,

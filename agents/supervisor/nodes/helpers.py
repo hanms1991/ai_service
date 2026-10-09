@@ -60,13 +60,22 @@ def _call_worker(tool_name: str, task: str, runnable_config=None) -> str:
     return result["messages"][-1].content
 
 
-def _self_handle(task: str, runnable_config=None) -> str:
-    """中枢自行处理闲聊/通用问答：用核心模型直接回答，不派给 worker agent。"""
+def _self_handle(task: str, runnable_config=None, history: list | None = None) -> str:
+    """中枢自行处理闲聊/通用问答：用核心模型直接回答，不派给 worker agent。
+
+    history: 对话历史（BaseMessage 列表），用于多轮上下文承接；不传保持原单轮行为。
+             若 task 与末条历史消息逐字相同（如 planner 原文透传用户消息），
+             自动排除该条，避免同一内容在历史与当前输入中重复出现。
+    """
     invoke_kwargs = {}
     if runnable_config is not None:
         invoke_kwargs["config"] = runnable_config
-    response = model.invoke(
-        [SystemMessage(content=_load_self_handle_prompt()), HumanMessage(content=task)],
-        **invoke_kwargs,
-    )
+    messages = [SystemMessage(content=_load_self_handle_prompt())]
+    if history:
+        last = getattr(history[-1], "content", None)
+        if isinstance(last, str) and last.strip() == task.strip():
+            history = history[:-1]
+        messages.extend(history)
+    messages.append(HumanMessage(content=task))
+    response = model.invoke(messages, **invoke_kwargs)
     return response.content

@@ -54,6 +54,7 @@ template: |
      - 用户消息中若出现 32 位十六进制文件标识（file_id，通常伴随"我上传的文档/文件"等表述），
        必须原样提取（不截断、不改写、不加引号外字符）填入技能对应的 file_id 输入。
   3. 至少一个步骤的 is_final 为 true；引用前序结果一律用 ${output_key} 格式。
+     ${output_key} 只允许引用当前计划中已定义步骤的 output_key，禁止引用上一轮计划的 output_key（如 ${result_1}）。
   4. 技能风险=high 时必须用 confirm 模式；风险=low 直接执行。
   5. 不要自己编造业务内容，所有产出必须通过 tool（含 skill 或通用对话）或 compose 拼装完成。
   {scene_hint}

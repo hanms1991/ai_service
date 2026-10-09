@@ -1,15 +1,53 @@
-# 知识库检索适配器声明（knowledge_lookup 技能自管，不侵入域技能）
-# 新增域/查询类型 = 加一行声明 + 加一个适配器模块，不改其他文件
+# 知识库检索适配器声明（knowledge_lookup 技能自管，纯声明式，不写 Python）
+# 新增查询类型 = 加一段 YAML，不改任何代码
 adapters:
   - domain: functional_safety
     query_type: failure_mode
-    module: scripts/adapters/functional_safety.py
-    function: query_failure_modes
     kb_domain: 功能安全
-    params:
-      - name: functions
-        type: array
-        required: true
-        desc: 功能名列表，如 ["滑行能量回收", "制动能量回收"]
-    description: 按功能名检索历史失效模式（含失效词、失效行为、整车危害）
-    output_columns: [功能, 失效词, 失效行为, 整车危害]
+    retrieval:
+      query_template: "{value} 失效模式"
+      iterate_param: functions
+      layer: failure_mode
+      top_k: 20
+    filter:
+      match_any:
+        - field: meta.func
+        - field: content
+    extract:
+      meta:
+        失效词: failure_type
+        来源: source.file
+    dedup_by: null
+    attach_param_value_to: 功能
+    raw_content_field: 内容
+    summary_columns: [功能, 失效词, 来源]
+    output_columns: [功能, 失效词, 来源, 内容]
+    render_format: tiered
+
+  - domain: functional_safety
+    query_type: safety_goal
+    kb_domain: 功能安全
+    retrieval:
+      query: "安全目标"
+      layer: safety_goal
+      top_k: 50
+    extract:
+      meta:
+        整车安全目标ID: vsg_id
+        ASIL: asil
+        来源: source.file
+    dedup_by: 整车安全目标ID
+    raw_content_field: 内容
+    filter:
+      field: 整车安全目标ID
+      prefix_map:
+        动力域: [P, PT, PW]
+        底盘域: [C, CB, CS, CH]
+        车身域: [B, BD]
+        AD域: [A, AD]
+        座舱域: [CP, CK]
+      filter_param: domain_area
+      fallback_all: true
+    summary_columns: [整车安全目标ID, ASIL, 来源]
+    output_columns: [整车安全目标ID, ASIL, 来源, 内容]
+    render_format: tiered
