@@ -9,6 +9,7 @@ adapters:
       iterate_param: functions
       layer: failure_mode
       top_k: 20
+      keywords_template: "{value}"
     filter:
       match_any:
         - field: meta.func

@@ -12,9 +12,12 @@ template: |
 
   执行计划模式说明：
   - single:   单步执行。选定 tool+skill 一步完成任务，is_final=true；
-              若只需该 Agent 通用对话（如功能简介、常识问答），省略 skill，把用户意图写入 input 字段即可
+              若只需该 Agent 通用对话（如功能简介、常识问答），省略 skill，把用户意图写入 input 字段即可；
+              多步计划中需要中枢 LLM 整理/总结/格式化前序结果时，也用 single + tool="" + skill=""，
+              把指令和 ${output_key} 引用写入 input，由 self_handle LLM 处理后回复用户
   - chain:    链式执行，前一步输出作为下一步技能输入（inputs 的值用 ${output_key} 引用）
-  - compose:  组合多个步骤的输出为最终结果（不调 worker，tool 与 skill 留空，is_final=true）；
+  - compose:  纯文本拼装，不调 LLM。tool 与 skill 留空，is_final=true；
+              仅用于直接透传前序结果给用户（如拼接多段文本），不做任何加工整理；
               在 input 中写含 ${output_key} 的拼装模板，或在 inputs 中按展示顺序给出各 ${output_key} 引用
   - ask:      （已废弃，禁止使用）参数缺失时改用 single 模式 + tool="" + skill="" 对话式追问
   - confirm:  高风险操作（技能风险=high），暂停等待人工确认后才执行（is_final=false）
@@ -56,6 +59,10 @@ template: |
   3. 至少一个步骤的 is_final 为 true；引用前序结果一律用 ${output_key} 格式。
      ${output_key} 只允许引用当前计划中已定义步骤的 output_key，禁止引用上一轮计划的 output_key（如 ${result_1}）。
   4. 技能风险=high 时必须用 confirm 模式；风险=low 直接执行。
-  5. 不要自己编造业务内容，所有产出必须通过 tool（含 skill 或通用对话）或 compose 拼装完成。
+  5. 不要自己编造业务内容，所有产出必须通过 tool（含 skill 或通用对话）或 self_handle 处理完成。
+  6. 多步计划中，后续步骤需要 LLM 加工前序结果（整理、总结、格式化、分析）时，
+     必须用 mode="single" + tool="" + skill="" + is_final=true，把指令和 ${output_key} 写入 input，
+     由 self_handle LLM 处理后回复用户。
+     禁止用 mode="compose" 替代——compose 不调 LLM，只做纯文本替换，无法理解或加工内容。
   {scene_hint}
   {extra_instructions}

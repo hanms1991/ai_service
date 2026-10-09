@@ -161,6 +161,7 @@ def _invoke_declarative(adapter: dict, params: dict, ctx) -> tuple[list, dict, s
     all_chunks: list = []
 
     iterate_param = retrieval_cfg.get("iterate_param")
+    keywords_tpl = retrieval_cfg.get("keywords_template")
     if iterate_param:
         values = params.get(iterate_param) or []
         if isinstance(values, str):
@@ -171,14 +172,22 @@ def _invoke_declarative(adapter: dict, params: dict, ctx) -> tuple[list, dict, s
             if not val:
                 continue
             query = query_tpl.replace("{value}", val)
-            chunks = _safe_retrieve(retrieve, kb_domain, query, retrieval_cfg)
+            # 迭代模式下 keywords 从模板生成，确保精确匹配本轮功能名
+            kw: list[str] | None = None
+            if keywords_tpl:
+                kw = [keywords_tpl.replace("{value}", val)]
+            chunks = _safe_retrieve(retrieve, kb_domain, query, retrieval_cfg, keywords=kw)
             for c in chunks:
                 if isinstance(c, dict):
                     c.setdefault("_iterate_value", val)
             all_chunks.extend(chunks)
     else:
         query = retrieval_cfg.get("query", "")
-        all_chunks = _safe_retrieve(retrieve, kb_domain, query, retrieval_cfg)
+        # 非迭代模式：keywords_template 无 {value} 占位时按静态关键词使用
+        kw: list[str] | None = None
+        if keywords_tpl and "{value}" not in keywords_tpl:
+            kw = [keywords_tpl]
+        all_chunks = _safe_retrieve(retrieve, kb_domain, query, retrieval_cfg, keywords=kw)
 
     # ─── ② 过滤（match_any 机制）─────────────
     filter_cfg = adapter.get("filter") or {}
@@ -291,12 +300,23 @@ def _invoke_declarative(adapter: dict, params: dict, ctx) -> tuple[list, dict, s
     return records, {}, note
 
 
-def _safe_retrieve(retrieve, domain: str, query: str, retrieval_cfg: dict) -> list:
+def _safe_retrieve(retrieve, domain: str, query: str, retrieval_cfg: dict,
+                   *, keywords: list[str] | None = None) -> list:
     """安全检索，异常时降级返回空。"""
     layer = retrieval_cfg.get("layer")
     top_k = retrieval_cfg.get("top_k", 20)
+    fetch_k = retrieval_cfg.get("fetch_k")
+    chunk_filter = retrieval_cfg.get("chunk_filter")
+    extra: dict = {}
+    if fetch_k is not None:
+        extra["fetch_k"] = int(fetch_k)
+    if chunk_filter:
+        extra["chunk_filter"] = chunk_filter
+    if keywords:
+        extra["keywords"] = keywords
     try:
-        return retrieve(domain, query, top_k=top_k, layer=layer) or []
+        return retrieve(domain, query, top_k=top_k, layer=layer, **extra) or []
     except Exception as exc:
-        logger.warning("[knowledge_lookup] 检索降级（query=%s layer=%s）：%s", query, layer, exc)
+        logger.warning("[knowledge_lookup] 检索降级（query=%s layer=%s keywords=%s）：%s",
+                        query, layer, keywords, exc)
         return []

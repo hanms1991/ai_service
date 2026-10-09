@@ -242,14 +242,25 @@ def retrieve_knowledge(
     query: str,
     *,
     top_k: int | None = None,
+    fetch_k: int | None = None,
     score_threshold: float | None = None,
     meta_filter: dict[str, Any] | None = None,
     layer: str | None = None,
+    layers: list[str] | None = None,
+    chunk_filter: dict[str, Any] | None = None,
+    keywords: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """检索指定领域的知识库，返回分块列表（content/score/filename/meta）。
 
-    layer：可选的分块级分层过滤（meta.layer）。auto-kb 的 meta_filter 只过滤
-    文档级元数据，分块级 layer 由本函数在客户端过滤（不增加服务端改动）。
+    layer/layers：可选的分块级分层过滤（meta.layer）。服务端支持 layers 参数时
+    直接在服务端过滤，释放 top_k 名额；layer 单值会自动转为 layers=[layer]。
+
+    keywords：可选的关键词列表，服务端对 content 做 ILIKE 子串精确匹配，
+    命中块以 score=1.0 注入候选池，不受向量 top_k 截断影响。
+
+    chunk_filter：可选的分块级元数据等值过滤（JSONB @> 包含匹配）。
+
+    fetch_k：可选的 SQL 召回池宽度（默认由服务端决定），上限 200。
 
     软降级承诺：任何失败（功能未启用、query 为空、库名不可解析、网络异常、
     响应格式异常）都返回 [] 并记 warning 日志，绝不抛异常阻断技能执行。
@@ -289,6 +300,20 @@ def retrieve_knowledge(
             body["score_threshold"] = float(score_threshold)
         if meta_filter:
             body["meta_filter"] = meta_filter
+        if fetch_k is not None:
+            body["fetch_k"] = int(fetch_k)
+        if chunk_filter:
+            body["chunk_filter"] = chunk_filter
+        # layer 单值自动转为 layers 列表
+        server_layers: list[str] | None = None
+        if layers:
+            server_layers = [str(l) for l in layers if l]
+        elif layer:
+            server_layers = [layer]
+        if server_layers:
+            body["layers"] = server_layers
+        if keywords:
+            body["keywords"] = [str(k) for k in keywords if k]
 
         resp = httpx.post(
             f"{_service_base_url()}/api/retrieve",
@@ -304,20 +329,22 @@ def retrieve_knowledge(
                              note="服务端返回非列表")
             return []
         server_count = len(chunks)
-        if layer:
-            # 分块级 layer 客户端过滤（auto-kb 的 meta_filter 仅过滤文档级元数据）
+        # 服务端 layers 过滤生效时跳过客户端过滤；仅当服务端未收到 layers 时才做客户端兜底
+        if layer and not server_layers:
             chunks = [
                 c for c in chunks
                 if str((c.get("meta") or {}).get("layer") or "") == layer
             ]
         logger.info(
-            "[kb_client] 知识检索命中 %d 块（domain=%s，layer=%s，query=%r）",
+            "[kb_client] 知识检索命中 %d 块（domain=%s，layer=%s，query=%r，keywords=%s）",
             len(chunks), domain, layer or "-", query[:50],
+            body.get("keywords", "-"),
         )
         _audit_retrieval(
             domain, query, layer=layer, kb_ids=kb_ids, chunks=chunks,
             note=f"top_k={body['top_k']} threshold={body.get('score_threshold', '-')}"
-                 + (f"，layer 过滤前 {server_count} 块" if layer else ""),
+                 + (f"，keywords={body.get('keywords')}" if body.get("keywords") else "")
+                 + (f"，layer 过滤前 {server_count} 块" if layer and not server_layers else ""),
         )
         return chunks
     except Exception as exc:  # noqa: BLE001 —— 软降级兜底，见 docstring
