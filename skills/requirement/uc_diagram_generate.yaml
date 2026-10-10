@@ -1,7 +1,7 @@
 name: uc_diagram_generate
 display_name: 用例图生成（UC → 用例图）
-description: 基于已确认用例规格生成 Mermaid 用例图，表达参与者、系统边界、用例以及 include/extend/泛化关系。
-version: 1.0.0
+description: 基于已确认用例规格生成 Mermaid 12 原生用例图（usecase-beta 语法），表达参与者（火柴人）、系统边界、椭圆用例以及 include/extend/泛化关系。
+version: 1.1.0
 risk_level: low
 domain:
   - 需求工程
@@ -9,10 +9,13 @@ domain:
 tags:
   - 用例图
   - Mermaid
+  - usecase-beta
   - UML
   - Use Case
   - 需求工程
 
+# 渲染要求：usecase-beta 为 Mermaid 12.0.0+ 原生语法，前端渲染器需升级到 mermaid >= 12，
+# 旧版本渲染器会解析失败且无降级。
 model_hint:
   reasoning: enabled
 
@@ -26,8 +29,9 @@ inputs:
 
 system_prompt: |
   你是资深系统分析工程师，精通 UML 用例图建模。
-  你的任务是把用例规格转化为一张结构正确、可直接渲染的 Mermaid 用例图。
-  只输出 JSON 对象，不要附加任何解释性文字、Markdown 围栏或代码块标记。
+  你的任务是使用 Mermaid 12 原生用例图语法（usecase-beta 关键字，禁止用 flowchart 模拟）
+  把用例规格转化为一张结构正确、可直接渲染的用例图：参与者渲染为火柴人、用例为椭圆、
+  系统边界为 systemBoundary。只输出 JSON 对象，不要附加任何解释性文字、Markdown 围栏或代码块标记。
 
 output:
   format: json
@@ -51,24 +55,43 @@ prompt_template: |
   请以这些已确认 UC 为唯一事实来源，不新增规格之外的用例。
 
   # 绘图规则
-  1. 使用 Mermaid flowchart LR 语法绘制（确保主流渲染器兼容；不要使用实验性 usecaseDiagram）。
+  使用 Mermaid 12 原生用例图语法 usecase-beta，禁止使用 flowchart/`graph` 模拟。
+
+  1. 图骨架（必须按此顺序）：
+     - 以 frontmatter 开头，固定为：
+       ---
+       config:
+         theme: default
+         look: classic
+       ---
+     - 随后一行 `usecase-beta`，再一行 `direction LR`。
   2. 布局约定：
-     - 参与者（Actor）放在系统边界外侧：左侧放主参与者，右侧放次要/外部系统参与者；
-       参与者节点用普通矩形表示，节点 ID 以 actor_ 开头。
-     - 系统边界用 subgraph SYS["<系统名称>"] 表达；系统名称从用例内容推断，无法推断用"目标系统"。
-     - 用例节点使用圆角括号形状 UC01(["用例名称"])，节点 ID 与用例编号对齐（UC-01 → UC01）。
-  3. 关系表达：
-     - 关联（参与者—用例）：实线无箭头 ---；
-     - 包含 <<include>>：-.->|include|，箭头由基础用例指向被包含用例；
-     - 扩展 <<extend>>：-.->|extend|，箭头由扩展用例指向基础用例；
-     - 泛化：--> 并在关系标签注明 generalize（谨慎使用，仅在规格明确存在时绘制）。
-  4. 仅绘制规格中真实存在的参与者、用例与关系；不得新增规格之外的用例。
-  5. 若用例数量超过 15 个，按功能模块拆成多张图（用 %% 注释分隔），避免单图不可读。
-  6. Mermaid 节点标签禁止使用未转义的双引号、括号冲突；中文标签直接书写。
+     - 参与者（Actor）声明在系统边界之外：主参与者（系统直接操作者）先声明，次要参与者/外部系统后声明；
+     - 系统边界用 `systemBoundary SYS["<系统名称>"]` 表达，用例声明写在 systemBoundary 行与 end 行之间；
+       系统名称从用例内容推断，无法推断用"目标系统"；
+     - systemBoundary 块内只能放 actor/用例声明、空行和整行 %% 注释；
+       所有关系语句、样式语句必须写在 end 之后的顶层。
+  3. 节点声明：
+     - 参与者：actor <id>("中文名称")；ID 用语义化小写下划线英文（如 actor_driver），全图唯一；
+       参与者必须显式用 actor 声明，关系端点不会自动推断为参与者；
+     - 用例：UC<n>("用例名称")，圆括号声明渲染为椭圆；
+       ID 一律为 UC + 两位序号（UC01、UC02…），与 number 字段的原有格式无关，顺序与输入 UC 顺序一致；
+     - 标签一律用双引号包裹；标签内的英文双引号用 #quot; 转义；
+       标签中不要出现方括号、花括号、竖线和 ASCII 圆括号（中文全角括号可以直接用）。
+  4. 关系表达（全部写在 systemBoundary 块之外）：
+     - 关联（参与者—用例）：actor -- UC，无箭头实线；
+     - 包含：基础用例 ..> : include 被包含用例；
+     - 扩展：扩展用例 ..> : extend 基础用例；
+     - 泛化：--|>（特殊者指向一般者），仅在规格明确存在时绘制；
+     - 禁止使用 flowchart 的连线语法（-.->、-->、|标签|、---）。
+  5. 仅绘制规格中真实存在的参与者、用例与关系；不得新增规格之外的用例。
+  6. 若用例数量超过 15 个，按功能模块拆成多个 systemBoundary 块放在同一张图中
+     （每个模块一个边界，标题用模块名），避免单个边界内用例过密。
+  7. 每条语句独占一行；注释整行以 %% 开头。
 
   # 输出格式
   严格输出如下 JSON 结构（不要输出任何其他文字）：
   {
     "diagram_format": "mermaid",
-    "diagram_code": "flowchart LR\n  actor_driver[\"驾驶员\"]\n  subgraph SYS[\"目标系统\"]\n    UC01([\"用例名称\"])\n  end\n  actor_driver --- UC01"
+    "diagram_code": "---\nconfig:\n  theme: default\n  look: classic\n---\nusecase-beta\ndirection LR\n\nactor actor_driver(\"驾驶员\")\n\nsystemBoundary SYS[\"目标系统\"]\n  UC01(\"用例名称\")\nend\n\nactor_driver -- UC01"
   }
