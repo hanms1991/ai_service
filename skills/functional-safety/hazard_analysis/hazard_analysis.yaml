@@ -1,7 +1,7 @@
 name: hazard_analysis
 display_name: 功能安全危害分析（HARA）
 description: 基于相关项定义文档或功能/系统描述，按 ISO 26262 与团队标准模板完成整车功能枚举、11 个失效词过滤、充分场景 HAZOP 展开与逐场景 S/E/C 评级，产出 11-Sheet 团队标准 HARA 工作簿（xlsx），历史项目条目优先沿用并在备注列标注来源。
-version: 3.1.0
+version: 4.0.0
 risk_level: medium
 domain:
   - 功能安全
@@ -53,93 +53,72 @@ document_source:
   file_id_input: file_id
 
 # ────────────────────────────────────────────────────────────────────
-# 执行模式：map_reduce 三阶段
-#   prepare（技能脚本 hara_prepare.py）：识别相关项与整车功能清单 → 按功能精准检索
-#   plan（1 次）：相关项/功能/失效矩阵/HAZOP 条目（含充分场景清单）
-#   map （N 次并发）：逐失效单元对完整场景清单做 S/E/C 评级，事件挂回切片
-# 切片即规划输出的 hazop_items；合并后经 schema 校验 → 确定性渲染器出 xlsx。
+# 执行模式：pipeline 线性管道（单一 run 入口，管道脚本自行驱动 LLM 与检索）
+#   Step 1 identify        识别相关项与整车功能清单
+#   Step 2 function_match  KB 功能清单候选 → LLM 判断沿用/改编/新增 → 物化
+#   Step 3 fm_match        KB 失效模式候选 × 11 失效词 → LLM 判断 → 物化
+#   Step 4 event_match     KB 事件候选 → LLM 判断（reused 只给 ref_id）→ 物化（切片并行）
+#   Step 5 sg_consolidate  事件安全目标提取 + KB 参考 → LLM 合并 → 整车安全目标
+#   Step 6 render          管道合并 01~05 JSON → 引擎 schema 校验 → 确定性渲染器出 xlsx
+# 级联检索：每步检索参数来自上一步物化输出（KB 功能名）；差异化召回量由
+# 管道脚本内置（function_list 10 / failure_mode 20/功能 / hara_event 50/功能）。
+# 每步产物存临时 JSON（01~05），可调试、可断点续跑。
 # ────────────────────────────────────────────────────────────────────
 execution:
-  mode: map_reduce
-  # 技能侧前置钩子（识别整车功能 → 功能级精准检索历史库）：
-  # 引擎只加载 script/entrypoint；prepare 段内其余配置由 hara_prepare.py 自行解释。
-  # 钩子失败/零命中时引擎自动回退 item_definition 或文档头部粗召回，不阻断执行。
-  prepare:
-    script: scripts/hara_prepare.py
-    entrypoint: prepare
+  mode: pipeline
+  pipeline:
+    script: scripts/hara_pipeline.py
+    entrypoint: run
+    # 以下阶段配置由管道脚本自行解释（引擎不读取）
     identify:
-      enabled: true
       system_prompt:
         file: stage_identify.md
       # 识别阶段只需域前缀映射，不加载场景库/评级规则等方法论
       references:
         - references/domain_prefixes.md
       max_tokens: 4096
-  plan:
-    system_prompt:
-      file: stage_plan.md
-    max_tokens: 32768
-    # 规划后处理钩子（复用 prepare.script 同模块，入口 fix_plan_items）——
-    # 2 步物化回填：失效模式按 ref_id 物化 mb/vh；场景按 history_ref 物化 scene_text；
-    # ref_id 无效降级保留 LLM 文本。纯代码不调 LLM，异常软降级保留规划层原输出。
-    postprocess_entrypoint: fix_plan_items
-  map:
-    system_prompt:
-      file: stage_rate.md
-    slice_path: hazop_items
-    events_key: events
-    max_workers: 3
-    max_tokens: 16384
-    # 每切片历史事件检索钩子（复用 prepare.script 同模块，默认入口 retrieve_map）：
-    # 按「整车功能+失效词」调 hara_event 适配器召回候选事件并包装为结构化 chunk；
-    # 钩子异常/未声明时引擎回退通用单路检索（knowledge.map_layer/map_top_k）。
-    retrieve_entrypoint: retrieve_map
-    query_fields: [word, malfunction_behavior, vehicle_hazard]
-    user_instruction: >-
-      以下是一个「功能失效单元」，其中 scenarios 给出该失效需要分析的场景清单。
-      请按系统提示词的「场景并集」规则处理：先对清单中每个场景输出一条 HARA 事件，
-      再把候选清单中同功能同失效、清单缺失的候选事件补录为 reused 事件，
-      实质相同场景去重；只输出 JSON 对象。
-    # 评审钩子（复用 prepare.script 同模块）：物化回填 + 安全目标缺口补全（删除 source 比对）——
-    # ① reused/adapted 事件按 ref_id 从知识库原文物化回填全字段（仅在有历史召回时）；
-    # ② 按 S/E/C 矩阵确定性反算 ASIL，ASIL≥A 的显著事件缺 sg_text/safe_state/
-    #   ftti 时，连同同切片邻近事件回炉大模型补全一次（与历史召回无关，始终执行）；
-    # 代码不改标/评级，补全采用字段白名单，异常软降级保留原评级结果；
-    # 仍缺的条目由渲染器标黄并在交付摘要中提示人工补全。
-    review_entrypoint: review_events
-    review:
+    function_match:
       system_prompt:
-        file: stage_review.md
+        file: stage_function_match.md
+      references:
+        - references/domain_prefixes.md
+      max_tokens: 8192
+    failure_mode_match:
+      system_prompt:
+        file: stage_failure_mode_match.md
+      references:
+        - references/domain_prefixes.md
       max_tokens: 16384
+    event_match:
+      system_prompt:
+        file: stage_rate.md
+      max_tokens: 16384
+      max_workers: 3
+      user_instruction: >-
+        以下是一个「功能失效单元」及其历史 HARA 事件候选清单。请按系统提示词输出
+        该失效单元的完整危害事件集合：候选事件逐条判断沿用（reused，只抄 ref_id，
+        评级留空由系统物化回填）/改编（adapted，填差异字段与完整评级），候选缺失的
+        场景新增（new，完整评级）；实质相同场景去重。只输出 JSON 对象。
+    sg_consolidate:
+      system_prompt:
+        file: stage_sg_consolidate.md
+      references:
+        - references/sec_rating_rules.md
+      max_tokens: 8192
 
 # ────────────────────────────────────────────────────────────────────
 # 知识库注入（auto-kb 历史项目参考，服务地址见 agents/configs/knowledge.yaml；
-# base_url 留空或服务不可达时自动跳过，不阻断执行）：
-#   prepare 钩子（hara_prepare.py）：按识别出的整车功能，四路调 retrieval_service
-#     适配器（function_list/failure_mode/hara_event/safety_goal）获取结构化候选
-#     JSON 注入规划层，每条带 ref_id，供 LLM 逐条判断沿用/改编/新增；
-#   回退粗召回：一次大召回（plan_top_k），按 meta.layer 四层分组注入；
-#   评级层：retrieve_map 钩子按「功能+失效词」调 hara_event 适配器召回
-#     候选事件 chunk（map_event_top_k），去重后封顶 map_event_cap；
-#     钩子未启用时退化为单路 map_top_k。
+# base_url 空或服务不可达时 ctx.retrieve_knowledge 由 kb_client 软降级返回空，
+# 管道对应步骤自动退化为全新增，不阻断执行）：
+#   管道脚本 hara_pipeline.py 按步骤调 retrieval_service 适配器：
+#     function_list / failure_mode / hara_event / safety_goal 四层结构化候选，
+#     每条带 ref_id/kb_id，供 LLM 逐条判断沿用/改编/新增。
 # 历史 HARA xlsx 导入 auto-kb 时须按这四层标注 meta.layer。
 # ────────────────────────────────────────────────────────────────────
 knowledge:
   domain: 功能安全
-  # query_from 仅作用于引擎粗召回兜底路径（prepare 钩子失败/零命中时的一次性
-  # 大召回）：取 inputs[query_from] 构造 query，为空时降级用文档正文前 500 字符。
-  # HARA 主路径（prepare 钩子）检索用的是识别出的整车功能名，不依赖此键。
-  query_from: item_definition
-  top_k: 5
   score_threshold: 0.3
-  prepare_event_recall: true
-  plan_top_k: 40
   layers: [function_list, failure_mode, hara_event, safety_goal]
-  map_layer: hara_event
-  map_top_k: 8
-  map_event_top_k: 20
-  map_event_cap: 45
-  retrieve_workers: 8
 
 # ────────────────────────────────────────────────────────────────────
 # 方法论参考（reference_files 由平台拼接在各阶段 system_prompt 之后）
@@ -151,11 +130,11 @@ reference_files:
   - references/domain_prefixes.md
 
 # ────────────────────────────────────────────────────────────────────
-# 输出：两阶段合并 JSON（轻量 schema 校验）→ 确定性渲染器生成 xlsx 交付物
+# 输出：管道合并 JSON（轻量 schema 校验）→ 确定性渲染器生成 xlsx 交付物
 # ────────────────────────────────────────────────────────────────────
 output:
   format: json
-  # 各阶段 token 上限在 execution.plan/map.max_tokens 单独配置；
+  # 各阶段 token 上限在 execution.pipeline.* 单独配置；
   # 此处保留 output.max_tokens 仅作契约元数据（实际不读取）。
   max_tokens: 32768
   example_file: examples/hara_sample_output.json
@@ -206,28 +185,14 @@ output:
         type: array
         items:
           type: object
-          required: [fid, word, malfunction_behavior, vehicle_hazard, scenarios]
+          required: [fid, word, malfunction_behavior, vehicle_hazard]
           properties:
             fid: {type: string}
             word: {type: string}
-            malfunction_behavior: {type: string, description: "标 reused（知识库已有该功能该失效）时留空串，系统按知识库原文自动填充；标 adapted/new 时由你撰写完整文本"}
-            vehicle_hazard: {type: string, description: "同上：reused 留空串由系统填充，adapted/new 撰写完整文本"}
-            source_note: {type: string}
-            source: {type: object}
-            scenarios:
-              type: array
-              items:
-                type: object
-                required: [scene_text]
-                properties:
-                  scene_text: {type: string}
-                  # 历史场景骨架：来自历史事件的场景携带其事件 ID（规划后处理
-                  # 按此回查知识库原文校正 scene_text；无效引用自动剥离）
-                  history_ref: {type: string}
-                  scene_refs:
-                    type: array
-                    items: {type: string}
-            # events 由评级层（map）回填；规划层输出不含此字段
+            malfunction_behavior: {type: string}
+            vehicle_hazard: {type: string}
+            # events 由管道 event_match 步骤物化挂回；reused 事件的 S/E/C 与
+            # 安全目标组由脚本从知识库原块逐字复制
             events:
               type: array
               items:
@@ -235,9 +200,6 @@ output:
                 required: [scenario_text, S, E, C, source]
                 properties:
                   scenario_text: {type: string}
-                  scene_refs:
-                    type: array
-                    items: {type: string}
                   event_description: {type: string}
                   S: {type: integer}
                   s_reason: {type: string}
@@ -251,6 +213,16 @@ output:
                   safe_state: {type: string}
                   ftti: {type: string}
                   source: {type: object}
+      # 整车安全目标（Step 5 产物，供追溯/下游消费；渲染器按事件文本自行合并）
+      safety_goals:
+        type: object
+        properties:
+          events_sg:
+            type: array
+            items: {type: object}
+          merged_sg:
+            type: array
+            items: {type: object}
   # 渲染器：输入 JSON 写临时文件 → 调用脚本 entrypoint(input_path, output_path)
   # → xlsx 存入文件沙箱，经 /agent/files/{file_id}/download 下载
   # stat_labels：交付摘要中工作簿统计的中文标签（按声明顺序，只列 stats 中存在的键）；
@@ -283,9 +255,9 @@ output:
     所有 S/E/C 评级均为建议值，请逐条复核理由列后由责任人签署确认。
 
 prompt_template: |
-  请完成功能安全危害分析（HARA）。分析分两个阶段由系统自动完成：
-  先规划整车功能、11 个失效词过滤与每个安全关键失效的完整运行场景清单，
-  再逐场景完成 S/E/C 评级与安全目标挂接，最终只输出团队标准工作簿。
+  请完成功能安全危害分析（HARA）。系统按线性管道自动完成：
+  识别整车功能 → 对照历史项目匹配功能与失效模式（优先沿用）→ 逐失效单元
+  评估危害事件与 S/E/C 评级 → 整理合并整车安全目标，最终只输出团队标准工作簿。
 
   【分析对象/功能描述】：{{item_definition}}
   【特别关注的运行场景】：{{operational_scenarios}}
@@ -294,6 +266,6 @@ prompt_template: |
 
   要点：
   1. 若下方提供了【相关项文档】，以文档为主要事实来源提取相关项与整车功能；
-  2. 场景分析以平台《运行场景库》四个维度穷举为准，用户补充场景只作增量提示；
+  2. 危害事件场景以历史项目候选为默认答案（优先沿用），缺失场景按《运行场景库》补充；
   3. 历史项目参考优先沿用，每条目必须按要求标注 source（reused/adapted/new）；
   4. 各阶段只输出约定 JSON，不要 Markdown 代码围栏或任何解释文字。

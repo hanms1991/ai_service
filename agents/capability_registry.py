@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1194,6 +1195,16 @@ def _execute_skill_core(
             runnable_config=runnable_config,
         )
 
+    # ── pipeline 技能（单一 run 入口：管道脚本自行驱动 LLM 调用与知识检索） ──
+    if (skill_cfg.get("execution") or {}).get("mode") == "pipeline":
+        return _execute_pipeline_skill(
+            skill_cfg,
+            agent_cfg,
+            inputs or {},
+            reference_data=reference_data,
+            runnable_config=runnable_config,
+        )
+
     rendered = render_prompt_template(
         skill_cfg["prompt_template"],
         inputs or {},
@@ -1986,6 +1997,221 @@ def _execute_staged_skill(
     result = SkillResult(text=raw_merged, structured=structured, usage=total_usage)
 
     # ── 确定性渲染：JSON → 文件交付物（与单阶段内核一致） ──
+    if output_cfg.get("format") == "json" and structured is not None:
+        emit_skill_progress("正在汇总评估结果并生成交付文件…")
+        artifact_meta, stats = _run_renderer(skill_cfg, structured)
+        if artifact_meta is not None:
+            from core.file_sandbox import resolve_stored_path
+
+            artifact_path = resolve_stored_path(artifact_meta.file_id)
+            result.artifacts = [{
+                "file_id": artifact_meta.file_id,
+                "filename": artifact_meta.original_name,
+                "format": artifact_meta.ext.lstrip("."),
+                "size": artifact_meta.size,
+            }]
+            result.text = _format_artifact_summary(
+                skill_cfg, artifact_meta, stats, artifact_path, structured
+            )
+    return result
+
+
+# ════════════════════════════════════════════════════════════════
+# 5A3. pipeline 执行（单一 run 入口：管道脚本自行驱动 LLM 与知识检索）
+# ════════════════════════════════════════════════════════════════
+
+@dataclass
+class PipelineContext:
+    """pipeline 执行模式上下文（稳定契约：只增字段）。
+
+    数据：skill_cfg/inputs/rendered/doc_raw/doc_block/ref_block/
+          schema_example_block/runnable_config/reference_data/task_id；
+    能力：模型构造、阶段提示装配、json 阶段调用、token 计量、
+          知识库检索、进度上报。
+
+    管道脚本约定入口 run(ctx) -> tuple[structured, usage]：
+      structured 为最终结构化输出（引擎做 schema 校验 → postprocess → 渲染）；
+      usage 为管道内全部 LLM 调用的 token 计量合计（dict）。
+    """
+
+    skill_cfg: dict
+    inputs: dict[str, Any]
+    rendered: str
+    doc_raw: str
+    doc_block: str
+    ref_block: str
+    schema_example_block: str
+    runnable_config: Any
+    reference_data: dict[str, Any] | None = None
+    logger: logging.Logger = logger
+    task_id: str = ""
+    bind_json_model: Callable[[Any], Any] | None = None
+    build_stage_prompt: Callable[[Any], str] | None = None
+    invoke_json_stage: Callable[..., Any] | None = None
+    extract_usage: Callable[[Any], dict] | None = None
+    retrieve_knowledge: Callable[..., list] | None = None
+    emit_progress: Callable[[str], None] | None = None
+
+
+_pipeline_cache: dict[str, Any] = {}
+
+
+def _execute_pipeline_skill(
+    skill_cfg: dict,
+    agent_cfg: dict,
+    inputs: dict[str, Any],
+    *,
+    reference_data: dict[str, Any] | None = None,
+    runnable_config: Any = None,
+) -> SkillResult:
+    """pipeline 执行内核：加载技能管道脚本，单一 run(ctx) 入口。
+
+    契约（技能 YAML）：
+        execution:
+          mode: pipeline
+          pipeline:
+            script: scripts/hara_pipeline.py
+            entrypoint: run
+            # 其余键（identify/function_match/event_match 等阶段配置：
+            # system_prompt/references/max_tokens/max_workers…）
+            # 由管道脚本自行解释，引擎不读取
+
+    流程：
+      1. 渲染 prompt 模板 + 读上传文档 + reference_data/schema 示例块；
+      2. 构造 PipelineContext（LLM/检索/进度回调齐全）→ run(ctx)；
+      3. 返回 (structured, usage) → schema 校验 → postprocess（可选）
+         → renderer 渲染 → SkillResult。
+    """
+    from agents.generate_agent import _resolve_model
+
+    exec_cfg = skill_cfg.get("execution") or {}
+    pipeline_cfg = exec_cfg.get("pipeline") or {}
+    script_rel = pipeline_cfg.get("script")
+    if not script_rel:
+        raise ValueError(
+            f"技能 {skill_cfg.get('name')} 的 execution.pipeline 缺少 script 配置"
+        )
+
+    output_cfg = skill_cfg.get("output", {}) or {}
+    output_schema = output_cfg.get("schema")
+
+    rendered = render_prompt_template(
+        skill_cfg["prompt_template"], inputs, skill_cfg.get("inputs", {})
+    )
+    emit_skill_progress("正在读取输入文档…")
+    doc_raw = _read_uploaded_document(skill_cfg, inputs)
+    logger.info(
+        "[capability_registry] pipeline 技能开始（skill=%s）：文档 %d 字符（file_id=%s）",
+        skill_cfg.get("name"), len(doc_raw or ""), inputs.get("file_id") or "-",
+    )
+    doc_block = (
+        "\n\n【相关项文档（Markdown，平台从用户上传文件转换，分析以此为主要事实来源）】\n"
+        + doc_raw
+    ) if doc_raw else ""
+    ref_block = _build_reference_block(reference_data)
+    schema_example_block = (
+        _build_schema_example_block(skill_cfg)
+        if output_cfg.get("format") == "json" else ""
+    )
+
+    base_llm = _build_model_with_hint(
+        _resolve_model(agent_cfg.get("model")), skill_cfg.get("model_hint")
+    )
+
+    def _bind_json_model(max_tokens: Any) -> Any:
+        bind_kwargs: dict[str, Any] = {
+            "response_format": {"type": "json_object"},
+            "timeout": SKILL_LLM_TIMEOUT_SECONDS,
+        }
+        if isinstance(max_tokens, int) and max_tokens > 0:
+            bind_kwargs["max_tokens"] = max_tokens
+        return base_llm.bind(**bind_kwargs)
+
+    from core.kb_client import retrieve_knowledge
+
+    # task_id：优先 runnable_config 元数据中的任务/追踪 ID，退化用短随机串（存档目录）
+    task_id = ""
+    try:
+        meta = getattr(runnable_config, "metadata", None)
+        if meta is None and isinstance(runnable_config, dict):
+            meta = runnable_config.get("metadata")
+        if isinstance(meta, dict):
+            task_id = str(meta.get("task_id") or meta.get("trace_id") or "")
+    except Exception:  # noqa: BLE001 —— 元数据提取失败不阻断
+        task_id = ""
+    if not task_id:
+        task_id = uuid.uuid4().hex[:12]
+
+    ctx = PipelineContext(
+        skill_cfg=skill_cfg,
+        inputs=inputs,
+        rendered=rendered,
+        doc_raw=doc_raw,
+        doc_block=doc_block,
+        ref_block=ref_block,
+        schema_example_block=schema_example_block,
+        runnable_config=runnable_config,
+        reference_data=reference_data,
+        logger=logger,
+        task_id=task_id,
+        bind_json_model=_bind_json_model,
+        build_stage_prompt=lambda stage_cfg: _build_stage_system_prompt(
+            skill_cfg, stage_cfg
+        ),
+        invoke_json_stage=_invoke_json_stage,
+        extract_usage=_extract_usage,
+        retrieve_knowledge=retrieve_knowledge,
+        emit_progress=emit_skill_progress,
+    )
+
+    module = _load_skill_script_module(
+        skill_cfg, script_rel, _pipeline_cache, "skill_pipeline"
+    )
+    entrypoint = pipeline_cfg.get("entrypoint", "run")
+    fn = getattr(module, entrypoint, None)
+    if not callable(fn):
+        raise AttributeError(
+            f"pipeline 脚本 {script_rel} 不存在入口 {entrypoint!r}"
+        )
+
+    structured, usage = fn(ctx)
+
+    merged_json = json.dumps(structured, ensure_ascii=False)
+    structured = _validate_structured_output(merged_json, output_schema)
+
+    # ── postprocess 钩子（可选，与单阶段/map_reduce 内核一致） ──
+    if exec_cfg.get("postprocess"):
+        postprocess_ctx = PostprocessContext(
+            skill_cfg=skill_cfg,
+            structured=structured,
+            reference_data=reference_data,
+            inputs=inputs,
+            logger=logger,
+        )
+        try:
+            pp_result = _run_postprocess_hook(postprocess_ctx)
+            if pp_result and "structured" in pp_result:
+                structured = pp_result["structured"]
+                merged_json = json.dumps(structured, ensure_ascii=False, indent=2)
+        except ValueError:
+            raise
+        except Exception as exc:  # noqa: BLE001 —— 非校验异常软降级
+            logger.warning(
+                "[capability_registry] 技能 %s postprocess 钩子失败，保留原输出：%s",
+                skill_cfg.get("name"), exc,
+            )
+
+    total_usage = {
+        "prompt_tokens": int((usage or {}).get("prompt_tokens", 0) or 0),
+        "completion_tokens": int((usage or {}).get("completion_tokens", 0) or 0),
+        "total_tokens": int((usage or {}).get("total_tokens", 0) or 0),
+    }
+    for k, v in (usage or {}).items():
+        if k not in total_usage:
+            total_usage[k] = v
+    result = SkillResult(text=merged_json, structured=structured, usage=total_usage)
+
+    # ── 确定性渲染：JSON → 文件交付物（与单阶段/map_reduce 内核一致） ──
     if output_cfg.get("format") == "json" and structured is not None:
         emit_skill_progress("正在汇总评估结果并生成交付文件…")
         artifact_meta, stats = _run_renderer(skill_cfg, structured)
