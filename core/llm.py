@@ -104,7 +104,7 @@ def _resolve_api_key(preset: dict[str, Any]) -> str:
     return preset.get("api_key") or "EMPTY"
 
 
-def _make_instance(preset: dict[str, Any]) -> ChatOpenAI:
+def _make_instance(preset: dict[str, Any], *, streaming: bool = True) -> ChatOpenAI:
     return ChatOpenAI(
         model=preset["model"],
         api_key=_resolve_api_key(preset),
@@ -112,17 +112,25 @@ def _make_instance(preset: dict[str, Any]) -> ChatOpenAI:
         temperature=float(preset.get("temperature", 0.7)),
         max_tokens=int(preset.get("max_tokens") or _DEFAULT_MAX_TOKENS),
         timeout=float(preset.get("timeout") or _DEFAULT_TIMEOUT),
-        streaming=True,
+        streaming=streaming,
     )
 
 
-def _get_instance(name: str) -> ChatOpenAI:
-    if name not in _INSTANCES:
+# 流式实例缓存（供 _astream / astream_events 路径使用）
+_INSTANCES: dict[str, ChatOpenAI] = {}
+# 非流式实例缓存（供 _generate / _agenerate / ainvoke 路径使用，
+# 避免 streaming=True 时同步调用收到 Stream 对象报错）
+_INSTANCES_NOSTREAM: dict[str, ChatOpenAI] = {}
+
+
+def _get_instance(name: str, *, streaming: bool = True) -> ChatOpenAI:
+    cache = _INSTANCES if streaming else _INSTANCES_NOSTREAM
+    if name not in cache:
         preset = _PRESETS.get(name)
         if preset is None:
             raise KeyError(f"未知模型预设: {name!r}")
-        _INSTANCES[name] = _make_instance(preset)
-    return _INSTANCES[name]
+        cache[name] = _make_instance(preset, streaming=streaming)
+    return cache[name]
 
 
 def _is_enabled(preset: dict[str, Any]) -> bool:
@@ -182,8 +190,17 @@ def set_current_model(name: str) -> str:
 
 
 def get_model() -> ChatOpenAI:
-    """当前生效的底层 ChatOpenAI 实例。"""
-    return _get_instance(_current_name)
+    """当前生效的底层 ChatOpenAI 实例（流式）。"""
+    return _get_instance(_current_name, streaming=True)
+
+
+def _get_nostream_model() -> ChatOpenAI:
+    """当前生效的底层 ChatOpenAI 实例（非流式）。
+
+    供 _ModelSwitchProxy 的 _generate / _agenerate 使用，避免 streaming=True
+    导致同步调用（graph.ainvoke / model.invoke）收到 Stream 对象报错。
+    """
+    return _get_instance(_current_name, streaming=False)
 
 
 class _ModelSwitchProxy(BaseChatModel):
@@ -208,7 +225,8 @@ class _ModelSwitchProxy(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
-        return get_model()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        # 用非流式实例，避免 streaming=True 时收到 Stream 对象
+        return _get_nostream_model()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
 
     async def _agenerate(
         self,
@@ -217,7 +235,8 @@ class _ModelSwitchProxy(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
-        return await get_model()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        # 用非流式实例，避免 streaming=True 时收到 Stream 对象
+        return await _get_nostream_model()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
 
     def _stream(
         self,
@@ -239,8 +258,11 @@ class _ModelSwitchProxy(BaseChatModel):
             yield chunk
 
     def with_structured_output(self, schema: Any, **kwargs: Any):
-        """委托给当前模型（规划层等按次调用，取当前模型的原生实现）。"""
-        return get_model().with_structured_output(schema, **kwargs)
+        """委托给当前模型（规划层等按次调用，取当前模型的原生实现）。
+
+        用非流式实例构建，避免 streaming=True 导致 JSON mode 同步调用报错。
+        """
+        return _get_nostream_model().with_structured_output(schema, **kwargs)
 
 
 # 全局代理：所有 from core.llm import model 与 _resolve_model 都拿到它
